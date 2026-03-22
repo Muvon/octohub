@@ -1,4 +1,4 @@
-use super::{Storage, StoredResponse};
+use super::{Storage, StoredEmbedding, StoredResponse};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::sync::Mutex;
@@ -37,7 +37,18 @@ impl SqliteStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_responses_session ON responses(session_id);
             CREATE INDEX IF NOT EXISTS idx_responses_previous ON responses(previous_response_id);
-            CREATE INDEX IF NOT EXISTS idx_responses_created ON responses(created_at);",
+            CREATE INDEX IF NOT EXISTS idx_responses_created ON responses(created_at);
+
+            CREATE TABLE IF NOT EXISTS embeddings (
+                id TEXT PRIMARY KEY,
+                input_model TEXT NOT NULL,
+                resolved_model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                input TEXT NOT NULL,
+                usage TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);",
         )?;
 
         Ok(Self {
@@ -138,6 +149,27 @@ impl Storage for SqliteStorage {
         // Reverse to get oldest-first order
         chain.reverse();
         Ok(chain)
+    }
+
+    fn store_embedding(&self, embedding: &StoredEmbedding) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT INTO embeddings (id, input_model, resolved_model, provider, input, usage, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                embedding.id,
+                embedding.input_model,
+                embedding.resolved_model,
+                embedding.provider,
+                embedding.input.to_string(),
+                embedding.usage.to_string(),
+                embedding.created_at,
+            ],
+        )?;
+        Ok(())
     }
 }
 

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 
-use crate::api::types::CreateResponseRequest;
+use crate::api::types::{CreateEmbeddingRequest, CreateResponseRequest};
 use crate::proxy::engine::ProxyEngine;
 
 type BoxBody = Full<Bytes>;
@@ -30,7 +30,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     )
 }
 
-/// Handle POST /v1/responses
+/// Handle POST /v1/completions
 pub async fn handle_create_response(
     req: Request<hyper::body::Incoming>,
     engine: Arc<ProxyEngine>,
@@ -87,4 +87,54 @@ pub async fn handle_create_response(
 /// Handle GET /health
 pub fn handle_health() -> Response<BoxBody> {
     json_response(StatusCode::OK, serde_json::json!({"status": "ok"}))
+}
+
+/// Handle POST /v1/embeddings
+pub async fn handle_create_embedding(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    api_key: Option<String>,
+) -> Response<BoxBody> {
+    let auth_header = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
+
+    if !crate::auth::check_auth(auth_header, api_key.as_deref()) {
+        return error_response(StatusCode::UNAUTHORIZED, "Invalid or missing API key");
+    }
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read request body: {}", e),
+            );
+        }
+    };
+
+    let create_req: CreateEmbeddingRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid request JSON: {}", e),
+            );
+        }
+    };
+
+    match engine.process_embedding(create_req).await {
+        Ok(response) => {
+            let body = serde_json::to_value(&response).unwrap_or_default();
+            json_response(StatusCode::OK, body)
+        }
+        Err(e) => {
+            tracing::error!("Embedding request failed: {:?}", e);
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Embedding processing failed: {}", e),
+            )
+        }
+    }
 }

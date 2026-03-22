@@ -28,18 +28,10 @@ pub struct CreateResponseRequest {
     /// Tool definitions for function calling
     #[serde(default)]
     pub tools: Option<Vec<ToolDefinition>>,
-
-    /// Whether to store this response (default: true)
-    #[serde(default = "default_store")]
-    pub store: bool,
 }
 
 fn default_temperature() -> f32 {
     1.0
-}
-
-fn default_store() -> bool {
-    true
 }
 
 /// Input can be a simple string or an array of typed items
@@ -145,6 +137,86 @@ pub struct Usage {
     pub request_time_ms: Option<u64>,
 }
 
+// ── Embedding types ──────────────────────────────────────────────────
+
+/// Request to create embeddings
+#[derive(Debug, Deserialize)]
+pub struct CreateEmbeddingRequest {
+    /// Model identifier (e.g., "voyage:voyage-3.5" or mapped name)
+    pub model: String,
+    /// Input text(s) to embed
+    pub input: EmbeddingInput,
+}
+
+/// Embedding input: single string or array of strings
+#[derive(Debug, Clone)]
+pub enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for EmbeddingInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(s) => Ok(EmbeddingInput::Single(s)),
+            serde_json::Value::Array(arr) => {
+                let strings: Result<Vec<String>, _> = arr
+                    .into_iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| serde::de::Error::custom("expected string in array"))
+                    })
+                    .collect();
+                Ok(EmbeddingInput::Batch(strings?))
+            }
+            _ => Err(serde::de::Error::custom(
+                "input must be a string or array of strings",
+            )),
+        }
+    }
+}
+
+impl Serialize for EmbeddingInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            EmbeddingInput::Single(s) => serializer.serialize_str(s),
+            EmbeddingInput::Batch(v) => v.serialize(serializer),
+        }
+    }
+}
+
+/// Response from embedding creation
+#[derive(Debug, Serialize)]
+pub struct CreateEmbeddingResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub model: String,
+    pub data: Vec<EmbeddingData>,
+    pub usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingData {
+    pub object: &'static str,
+    pub index: usize,
+    pub embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingUsage {
+    pub input_tokens: u64,
+    pub total_tokens: u64,
+    pub request_time_ms: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,7 +232,6 @@ mod tests {
         assert!(matches!(req.input, Input::Text(ref s) if s == "Hello, world!"));
         assert!(req.previous_response_id.is_none());
         assert_eq!(req.temperature, 1.0);
-        assert!(req.store);
     }
 
     #[test]
@@ -286,16 +357,5 @@ mod tests {
         assert_eq!(json["output"][0]["type"], "function_call");
         assert_eq!(json["output"][0]["name"], "get_weather");
         assert_eq!(json["output"][0]["call_id"], "call_abc");
-    }
-
-    #[test]
-    fn test_deserialize_store_false() {
-        let json = r#"{
-            "model": "openai:gpt-4o",
-            "input": "test",
-            "store": false
-        }"#;
-        let req: CreateResponseRequest = serde_json::from_str(json).unwrap();
-        assert!(!req.store);
     }
 }

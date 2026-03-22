@@ -2,12 +2,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use octolib::embedding::{create_embedding_provider_from_parts, InputType};
 use octolib::llm::{ChatCompletionParams, FunctionDefinition, Message, ProviderFactory};
 use uuid::Uuid;
 
 use crate::api::types::*;
 use crate::config::Config;
-use crate::storage::{Storage, StoredResponse};
+use crate::storage::{Storage, StoredEmbedding, StoredResponse};
 
 /// Core proxy engine that processes requests through octolib providers
 pub struct ProxyEngine {
@@ -188,36 +189,117 @@ impl ProxyEngine {
             created_at: now,
         };
 
-        // 9. Store in DB if requested
-        if req.store {
-            // Resolve session: inherit from previous response or start new
-            let session_id = if let Some(ref prev_id) = req.previous_response_id {
-                self.storage
-                    .get_session_id(prev_id)?
-                    .unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()))
-            } else {
-                format!("sess_{}", Uuid::new_v4().simple())
-            };
+        // 9. Store for observability
+        let session_id = if let Some(ref prev_id) = req.previous_response_id {
+            self.storage
+                .get_session_id(prev_id)?
+                .unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()))
+        } else {
+            format!("sess_{}", Uuid::new_v4().simple())
+        };
 
-            let stored = StoredResponse {
-                id: response_id,
-                session_id,
-                previous_response_id: req.previous_response_id.clone(),
-                input_model: req.model.clone(),
-                resolved_model,
-                provider: provider.name().to_string(),
-                input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
-                output: serde_json::to_value(&output).unwrap_or(serde_json::Value::Null),
-                instructions: req.instructions.clone(),
-                exchange: serde_json::json!({
-                    "request": provider_response.exchange.request,
-                    "response": provider_response.exchange.response,
-                }),
-                usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
-                created_at: now,
-            };
-            self.storage.store_response(&stored)?;
-        }
+        let stored = StoredResponse {
+            id: response_id,
+            session_id,
+            previous_response_id: req.previous_response_id.clone(),
+            input_model: req.model.clone(),
+            resolved_model,
+            provider: provider.name().to_string(),
+            input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
+            output: serde_json::to_value(&output).unwrap_or(serde_json::Value::Null),
+            instructions: req.instructions.clone(),
+            exchange: serde_json::json!({
+                "request": provider_response.exchange.request,
+                "response": provider_response.exchange.response,
+            }),
+            usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+            created_at: now,
+        };
+        self.storage.store_response(&stored)?;
+
+        Ok(response)
+    }
+
+    /// Process an embedding request
+    pub async fn process_embedding(
+        &self,
+        req: CreateEmbeddingRequest,
+    ) -> Result<CreateEmbeddingResponse> {
+        let start = std::time::Instant::now();
+
+        // 1. Resolve provider and model
+        let (provider_name, resolved_model) = self
+            .config
+            .resolve_embedding_model(&req.model)
+            .with_context(|| format!("Failed to resolve embedding model '{}'", req.model))?;
+
+        // 2. Parse provider type and create provider
+        let provider_model = format!("{}:{}", provider_name, resolved_model);
+        let (provider_type, model_name) =
+            octolib::embedding::parse_provider_model(&provider_model)?;
+        let provider = create_embedding_provider_from_parts(&provider_type, &model_name).await?;
+
+        // 3. Generate embeddings
+        let texts: Vec<String> = match &req.input {
+            EmbeddingInput::Single(s) => vec![s.clone()],
+            EmbeddingInput::Batch(v) => v.clone(),
+        };
+        let embeddings = provider
+            .generate_embeddings_batch(texts.clone(), InputType::None)
+            .await
+            .with_context(|| {
+                format!(
+                    "Embedding provider '{}' failed for model '{}'",
+                    provider_name, resolved_model
+                )
+            })?;
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        // 4. Build response
+        let embedding_id = format!("embd_{}", Uuid::new_v4().simple());
+        let data: Vec<EmbeddingData> = embeddings
+            .into_iter()
+            .enumerate()
+            .map(|(i, emb)| EmbeddingData {
+                object: "embedding",
+                index: i,
+                embedding: emb,
+            })
+            .collect();
+
+        // Approximate token count from input text length (rough: 1 token ≈ 4 chars)
+        let approx_tokens = texts.iter().map(|t| t.len() as u64).sum::<u64>() / 4;
+        let usage = EmbeddingUsage {
+            input_tokens: approx_tokens,
+            total_tokens: approx_tokens,
+            request_time_ms: Some(elapsed_ms),
+        };
+
+        let response = CreateEmbeddingResponse {
+            id: embedding_id.clone(),
+            object: "list",
+            model: resolved_model.clone(),
+            data,
+            usage: usage.clone(),
+        };
+
+        // 5. Store for observability
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let stored = StoredEmbedding {
+            id: embedding_id,
+            input_model: req.model.clone(),
+            resolved_model,
+            provider: provider_name,
+            input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
+            usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+            created_at: now,
+        };
+        self.storage.store_embedding(&stored)?;
 
         Ok(response)
     }

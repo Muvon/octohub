@@ -109,8 +109,11 @@ async fn route(
     tracing::info!("{} {} from {}", method, path, remote_addr);
 
     match (method, path.as_str()) {
-        (Method::POST, "/v1/responses") => {
+        (Method::POST, "/v1/completions") => {
             api::handler::handle_create_response(req, engine, api_key).await
+        }
+        (Method::POST, "/v1/embeddings") => {
+            api::handler::handle_create_embedding(req, engine, api_key).await
         }
         (Method::GET, "/health") => api::handler::handle_health(),
         _ => Response::builder()

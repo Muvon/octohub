@@ -15,6 +15,9 @@ pub struct Config {
     /// When resolving, randomly pick one from the list
     #[serde(default)]
     pub models: HashMap<String, Vec<String>>,
+    /// Embedding model mappings (same format as models)
+    #[serde(default)]
+    pub embedding_models: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +105,7 @@ impl Config {
                 db_path: env::var("OCTOHUB_DB_PATH").unwrap_or_else(|_| default_db_path()),
             },
             models: HashMap::new(),
+            embedding_models: HashMap::new(),
         }
     }
 
@@ -109,6 +113,20 @@ impl Config {
     /// If model is already in "provider:model" format, use directly
     /// Otherwise look up in config and randomly pick one from the list
     pub fn resolve_model(&self, model: &str) -> Result<(String, String)> {
+        self.resolve_from_map(model, &self.models, "model")
+    }
+
+    /// Resolve an embedding model name to (provider, model_name)
+    pub fn resolve_embedding_model(&self, model: &str) -> Result<(String, String)> {
+        self.resolve_from_map(model, &self.embedding_models, "embedding model")
+    }
+
+    fn resolve_from_map(
+        &self,
+        model: &str,
+        map: &HashMap<String, Vec<String>>,
+        kind: &str,
+    ) -> Result<(String, String)> {
         // Check if model is already in provider:model format
         if let Some(pos) = model.find(':') {
             let provider = model[..pos].to_string();
@@ -117,11 +135,12 @@ impl Config {
         }
 
         // Look up model in config mapping
-        let providers = self.models.get(model).with_context(|| {
+        let providers = map.get(model).with_context(|| {
             format!(
-                "Model '{}' not found in config. Available models: {}",
+                "{} '{}' not found in config. Available: {}",
+                kind,
                 model,
-                self.models.keys().cloned().collect::<Vec<_>>().join(", ")
+                map.keys().cloned().collect::<Vec<_>>().join(", ")
             )
         })?;
 
@@ -135,8 +154,8 @@ impl Config {
         let selected = &providers[idx];
 
         let pos = selected.find(':').context(format!(
-            "Invalid model mapping '{}': expected 'provider:model' format",
-            selected
+            "Invalid {} mapping '{}': expected 'provider:model' format",
+            kind, selected
         ))?;
 
         let provider = selected[..pos].to_string();
