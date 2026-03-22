@@ -190,8 +190,18 @@ impl ProxyEngine {
 
         // 9. Store in DB if requested
         if req.store {
+            // Resolve session: inherit from previous response or start new
+            let session_id = if let Some(ref prev_id) = req.previous_response_id {
+                self.storage
+                    .get_session_id(prev_id)?
+                    .unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()))
+            } else {
+                format!("sess_{}", Uuid::new_v4().simple())
+            };
+
             let stored = StoredResponse {
                 id: response_id,
+                session_id,
                 previous_response_id: req.previous_response_id.clone(),
                 input_model: req.model.clone(),
                 resolved_model,

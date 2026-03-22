@@ -6,6 +6,7 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub struct StoredResponse {
     pub id: String,
+    pub session_id: String,
     pub previous_response_id: Option<String>,
     /// Model name as sent by user (e.g., "minimax-m2.7")
     pub input_model: String,
@@ -25,6 +26,8 @@ pub struct StoredResponse {
 pub trait Storage: Send + Sync {
     fn store_response(&self, response: &StoredResponse) -> Result<()>;
     fn get_response(&self, id: &str) -> Result<Option<StoredResponse>>;
+    /// Get session_id for a given response id (used to inherit session on chained requests)
+    fn get_session_id(&self, id: &str) -> Result<Option<String>>;
     /// Walk the chain of previous_response_id links, returning responses oldest-first
     fn walk_chain(&self, id: &str) -> Result<Vec<StoredResponse>>;
 }
