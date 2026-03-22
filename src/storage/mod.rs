@@ -7,7 +7,11 @@ use anyhow::Result;
 pub struct StoredResponse {
     pub id: String,
     pub previous_response_id: Option<String>,
-    pub model: String,
+    /// Model name as sent by user (e.g., "minimax-m2.7")
+    pub input_model: String,
+    /// Resolved model sent to provider (e.g., "minimax-m2.7" - same as input for now)
+    pub resolved_model: String,
+    /// Provider name (e.g., "minimax")
     pub provider: String,
     pub input: serde_json::Value,
     pub output: serde_json::Value,

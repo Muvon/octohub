@@ -6,16 +6,18 @@ use octolib::llm::{ChatCompletionParams, FunctionDefinition, Message, ProviderFa
 use uuid::Uuid;
 
 use crate::api::types::*;
+use crate::config::Config;
 use crate::storage::{Storage, StoredResponse};
 
 /// Core proxy engine that processes requests through octolib providers
 pub struct ProxyEngine {
     storage: Arc<dyn Storage>,
+    config: Arc<Config>,
 }
 
 impl ProxyEngine {
-    pub fn new(storage: Arc<dyn Storage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<dyn Storage>, config: Arc<Config>) -> Self {
+        Self { storage, config }
     }
 
     /// Process a create response request
@@ -77,11 +79,17 @@ impl ProxyEngine {
             }
         }
 
-        // 4. Resolve provider and model
-        let (provider, model_name) = ProviderFactory::get_provider_for_model(&req.model)
+        // 4. Resolve provider and model via config
+        let (provider_name, resolved_model) = self
+            .config
+            .resolve_model(&req.model)
             .with_context(|| format!("Failed to resolve model '{}'", req.model))?;
 
-        // 5. Build ChatCompletionParams
+        // 5. Get provider instance
+        let provider = ProviderFactory::create_provider(&provider_name)
+            .with_context(|| format!("Provider '{}' not available", provider_name))?;
+
+        // 6. Build ChatCompletionParams
         let tools = req.tools.as_ref().map(|tools| {
             tools
                 .iter()
@@ -96,7 +104,7 @@ impl ProxyEngine {
 
         let mut params = ChatCompletionParams::new(
             &messages,
-            &model_name,
+            &resolved_model,
             req.temperature,
             1.0,
             50,
@@ -107,13 +115,13 @@ impl ProxyEngine {
             params.tools = Some(tools);
         }
 
-        // 6. Call provider
+        // 7. Call provider
         let provider_response = provider
             .chat_completion(params)
             .await
             .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
 
-        // 7. Build our response
+        // 8. Build our response
         let response_id = format!("resp_{}", Uuid::new_v4().simple());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -174,18 +182,19 @@ impl ProxyEngine {
         let response = CreateResponseResponse {
             id: response_id.clone(),
             object: "response",
-            model: model_name.clone(),
+            model: resolved_model.clone(),
             output: output.clone(),
             usage: usage.clone(),
             created_at: now,
         };
 
-        // 8. Store in DB if requested
+        // 9. Store in DB if requested
         if req.store {
             let stored = StoredResponse {
                 id: response_id,
                 previous_response_id: req.previous_response_id.clone(),
-                model: model_name,
+                input_model: req.model.clone(),
+                resolved_model: resolved_model,
                 provider: provider.name().to_string(),
                 input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
                 output: serde_json::to_value(&output).unwrap_or(serde_json::Value::Null),

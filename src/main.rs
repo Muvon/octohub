@@ -7,7 +7,9 @@ mod storage;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use bytes::Bytes;
+use clap::Parser;
 use http_body_util::Full;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -21,6 +23,18 @@ use storage::sqlite::SqliteStorage;
 
 type BoxBody = Full<Bytes>;
 
+#[derive(Parser, Debug)]
+#[command(name = "octohub")]
+#[command(about = "High-performance LLM proxy server", long_about = None)]
+struct Args {
+    /// Path to configuration file
+    #[arg(short = 'c', long)]
+    config: Option<String>,
+    /// Bind to HTTP server on host:port (e.g., "0.0.0.0:8080") - overrides config
+    #[arg(long)]
+    bind: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -31,30 +45,43 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Config::from_env();
+    let args = Args::parse();
+    let mut config = Config::load(args.config)?;
+
+    // Override bind address if specified
+    if let Some(bind) = args.bind {
+        let parts: Vec<&str> = bind.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("Invalid bind format '{}': expected HOST:PORT", bind);
+        }
+        config.server.host = parts[0].to_string();
+        config.server.port = parts[1].parse().context("Invalid port in bind argument")?;
+    }
+
+    let config = Arc::new(config);
 
     // Initialize storage
-    let storage = Arc::new(SqliteStorage::new(&config.db_path)?);
-    tracing::info!("Database initialized at: {}", config.db_path);
+    let storage = Arc::new(SqliteStorage::new(&config.server.db_path)?);
+    tracing::info!("Database initialized at: {}", config.server.db_path);
 
     // Initialize proxy engine
-    let engine = Arc::new(ProxyEngine::new(storage));
+    let engine = Arc::new(ProxyEngine::new(storage, config.clone()));
 
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("OctoHub server listening on {}", addr);
 
-    if config.api_key.is_some() {
+    if config.server.api_key.is_some() {
         tracing::info!("API key authentication enabled");
     } else {
-        tracing::warn!("No OCTOHUB_API_KEY set - authentication disabled");
+        tracing::warn!("No API key configured - authentication disabled");
     }
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let engine = engine.clone();
-        let api_key = config.api_key.clone();
+        let api_key = config.server.api_key.clone();
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {

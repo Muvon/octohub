@@ -24,7 +24,8 @@ impl SqliteStorage {
             "CREATE TABLE IF NOT EXISTS responses (
                 id TEXT PRIMARY KEY,
                 previous_response_id TEXT,
-                model TEXT NOT NULL,
+                input_model TEXT NOT NULL,
+                resolved_model TEXT NOT NULL,
                 provider TEXT NOT NULL,
                 input TEXT NOT NULL,
                 output TEXT NOT NULL,
@@ -50,12 +51,13 @@ impl Storage for SqliteStorage {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO responses (id, previous_response_id, model, provider, input, output, instructions, exchange, usage, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO responses (id, previous_response_id, input_model, resolved_model, provider, input, output, instructions, exchange, usage, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 response.id,
                 response.previous_response_id,
-                response.model,
+                response.input_model,
+                response.resolved_model,
                 response.provider,
                 response.input.to_string(),
                 response.output.to_string(),
@@ -74,7 +76,7 @@ impl Storage for SqliteStorage {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, previous_response_id, model, provider, input, output, instructions, exchange, usage, created_at
+            "SELECT id, previous_response_id, input_model, resolved_model, provider, input, output, instructions, exchange, usage, created_at
              FROM responses WHERE id = ?1",
         )?;
 
@@ -82,14 +84,15 @@ impl Storage for SqliteStorage {
             Ok(StoredResponse {
                 id: row.get(0)?,
                 previous_response_id: row.get(1)?,
-                model: row.get(2)?,
-                provider: row.get(3)?,
-                input: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                output: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                instructions: row.get(6)?,
-                exchange: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
-                usage: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
-                created_at: row.get(9)?,
+                input_model: row.get(2)?,
+                resolved_model: row.get(3)?,
+                provider: row.get(4)?,
+                input: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                output: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+                instructions: row.get(7)?,
+                exchange: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+                usage: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                created_at: row.get(10)?,
             })
         });
 
