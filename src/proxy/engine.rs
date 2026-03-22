@@ -194,7 +194,7 @@ impl ProxyEngine {
                 id: response_id,
                 previous_response_id: req.previous_response_id.clone(),
                 input_model: req.model.clone(),
-                resolved_model: resolved_model,
+                resolved_model,
                 provider: provider.name().to_string(),
                 input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
                 output: serde_json::to_value(&output).unwrap_or(serde_json::Value::Null),
@@ -273,8 +273,8 @@ impl ProxyEngine {
                         OutputItem::Message { content, .. } => {
                             let text: String = content
                                 .iter()
-                                .filter_map(|c| match c {
-                                    ContentPart::OutputText { text } => Some(text.as_str()),
+                                .map(|c| match c {
+                                    ContentPart::OutputText { text } => text.as_str(),
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");

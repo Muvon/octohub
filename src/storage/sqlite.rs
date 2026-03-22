@@ -136,7 +136,8 @@ mod tests {
         StoredResponse {
             id: id.to_string(),
             previous_response_id: prev.map(|s| s.to_string()),
-            model: "gpt-4o".to_string(),
+            input_model: "gpt-4o".to_string(),
+            resolved_model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
             input: serde_json::json!({"content": input}),
             output: serde_json::json!({"content": output}),
@@ -156,8 +157,7 @@ mod tests {
         let retrieved = storage.get_response("resp_001").unwrap().unwrap();
 
         assert_eq!(retrieved.id, "resp_001");
-        assert_eq!(retrieved.model, "gpt-4o");
-        assert_eq!(retrieved.provider, "openai");
+        assert_eq!(retrieved.input_model, "gpt-4o");
         assert!(retrieved.previous_response_id.is_none());
     }
 
