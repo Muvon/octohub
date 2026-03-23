@@ -3,7 +3,7 @@
 [server]
 host = "127.0.0.1"
 port = 8080
-# api_key = "your-master-secret"  # Optional: enables auth for client + admin endpoints
+api_key = "your-master-secret"  # Optional: enables auth for client + admin endpoints
 db_path = "octohub.db"
 
 # Model mappings: model_name -> list of fully qualified "provider:model" strings

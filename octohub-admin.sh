@@ -18,7 +18,7 @@ MASTER_KEY="${OCTOHUB_MASTER_KEY:-}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 require_master_key() {
-  [[ -n "$MASTER_KEY" ]] || die "OCTOHUB_MASTER_KEY is not set"
+  [[ -v OCTOHUB_MASTER_KEY ]] || die "OCTOHUB_MASTER_KEY is not set"
 }
 
 admin_curl() {

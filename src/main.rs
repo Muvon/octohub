@@ -59,11 +59,8 @@ async fn main() -> anyhow::Result<()> {
         config.server.port = parts[1].parse().context("Invalid port in bind argument")?;
     }
 
-    if config.server.api_key.is_none() {
-        tracing::warn!(
-            "No master API key configured (server.api_key). \
-             Server running without authentication — admin endpoints are disabled."
-        );
+    if config.server.api_key.is_empty() {
+        tracing::warn!("Master API key is empty (server.api_key). Consider setting a strong key.");
     }
 
     let config = Arc::new(config);
@@ -78,9 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("OctoHub server listening on {}", addr);
-    if config.server.api_key.is_some() {
-        tracing::info!("Authentication enabled (master key set)");
-    }
+    tracing::info!("Authentication enabled (master key configured)");
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;
@@ -96,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
                 let master_key = master_key.clone();
                 async move {
                     Ok::<_, hyper::Error>(
-                        route(req, engine, storage, master_key.as_deref(), remote_addr).await,
+                        route(req, engine, storage, &master_key, remote_addr).await,
                     )
                 }
             });
@@ -112,7 +107,7 @@ async fn route(
     req: Request<hyper::body::Incoming>,
     engine: Arc<ProxyEngine>,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
     remote_addr: SocketAddr,
 ) -> Response<BoxBody> {
     let method = req.method().clone();
@@ -143,7 +138,7 @@ async fn route_admin(
     method: Method,
     path: &str,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
 ) -> Response<BoxBody> {
     // Parse /v1/admin/keys/:id and /v1/admin/keys/:id/revoke
     let segments: Vec<&str> = path

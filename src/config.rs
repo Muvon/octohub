@@ -29,7 +29,7 @@ pub struct ServerConfig {
     #[serde(default = "default_port")]
     pub port: u16,
     /// API key for authentication (optional)
-    pub api_key: Option<String>,
+    pub api_key: String,
     /// SQLite database path
     #[serde(default = "default_db_path")]
     pub db_path: String,
@@ -52,7 +52,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
-            api_key: None,
+            api_key: String::new(),
             db_path: default_db_path(),
         }
     }
@@ -68,24 +68,9 @@ impl Config {
                 .with_context(|| format!("Failed to read config file: {}", path))?;
             let mut config: Config = toml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {}", path))?;
-            // Normalize empty api_key to None
-            if config.server.api_key.as_deref() == Some("") {
-                config.server.api_key = None;
-            }
-
             // Override with environment variables if set
-            if let Ok(host) = env::var("OCTOHUB_HOST") {
-                config.server.host = host;
-            }
-            if let Some(port) = env::var("OCTOHUB_PORT").ok().and_then(|p| p.parse().ok()) {
-                config.server.port = port;
-            }
             if let Ok(api_key) = env::var("OCTOHUB_API_KEY") {
-                config.server.api_key = if api_key.is_empty() {
-                    None
-                } else {
-                    Some(api_key)
-                };
+                config.server.api_key = api_key;
             }
             if let Ok(db_path) = env::var("OCTOHUB_DB_PATH") {
                 config.server.db_path = db_path;
@@ -109,7 +94,7 @@ impl Config {
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(default_port()),
-                api_key: env::var("OCTOHUB_API_KEY").ok().filter(|k| !k.is_empty()),
+                api_key: env::var("OCTOHUB_API_KEY").unwrap_or_default(),
                 db_path: env::var("OCTOHUB_DB_PATH").unwrap_or_else(|_| default_db_path()),
             },
             models: HashMap::new(),

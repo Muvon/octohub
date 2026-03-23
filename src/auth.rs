@@ -32,14 +32,11 @@ pub fn authenticate_client(auth_header: Option<&str>, storage: &Arc<dyn Storage>
 
 /// Authenticate an admin request against the master key from config.
 /// Returns true if the token matches the configured master key.
-pub fn authenticate_admin(auth_header: Option<&str>, master_key: Option<&str>) -> bool {
-    let Some(expected) = master_key else {
-        return false; // Admin endpoints require a master key
-    };
+pub fn authenticate_admin(auth_header: Option<&str>, master_key: &str) -> bool {
     let Some(token) = extract_bearer(auth_header) else {
         return false;
     };
-    token == expected
+    token == master_key
 }
 
 #[cfg(test)]
@@ -55,28 +52,30 @@ mod tests {
 
     #[test]
     fn test_admin_auth_no_master_key() {
-        // Admin endpoints disabled when no master key configured
-        assert!(!authenticate_admin(Some("Bearer anything"), None));
+        // Empty master key — only matches empty bearer token
+        assert!(!authenticate_admin(Some("Bearer anything"), ""));
+    }
+
+    #[test]
+    fn test_admin_auth_empty_key_match() {
+        assert!(authenticate_admin(Some("Bearer "), ""));
     }
 
     #[test]
     fn test_admin_auth_valid() {
         assert!(authenticate_admin(
             Some("Bearer master-secret"),
-            Some("master-secret")
+            "master-secret"
         ));
     }
 
     #[test]
     fn test_admin_auth_invalid() {
-        assert!(!authenticate_admin(
-            Some("Bearer wrong"),
-            Some("master-secret")
-        ));
+        assert!(!authenticate_admin(Some("Bearer wrong"), "master-secret"));
     }
 
     #[test]
     fn test_admin_auth_missing_header() {
-        assert!(!authenticate_admin(None, Some("master-secret")));
+        assert!(!authenticate_admin(None, "master-secret"));
     }
 }

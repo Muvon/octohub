@@ -33,7 +33,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
 /// Verify admin auth from request headers against master key
 fn check_admin(
     req: &Request<hyper::body::Incoming>,
-    master_key: Option<&str>,
+    master_key: &str,
 ) -> Result<(), Box<Response<BoxBody>>> {
     let header = req
         .headers()
@@ -54,7 +54,7 @@ fn check_admin(
 pub async fn handle_create_key(
     req: Request<hyper::body::Incoming>,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
 ) -> Response<BoxBody> {
     if let Err(resp) = check_admin(&req, master_key) {
         return *resp;
@@ -118,7 +118,7 @@ pub async fn handle_create_key(
 pub async fn handle_list_keys(
     req: Request<hyper::body::Incoming>,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
 ) -> Response<BoxBody> {
     if let Err(resp) = check_admin(&req, master_key) {
         return *resp;
@@ -151,7 +151,7 @@ pub async fn handle_list_keys(
 pub async fn handle_get_key(
     req: Request<hyper::body::Incoming>,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
     key_id: i64,
 ) -> Response<BoxBody> {
     if let Err(resp) = check_admin(&req, master_key) {
@@ -181,7 +181,7 @@ pub async fn handle_get_key(
 pub async fn handle_revoke_key(
     req: Request<hyper::body::Incoming>,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
     key_id: i64,
 ) -> Response<BoxBody> {
     if let Err(resp) = check_admin(&req, master_key) {
@@ -205,7 +205,7 @@ pub async fn handle_revoke_key(
 pub async fn handle_usage(
     req: Request<hyper::body::Incoming>,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
 ) -> Response<BoxBody> {
     if let Err(resp) = check_admin(&req, master_key) {
         return *resp;
@@ -248,7 +248,7 @@ pub async fn handle_usage(
 pub async fn handle_list_completions(
     req: Request<hyper::body::Incoming>,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
 ) -> Response<BoxBody> {
     if let Err(resp) = check_admin(&req, master_key) {
         return *resp;
@@ -293,7 +293,7 @@ pub async fn handle_list_completions(
 pub async fn handle_list_embeddings(
     req: Request<hyper::body::Incoming>,
     storage: Arc<dyn Storage>,
-    master_key: Option<&str>,
+    master_key: &str,
 ) -> Response<BoxBody> {
     if let Err(resp) = check_admin(&req, master_key) {
         return *resp;
