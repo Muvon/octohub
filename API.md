@@ -25,7 +25,7 @@ Create a model response. Supports multi-turn conversations via response chaining
   "model": "string",
   "input": "string | InputItem[]",
   "instructions": "string | null",
-  "previous_response_id": "string | null",
+  "previous_completion_id": "string | null",
   "temperature": 1.0,
   "max_output_tokens": 0,
   "tools": "ToolDefinition[] | null"
@@ -37,7 +37,7 @@ Create a model response. Supports multi-turn conversations via response chaining
 | `model` | string | ✅ | — | Model identifier. Use `"provider:model"` format (e.g. `"openai:gpt-4o"`) or a mapped name from config. |
 | `input` | string \| array | ✅ | — | Input content. A plain string becomes a user message. An array allows typed items (see below). |
 | `instructions` | string | — | `null` | System instructions prepended to the conversation. |
-| `previous_response_id` | string | — | `null` | Chain to a previous response for multi-turn conversations. OctoHub reconstructs the full history automatically. |
+| `previous_completion_id` | string | — | `null` | Chain to a previous completion for multi-turn conversations. OctoHub reconstructs the full history automatically. |
 | `temperature` | float | — | `1.0` | Sampling temperature (0.0–2.0). |
 | `max_output_tokens` | integer | — | `0` | Maximum tokens in the response. `0` = provider default. |
 | `tools` | array | — | `null` | Function definitions for tool/function calling. |
@@ -51,7 +51,7 @@ When `input` is an array, each element is a tagged object:
 {"type": "message", "role": "user", "content": "What is Rust?"}
 ```
 
-**Function call output** (tool result, requires `previous_response_id`):
+**Function call output** (tool result, requires `previous_completion_id`):
 ```json
 {"type": "function_call_output", "call_id": "call_abc123", "output": "72°F sunny"}
 ```
@@ -76,9 +76,8 @@ When `input` is an array, each element is a tagged object:
 
 ```json
 {
-  "id": "resp_<uuid>",
-  "object": "response",
-  "model": "gpt-4o",
+  "id": "cmpl_<uuid>",
+  "object": "completion",
   "output": [OutputItem],
   "usage": Usage,
   "created_at": 1700000000
@@ -162,7 +161,7 @@ curl -X POST http://127.0.0.1:8080/v1/completions \
     "model": "openai:gpt-4o",
     "input": "What is the capital of France?"
   }'
-# Response: {"id": "resp_abc123", ...}
+# Response: {"id": "cmpl_abc123", ...}
 
 # Second turn — chains automatically
 curl -X POST http://127.0.0.1:8080/v1/completions \
@@ -170,7 +169,7 @@ curl -X POST http://127.0.0.1:8080/v1/completions \
   -d '{
     "model": "openai:gpt-4o",
     "input": "And what is its population?",
-    "previous_response_id": "resp_abc123"
+    "previous_completion_id": "cmpl_abc123"
   }'
 ```
 
@@ -208,7 +207,7 @@ curl -X POST http://127.0.0.1:8080/v1/completions \
     "input": [
       {"type": "function_call_output", "call_id": "call_xyz", "output": "72°F, sunny"}
     ],
-    "previous_response_id": "resp_from_step1"
+    "previous_completion_id": "cmpl_from_step1"
   }'
 ```
 
@@ -253,24 +252,20 @@ Generate vector embeddings for text input.
 
 ### Response
 
+Returns the embedding vector(s) directly:
+
+**Single input:**
 ```json
-{
-  "id": "embd_<uuid>",
-  "object": "list",
-  "model": "voyage-3.5",
-  "data": [
-    {
-      "object": "embedding",
-      "index": 0,
-      "embedding": [0.0023, -0.0091, ...]
-    }
-  ],
-  "usage": {
-    "input_tokens": 8,
-    "total_tokens": 8,
-    "request_time_ms": 120
-  }
-}
+[0.0023, -0.0091, 0.0234, ...]
+```
+
+**Batch input:**
+```json
+[
+  [0.0023, -0.0091, ...],
+  [0.0156, 0.0089, ...],
+  [0.0034, -0.0123, ...]
+]
 ```
 
 ### Examples
@@ -380,7 +375,7 @@ All errors follow this format:
 
 | HTTP Status | Meaning |
 |---|---|
-| 400 | Bad request (malformed JSON, missing fields) |
+| 400 | Bad request (invalid model, malformed input, unknown completion ID) |
 | 401 | Unauthorized (missing or invalid API key) |
 | 404 | Unknown endpoint |
 | 500 | Internal error (provider failure, storage error) |

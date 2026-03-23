@@ -1,6 +1,6 @@
 # OctoHub - High-Performance LLM Proxy Server
 
-A high-performance LLM proxy server with response chaining and full request/response logging.
+A high-performance LLM proxy server with completion chaining and full request/response logging.
 
 ## Features
 
@@ -42,6 +42,9 @@ db_path = "octohub.db"
 
 # Multiple providers (random selection)
 # "my-model" = ["minimax:minimax-m2.7", "ollama:minimax-m2.7"]
+
+[embedding_models]
+"voyage-3.5" = ["voyage:voyage-3.5"]
 ```
 
 ## Usage
