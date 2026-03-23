@@ -75,11 +75,13 @@ pub async fn handle_create_completion(
             json_response(StatusCode::OK, body)
         }
         Err(e) => {
-            tracing::error!("Request processing failed: {:?}", e);
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Processing failed: {}", e),
-            )
+            let (status, msg) = classify_engine_error(&e);
+            if status.is_server_error() {
+                tracing::error!("Request processing failed: {:?}", e);
+            } else {
+                tracing::warn!("Request rejected: {}", msg);
+            }
+            error_response(status, &msg)
         }
     }
 }
@@ -130,11 +132,35 @@ pub async fn handle_create_embedding(
             json_response(StatusCode::OK, body)
         }
         Err(e) => {
-            tracing::error!("Embedding request failed: {:?}", e);
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Embedding processing failed: {}", e),
-            )
+            let (status, msg) = classify_engine_error(&e);
+            if status.is_server_error() {
+                tracing::error!("Embedding request failed: {:?}", e);
+            } else {
+                tracing::warn!("Embedding request rejected: {}", msg);
+            }
+            error_response(status, &msg)
         }
     }
+}
+
+/// Classify engine errors into HTTP status codes.
+/// Client errors (bad model, bad input) → 400, server errors → 500.
+fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
+    let msg = format!("{}", error);
+
+    // Model/provider resolution failures are client errors
+    let is_client_error = msg.contains("not found in config")
+        || msg.contains("Failed to resolve model")
+        || msg.contains("Failed to resolve embedding model")
+        || msg.contains("not available")
+        || msg.contains("Invalid request")
+        || msg.contains("Failed to walk chain");
+
+    let status = if is_client_error {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
+    (status, msg)
 }
