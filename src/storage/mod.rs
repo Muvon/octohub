@@ -2,12 +2,12 @@ pub mod sqlite;
 
 use anyhow::Result;
 
-/// Stored response record from the database
+/// Stored completion record from the database
 #[derive(Debug, Clone)]
-pub struct StoredResponse {
+pub struct StoredCompletion {
     pub id: String,
     pub session_id: String,
-    pub previous_response_id: Option<String>,
+    pub previous_completion_id: Option<String>,
     /// Model name as sent by user (e.g., "minimax-m2.7")
     pub input_model: String,
     /// Resolved model sent to provider (e.g., "minimax-m2.7" - same as input for now)
@@ -39,14 +39,14 @@ pub struct StoredEmbedding {
     pub created_at: u64,
 }
 
-/// Storage trait for response persistence
+/// Storage trait for completion persistence
 pub trait Storage: Send + Sync {
-    fn store_response(&self, response: &StoredResponse) -> Result<()>;
-    fn get_response(&self, id: &str) -> Result<Option<StoredResponse>>;
-    /// Get session_id for a given response id (used to inherit session on chained requests)
+    fn store_completion(&self, completion: &StoredCompletion) -> Result<()>;
+    fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>>;
+    /// Get session_id for a given completion id (used to inherit session on chained requests)
     fn get_session_id(&self, id: &str) -> Result<Option<String>>;
-    /// Walk the chain of previous_response_id links, returning responses oldest-first
-    fn walk_chain(&self, id: &str) -> Result<Vec<StoredResponse>>;
+    /// Walk the chain of previous_completion_id links, returning completions oldest-first
+    fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>>;
     /// Store an embedding request for observability
     fn store_embedding(&self, embedding: &StoredEmbedding) -> Result<()>;
 }

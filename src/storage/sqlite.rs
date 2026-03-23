@@ -1,4 +1,4 @@
-use super::{Storage, StoredEmbedding, StoredResponse};
+use super::{Storage, StoredCompletion, StoredEmbedding};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::sync::Mutex;
@@ -21,10 +21,10 @@ impl SqliteStorage {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS responses (
+            "CREATE TABLE IF NOT EXISTS completions (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
-                previous_response_id TEXT,
+                previous_completion_id TEXT,
                 input_model TEXT NOT NULL,
                 resolved_model TEXT NOT NULL,
                 provider TEXT NOT NULL,
@@ -35,9 +35,9 @@ impl SqliteStorage {
                 usage TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_responses_session ON responses(session_id);
-            CREATE INDEX IF NOT EXISTS idx_responses_previous ON responses(previous_response_id);
-            CREATE INDEX IF NOT EXISTS idx_responses_created ON responses(created_at);
+            CREATE INDEX IF NOT EXISTS idx_completions_session ON completions(session_id);
+            CREATE INDEX IF NOT EXISTS idx_completions_previous ON completions(previous_completion_id);
+            CREATE INDEX IF NOT EXISTS idx_completions_created ON completions(created_at);
 
             CREATE TABLE IF NOT EXISTS embeddings (
                 id TEXT PRIMARY KEY,
@@ -58,47 +58,47 @@ impl SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
-    fn store_response(&self, response: &StoredResponse) -> Result<()> {
+    fn store_completion(&self, completion: &StoredCompletion) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO responses (id, session_id, previous_response_id, input_model, resolved_model, provider, input, output, instructions, exchange, usage, created_at)
+            "INSERT INTO completions (id, session_id, previous_completion_id, input_model, resolved_model, provider, input, output, instructions, exchange, usage, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
-                response.id,
-                response.session_id,
-                response.previous_response_id,
-                response.input_model,
-                response.resolved_model,
-                response.provider,
-                response.input.to_string(),
-                response.output.to_string(),
-                response.instructions,
-                response.exchange.to_string(),
-                response.usage.to_string(),
-                response.created_at,
+                completion.id,
+                completion.session_id,
+                completion.previous_completion_id,
+                completion.input_model,
+                completion.resolved_model,
+                completion.provider,
+                completion.input.to_string(),
+                completion.output.to_string(),
+                completion.instructions,
+                completion.exchange.to_string(),
+                completion.usage.to_string(),
+                completion.created_at,
             ],
         )?;
         Ok(())
     }
 
-    fn get_response(&self, id: &str) -> Result<Option<StoredResponse>> {
+    fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, session_id, previous_response_id, input_model, resolved_model, provider, input, output, instructions, exchange, usage, created_at
-             FROM responses WHERE id = ?1",
+            "SELECT id, session_id, previous_completion_id, input_model, resolved_model, provider, input, output, instructions, exchange, usage, created_at
+             FROM completions WHERE id = ?1",
         )?;
 
         let result = stmt.query_row(rusqlite::params![id], |row| {
-            Ok(StoredResponse {
+            Ok(StoredCompletion {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
-                previous_response_id: row.get(2)?,
+                previous_completion_id: row.get(2)?,
                 input_model: row.get(3)?,
                 resolved_model: row.get(4)?,
                 provider: row.get(5)?,
@@ -123,7 +123,7 @@ impl Storage for SqliteStorage {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare("SELECT session_id FROM responses WHERE id = ?1")?;
+        let mut stmt = conn.prepare("SELECT session_id FROM completions WHERE id = ?1")?;
         let result = stmt.query_row(rusqlite::params![id], |row| row.get(0));
         match result {
             Ok(session_id) => Ok(Some(session_id)),
@@ -132,17 +132,17 @@ impl Storage for SqliteStorage {
         }
     }
 
-    fn walk_chain(&self, id: &str) -> Result<Vec<StoredResponse>> {
+    fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
         let mut chain = Vec::new();
         let mut current_id = Some(id.to_string());
 
         // Walk backwards through the chain
         while let Some(ref cid) = current_id {
-            let response = self
-                .get_response(cid)?
-                .with_context(|| format!("Response '{}' not found in chain", cid))?;
-            let prev = response.previous_response_id.clone();
-            chain.push(response);
+            let completion = self
+                .get_completion(cid)?
+                .with_context(|| format!("Completion '{}' not found in chain", cid))?;
+            let prev = completion.previous_completion_id.clone();
+            chain.push(completion);
             current_id = prev;
         }
 
@@ -177,16 +177,16 @@ impl Storage for SqliteStorage {
 mod tests {
     use super::*;
 
-    fn make_stored_response(
+    fn make_stored_completion(
         id: &str,
         prev: Option<&str>,
         input: &str,
         output: &str,
-    ) -> StoredResponse {
-        StoredResponse {
+    ) -> StoredCompletion {
+        StoredCompletion {
             id: id.to_string(),
             session_id: format!("sess_test_{}", id),
-            previous_response_id: prev.map(|s| s.to_string()),
+            previous_completion_id: prev.map(|s| s.to_string()),
             input_model: "gpt-4o".to_string(),
             resolved_model: "gpt-4o".to_string(),
             provider: "openai".to_string(),
@@ -202,32 +202,32 @@ mod tests {
     #[test]
     fn test_store_and_retrieve() {
         let storage = SqliteStorage::new(":memory:").unwrap();
-        let resp = make_stored_response("resp_001", None, "Hello", "Hi there!");
+        let cmpl = make_stored_completion("cmpl_001", None, "Hello", "Hi there!");
 
-        storage.store_response(&resp).unwrap();
-        let retrieved = storage.get_response("resp_001").unwrap().unwrap();
+        storage.store_completion(&cmpl).unwrap();
+        let retrieved = storage.get_completion("cmpl_001").unwrap().unwrap();
 
-        assert_eq!(retrieved.id, "resp_001");
+        assert_eq!(retrieved.id, "cmpl_001");
         assert_eq!(retrieved.input_model, "gpt-4o");
-        assert!(retrieved.previous_response_id.is_none());
+        assert!(retrieved.previous_completion_id.is_none());
     }
 
     #[test]
     fn test_get_nonexistent() {
         let storage = SqliteStorage::new(":memory:").unwrap();
-        let result = storage.get_response("nonexistent").unwrap();
+        let result = storage.get_completion("nonexistent").unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_walk_chain_single() {
         let storage = SqliteStorage::new(":memory:").unwrap();
-        let resp = make_stored_response("resp_001", None, "Hello", "Hi!");
-        storage.store_response(&resp).unwrap();
+        let cmpl = make_stored_completion("cmpl_001", None, "Hello", "Hi!");
+        storage.store_completion(&cmpl).unwrap();
 
-        let chain = storage.walk_chain("resp_001").unwrap();
+        let chain = storage.walk_chain("cmpl_001").unwrap();
         assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].id, "resp_001");
+        assert_eq!(chain[0].id, "cmpl_001");
     }
 
     #[test]
@@ -235,63 +235,63 @@ mod tests {
         let storage = SqliteStorage::new(":memory:").unwrap();
 
         storage
-            .store_response(&make_stored_response(
-                "resp_001",
+            .store_completion(&make_stored_completion(
+                "cmpl_001",
                 None,
                 "What is Rust?",
                 "Rust is a systems language",
             ))
             .unwrap();
         storage
-            .store_response(&make_stored_response(
-                "resp_002",
-                Some("resp_001"),
+            .store_completion(&make_stored_completion(
+                "cmpl_002",
+                Some("cmpl_001"),
                 "And its async story?",
                 "Tokio is the main runtime",
             ))
             .unwrap();
         storage
-            .store_response(&make_stored_response(
-                "resp_003",
-                Some("resp_002"),
+            .store_completion(&make_stored_completion(
+                "cmpl_003",
+                Some("cmpl_002"),
                 "Tell me more",
                 "Tokio provides...",
             ))
             .unwrap();
 
-        let chain = storage.walk_chain("resp_003").unwrap();
+        let chain = storage.walk_chain("cmpl_003").unwrap();
         assert_eq!(chain.len(), 3);
         // Oldest first
-        assert_eq!(chain[0].id, "resp_001");
-        assert_eq!(chain[1].id, "resp_002");
-        assert_eq!(chain[2].id, "resp_003");
+        assert_eq!(chain[0].id, "cmpl_001");
+        assert_eq!(chain[1].id, "cmpl_002");
+        assert_eq!(chain[2].id, "cmpl_003");
     }
 
     #[test]
     fn test_walk_chain_missing_link() {
         let storage = SqliteStorage::new(":memory:").unwrap();
-        // resp_002 references resp_001 which doesn't exist
+        // cmpl_002 references cmpl_001 which doesn't exist
         storage
-            .store_response(&make_stored_response(
-                "resp_002",
-                Some("resp_001"),
+            .store_completion(&make_stored_completion(
+                "cmpl_002",
+                Some("cmpl_001"),
                 "test",
                 "test",
             ))
             .unwrap();
 
-        let result = storage.walk_chain("resp_002");
+        let result = storage.walk_chain("cmpl_002");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_store_with_instructions() {
         let storage = SqliteStorage::new(":memory:").unwrap();
-        let mut resp = make_stored_response("resp_001", None, "Hello", "Hi!");
-        resp.instructions = Some("You are helpful".to_string());
-        storage.store_response(&resp).unwrap();
+        let mut cmpl = make_stored_completion("cmpl_001", None, "Hello", "Hi!");
+        cmpl.instructions = Some("You are helpful".to_string());
+        storage.store_completion(&cmpl).unwrap();
 
-        let retrieved = storage.get_response("resp_001").unwrap().unwrap();
+        let retrieved = storage.get_completion("cmpl_001").unwrap().unwrap();
         assert_eq!(retrieved.instructions.as_deref(), Some("You are helpful"));
     }
 }

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::api::types::*;
 use crate::config::Config;
-use crate::storage::{Storage, StoredEmbedding, StoredResponse};
+use crate::storage::{Storage, StoredCompletion, StoredEmbedding};
 
 /// Core proxy engine that processes requests through octolib providers
 pub struct ProxyEngine {
@@ -21,19 +21,19 @@ impl ProxyEngine {
         Self { storage, config }
     }
 
-    /// Process a create response request
-    pub async fn process(&self, req: CreateResponseRequest) -> Result<CreateResponseResponse> {
+    /// Process a create completion request
+    pub async fn process(&self, req: CreateCompletionRequest) -> Result<CreateCompletionResponse> {
         // 1. Build conversation history from chain
         let mut messages: Vec<Message> = Vec::new();
 
-        if let Some(ref prev_resp_id) = req.previous_response_id {
+        if let Some(ref prev_cmpl_id) = req.previous_completion_id {
             let chain = self
                 .storage
-                .walk_chain(prev_resp_id)
-                .with_context(|| format!("Failed to walk chain from '{}'", prev_resp_id))?;
+                .walk_chain(prev_cmpl_id)
+                .with_context(|| format!("Failed to walk chain from '{}'", prev_cmpl_id))?;
 
             for stored in &chain {
-                // Add instructions as system message (from the first response that has them)
+                // Add instructions as system message (from the first completion that has them)
                 if let Some(ref instr) = stored.instructions {
                     if !messages.iter().any(|m| m.role == "system") {
                         messages.push(Message::system(instr));
@@ -123,7 +123,7 @@ impl ProxyEngine {
             .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
 
         // 8. Build our response
-        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+        let completion_id = format!("cmpl_{}", Uuid::new_v4().simple());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -180,9 +180,9 @@ impl ProxyEngine {
             request_time_ms: exchange_usage.as_ref().and_then(|u| u.request_time_ms),
         };
 
-        let response = CreateResponseResponse {
-            id: response_id.clone(),
-            object: "response",
+        let response = CreateCompletionResponse {
+            id: completion_id.clone(),
+            object: "completion",
             model: resolved_model.clone(),
             output: output.clone(),
             usage: usage.clone(),
@@ -190,7 +190,7 @@ impl ProxyEngine {
         };
 
         // 9. Store for observability
-        let session_id = if let Some(ref prev_id) = req.previous_response_id {
+        let session_id = if let Some(ref prev_id) = req.previous_completion_id {
             self.storage
                 .get_session_id(prev_id)?
                 .unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()))
@@ -198,10 +198,10 @@ impl ProxyEngine {
             format!("sess_{}", Uuid::new_v4().simple())
         };
 
-        let stored = StoredResponse {
-            id: response_id,
+        let stored = StoredCompletion {
+            id: completion_id,
             session_id,
-            previous_response_id: req.previous_response_id.clone(),
+            previous_completion_id: req.previous_completion_id.clone(),
             input_model: req.model.clone(),
             resolved_model,
             provider: provider.name().to_string(),
@@ -215,7 +215,7 @@ impl ProxyEngine {
             usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
             created_at: now,
         };
-        self.storage.store_response(&stored)?;
+        self.storage.store_completion(&stored)?;
 
         Ok(response)
     }

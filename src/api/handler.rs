@@ -4,7 +4,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 
-use crate::api::types::{CreateEmbeddingRequest, CreateResponseRequest};
+use crate::api::types::{CreateCompletionRequest, CreateEmbeddingRequest};
 use crate::proxy::engine::ProxyEngine;
 
 type BoxBody = Full<Bytes>;
@@ -31,7 +31,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
 }
 
 /// Handle POST /v1/completions
-pub async fn handle_create_response(
+pub async fn handle_create_completion(
     req: Request<hyper::body::Incoming>,
     engine: Arc<ProxyEngine>,
     api_key: Option<String>,
@@ -58,7 +58,7 @@ pub async fn handle_create_response(
     };
 
     // Parse request
-    let create_req: CreateResponseRequest = match serde_json::from_slice(&body_bytes) {
+    let create_req: CreateCompletionRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
             return error_response(

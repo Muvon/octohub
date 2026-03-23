@@ -110,7 +110,7 @@ async fn route(
 
     match (method, path.as_str()) {
         (Method::POST, "/v1/completions") => {
-            api::handler::handle_create_response(req, engine, api_key).await
+            api::handler::handle_create_completion(req, engine, api_key).await
         }
         (Method::POST, "/v1/embeddings") => {
             api::handler::handle_create_embedding(req, engine, api_key).await

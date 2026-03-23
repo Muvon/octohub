@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-/// Request to create a model response (OpenAI Responses API compatible)
+/// Request to create a completion (OpenAI Responses API compatible)
 #[derive(Debug, Deserialize)]
-pub struct CreateResponseRequest {
+pub struct CreateCompletionRequest {
     /// Model identifier in "provider:model" format (e.g., "openai:gpt-4o")
     pub model: String,
 
@@ -13,9 +13,9 @@ pub struct CreateResponseRequest {
     #[serde(default)]
     pub instructions: Option<String>,
 
-    /// Previous response ID for multi-turn conversations
+    /// Previous completion ID for multi-turn conversations
     #[serde(default)]
-    pub previous_response_id: Option<String>,
+    pub previous_completion_id: Option<String>,
 
     /// Sampling temperature (0.0 to 2.0)
     #[serde(default = "default_temperature")]
@@ -72,12 +72,12 @@ pub struct ToolDefinition {
     pub parameters: Option<serde_json::Value>,
 }
 
-/// Response object (OpenAI Responses API compatible)
+/// Completion response object
 #[derive(Debug, Serialize)]
-pub struct CreateResponseResponse {
-    /// Unique response ID
+pub struct CreateCompletionResponse {
+    /// Unique completion ID
     pub id: String,
-    /// Object type (always "response")
+    /// Object type (always "completion")
     pub object: &'static str,
     /// Model used
     pub model: String,
@@ -89,7 +89,7 @@ pub struct CreateResponseResponse {
     pub created_at: u64,
 }
 
-/// Output item in a response
+/// Output item in a completion
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum OutputItem {
@@ -214,10 +214,10 @@ mod tests {
             "model": "openai:gpt-4o",
             "input": "Hello, world!"
         }"#;
-        let req: CreateResponseRequest = serde_json::from_str(json).unwrap();
+        let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.model, "openai:gpt-4o");
         assert!(matches!(req.input, Input::Text(ref s) if s == "Hello, world!"));
-        assert!(req.previous_response_id.is_none());
+        assert!(req.previous_completion_id.is_none());
         assert_eq!(req.temperature, 1.0);
     }
 
@@ -231,7 +231,7 @@ mod tests {
             "instructions": "You are helpful",
             "temperature": 0.7
         }"#;
-        let req: CreateResponseRequest = serde_json::from_str(json).unwrap();
+        let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.instructions.as_deref(), Some("You are helpful"));
         assert_eq!(req.temperature, 0.7);
         if let Input::Items(items) = &req.input {
@@ -251,10 +251,10 @@ mod tests {
             "input": [
                 {"type": "function_call_output", "call_id": "call_abc123", "output": "72°F sunny"}
             ],
-            "previous_response_id": "resp_001"
+            "previous_completion_id": "cmpl_001"
         }"#;
-        let req: CreateResponseRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.previous_response_id.as_deref(), Some("resp_001"));
+        let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.previous_completion_id.as_deref(), Some("cmpl_001"));
         if let Input::Items(items) = &req.input {
             assert_eq!(items.len(), 1);
             assert!(
@@ -279,17 +279,17 @@ mod tests {
                 }
             ]
         }"#;
-        let req: CreateResponseRequest = serde_json::from_str(json).unwrap();
+        let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
         let tools = req.tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "get_weather");
     }
 
     #[test]
-    fn test_serialize_response_message() {
-        let resp = CreateResponseResponse {
-            id: "resp_001".to_string(),
-            object: "response",
+    fn test_serialize_completion_message() {
+        let resp = CreateCompletionResponse {
+            id: "cmpl_001".to_string(),
+            object: "completion",
             model: "gpt-4o".to_string(),
             output: vec![OutputItem::Message {
                 id: "msg_001".to_string(),
@@ -310,18 +310,18 @@ mod tests {
             created_at: 1700000000,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["id"], "resp_001");
-        assert_eq!(json["object"], "response");
+        assert_eq!(json["id"], "cmpl_001");
+        assert_eq!(json["object"], "completion");
         assert_eq!(json["output"][0]["type"], "message");
         assert_eq!(json["output"][0]["content"][0]["type"], "output_text");
         assert_eq!(json["output"][0]["content"][0]["text"], "Hello!");
     }
 
     #[test]
-    fn test_serialize_response_function_call() {
-        let resp = CreateResponseResponse {
-            id: "resp_002".to_string(),
-            object: "response",
+    fn test_serialize_completion_function_call() {
+        let resp = CreateCompletionResponse {
+            id: "cmpl_002".to_string(),
+            object: "completion",
             model: "gpt-4o".to_string(),
             output: vec![OutputItem::FunctionCall {
                 id: "fc_001".to_string(),
