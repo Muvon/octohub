@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use config::Config;
 use proxy::engine::ProxyEngine;
 use storage::sqlite::SqliteStorage;
+use storage::Storage;
 
 type BoxBody = Full<Bytes>;
 
@@ -58,36 +59,44 @@ async fn main() -> anyhow::Result<()> {
         config.server.port = parts[1].parse().context("Invalid port in bind argument")?;
     }
 
+    if config.server.api_key.is_none() {
+        anyhow::bail!(
+            "Master API key (server.api_key) must be set in config. \
+             Admin endpoints require it for authentication."
+        );
+    }
+
     let config = Arc::new(config);
 
     // Initialize storage
-    let storage = Arc::new(SqliteStorage::new(&config.server.db_path)?);
+    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::new(&config.server.db_path)?);
     tracing::info!("Database initialized at: {}", config.server.db_path);
 
     // Initialize proxy engine
-    let engine = Arc::new(ProxyEngine::new(storage, config.clone()));
+    let engine = Arc::new(ProxyEngine::new(storage.clone(), config.clone()));
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("OctoHub server listening on {}", addr);
-
-    if config.server.api_key.is_some() {
-        tracing::info!("API key authentication enabled");
-    } else {
-        tracing::warn!("No API key configured - authentication disabled");
-    }
+    tracing::info!("Admin authentication enabled (master key)");
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let engine = engine.clone();
-        let api_key = config.server.api_key.clone();
+        let storage = storage.clone();
+        let master_key = config.server.api_key.clone();
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let engine = engine.clone();
-                let api_key = api_key.clone();
-                async move { Ok::<_, hyper::Error>(route(req, engine, api_key, remote_addr).await) }
+                let storage = storage.clone();
+                let master_key = master_key.clone();
+                async move {
+                    Ok::<_, hyper::Error>(
+                        route(req, engine, storage, master_key.as_deref(), remote_addr).await,
+                    )
+                }
             });
 
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
@@ -100,7 +109,8 @@ async fn main() -> anyhow::Result<()> {
 async fn route(
     req: Request<hyper::body::Incoming>,
     engine: Arc<ProxyEngine>,
-    api_key: Option<String>,
+    storage: Arc<dyn Storage>,
+    master_key: Option<&str>,
     remote_addr: SocketAddr,
 ) -> Response<BoxBody> {
     let method = req.method().clone();
@@ -108,20 +118,92 @@ async fn route(
 
     tracing::info!("{} {} from {}", method, path, remote_addr);
 
+    // Admin endpoints: /v1/admin/* (master key auth)
+    if path.starts_with("/v1/admin/") {
+        return route_admin(req, method, &path, storage, master_key).await;
+    }
+
+    // Client endpoints (api_keys table auth)
     match (method, path.as_str()) {
         (Method::POST, "/v1/completions") => {
-            api::handler::handle_create_completion(req, engine, api_key).await
+            api::handler::handle_create_completion(req, engine, storage).await
         }
         (Method::POST, "/v1/embeddings") => {
-            api::handler::handle_create_embedding(req, engine, api_key).await
+            api::handler::handle_create_embedding(req, engine, storage).await
         }
         (Method::GET, "/health") => api::handler::handle_health(),
-        _ => Response::builder()
-            .status(404)
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(
-                r#"{"error":{"message":"Not found","type":"not_found"}}"#,
-            )))
-            .unwrap(),
+        _ => not_found(),
     }
+}
+
+async fn route_admin(
+    req: Request<hyper::body::Incoming>,
+    method: Method,
+    path: &str,
+    storage: Arc<dyn Storage>,
+    master_key: Option<&str>,
+) -> Response<BoxBody> {
+    // Parse /v1/admin/keys/:id and /v1/admin/keys/:id/revoke
+    let segments: Vec<&str> = path
+        .trim_start_matches("/v1/admin/")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    match (method, segments.as_slice()) {
+        // POST /v1/admin/keys
+        (Method::POST, ["keys"]) => api::admin::handle_create_key(req, storage, master_key).await,
+        // GET /v1/admin/keys
+        (Method::GET, ["keys"]) => api::admin::handle_list_keys(req, storage, master_key).await,
+        // GET /v1/admin/keys/:id
+        (Method::GET, ["keys", id]) => {
+            let Ok(key_id) = id.parse::<i64>() else {
+                return error_response(hyper::StatusCode::BAD_REQUEST, "Invalid key ID");
+            };
+            api::admin::handle_get_key(req, storage, master_key, key_id).await
+        }
+        // POST /v1/admin/keys/:id/revoke
+        (Method::POST, ["keys", id, "revoke"]) => {
+            let Ok(key_id) = id.parse::<i64>() else {
+                return error_response(hyper::StatusCode::BAD_REQUEST, "Invalid key ID");
+            };
+            api::admin::handle_revoke_key(req, storage, master_key, key_id).await
+        }
+        // GET /v1/admin/usage
+        (Method::GET, ["usage"]) => api::admin::handle_usage(req, storage, master_key).await,
+        // GET /v1/admin/completions
+        (Method::GET, ["completions"]) => {
+            api::admin::handle_list_completions(req, storage, master_key).await
+        }
+        // GET /v1/admin/embeddings
+        (Method::GET, ["embeddings"]) => {
+            api::admin::handle_list_embeddings(req, storage, master_key).await
+        }
+        _ => not_found(),
+    }
+}
+
+fn not_found() -> Response<BoxBody> {
+    Response::builder()
+        .status(404)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(
+            r#"{"error":{"message":"Not found","type":"not_found"}}"#,
+        )))
+        .unwrap()
+}
+
+fn error_response(status: hyper::StatusCode, message: &str) -> Response<BoxBody> {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error"
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body_bytes)))
+        .unwrap()
 }

@@ -5,7 +5,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 
 use crate::api::types::{CreateCompletionRequest, CreateEmbeddingRequest};
+use crate::auth::{authenticate_client, ClientAuth};
 use crate::proxy::engine::ProxyEngine;
+use crate::storage::Storage;
 
 type BoxBody = Full<Bytes>;
 
@@ -30,21 +32,29 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     )
 }
 
+/// Extract Authorization header value from request
+fn auth_header(req: &Request<hyper::body::Incoming>) -> Option<String> {
+    req.headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
 /// Handle POST /v1/completions
 pub async fn handle_create_completion(
     req: Request<hyper::body::Incoming>,
     engine: Arc<ProxyEngine>,
-    api_key: Option<String>,
+    storage: Arc<dyn Storage>,
 ) -> Response<BoxBody> {
-    // Auth check
-    let auth_header = req
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
-
-    if !crate::auth::check_auth(auth_header, api_key.as_deref()) {
-        return error_response(StatusCode::UNAUTHORIZED, "Invalid or missing API key");
-    }
+    // Client auth via api_keys table
+    let header = auth_header(&req);
+    let api_key_id = match authenticate_client(header.as_deref(), &storage) {
+        ClientAuth::Ok(key) => key.id,
+        ClientAuth::Missing => return error_response(StatusCode::UNAUTHORIZED, "Missing API key"),
+        ClientAuth::Invalid => {
+            return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key")
+        }
+    };
 
     // Read body
     let body_bytes = match req.collect().await {
@@ -69,7 +79,7 @@ pub async fn handle_create_completion(
     };
 
     // Process
-    match engine.process(create_req).await {
+    match engine.process(create_req, api_key_id).await {
         Ok(response) => {
             let body = serde_json::to_value(&response).unwrap_or_default();
             json_response(StatusCode::OK, body)
@@ -95,16 +105,16 @@ pub fn handle_health() -> Response<BoxBody> {
 pub async fn handle_create_embedding(
     req: Request<hyper::body::Incoming>,
     engine: Arc<ProxyEngine>,
-    api_key: Option<String>,
+    storage: Arc<dyn Storage>,
 ) -> Response<BoxBody> {
-    let auth_header = req
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
-
-    if !crate::auth::check_auth(auth_header, api_key.as_deref()) {
-        return error_response(StatusCode::UNAUTHORIZED, "Invalid or missing API key");
-    }
+    let header = auth_header(&req);
+    let api_key_id = match authenticate_client(header.as_deref(), &storage) {
+        ClientAuth::Ok(key) => key.id,
+        ClientAuth::Missing => return error_response(StatusCode::UNAUTHORIZED, "Missing API key"),
+        ClientAuth::Invalid => {
+            return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key")
+        }
+    };
 
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -126,7 +136,7 @@ pub async fn handle_create_embedding(
         }
     };
 
-    match engine.process_embedding(create_req).await {
+    match engine.process_embedding(create_req, api_key_id).await {
         Ok(response) => {
             let body = serde_json::to_value(&response).unwrap_or_default();
             json_response(StatusCode::OK, body)

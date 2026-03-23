@@ -21,8 +21,12 @@ impl ProxyEngine {
         Self { storage, config }
     }
 
-    /// Process a create completion request
-    pub async fn process(&self, req: CreateCompletionRequest) -> Result<CreateCompletionResponse> {
+    /// Process a create completion request, attributing usage to the given API key
+    pub async fn process(
+        &self,
+        req: CreateCompletionRequest,
+        api_key_id: i64,
+    ) -> Result<CreateCompletionResponse> {
         // 1. Build conversation history from chain
         let mut messages: Vec<Message> = Vec::new();
 
@@ -200,6 +204,7 @@ impl ProxyEngine {
 
         let stored = StoredCompletion {
             id: completion_id,
+            api_key_id,
             session_id,
             previous_completion_id: req.previous_completion_id.clone(),
             input_model: req.model.clone(),
@@ -220,10 +225,11 @@ impl ProxyEngine {
         Ok(response)
     }
 
-    /// Process an embedding request
+    /// Process an embedding request, attributing usage to the given API key
     pub async fn process_embedding(
         &self,
         req: CreateEmbeddingRequest,
+        api_key_id: i64,
     ) -> Result<CreateEmbeddingResponse> {
         let start = std::time::Instant::now();
 
@@ -281,6 +287,7 @@ impl ProxyEngine {
 
         let stored = StoredEmbedding {
             id: embedding_id,
+            api_key_id,
             input_model: req.model.clone(),
             resolved_model,
             provider: provider_name,
