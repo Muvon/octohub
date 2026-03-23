@@ -346,8 +346,14 @@ impl ProxyEngine {
     }
 
     /// Reconstruct output as assistant message(s) from stored JSON
+    ///
+    /// Collects all function calls into a single assistant message with
+    /// tool_calls in the unified GenericToolCall format that octolib expects.
     fn reconstruct_output(&self, output: &serde_json::Value, messages: &mut Vec<Message>) {
         if let Some(items) = output.as_array() {
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+
             for item in items {
                 if let Ok(output_item) = serde_json::from_value::<OutputItem>(item.clone()) {
                     match output_item {
@@ -360,7 +366,7 @@ impl ProxyEngine {
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             if !text.is_empty() {
-                                messages.push(Message::assistant(&text));
+                                text_parts.push(text);
                             }
                         }
                         OutputItem::FunctionCall {
@@ -369,20 +375,27 @@ impl ProxyEngine {
                             arguments,
                             ..
                         } => {
-                            // Store as assistant message with tool_calls
-                            let mut msg = Message::assistant("");
-                            msg.tool_calls = Some(serde_json::json!([{
+                            // Parse arguments string back to JSON value
+                            let args_value: serde_json::Value =
+                                serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
+                            tool_calls.push(serde_json::json!({
                                 "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": arguments
-                                }
-                            }]));
-                            messages.push(msg);
+                                "name": name,
+                                "arguments": args_value,
+                            }));
                         }
                     }
                 }
+            }
+
+            // Emit a single assistant message with text + tool_calls
+            if !tool_calls.is_empty() || !text_parts.is_empty() {
+                let content = text_parts.join("\n");
+                let mut msg = Message::assistant(&content);
+                if !tool_calls.is_empty() {
+                    msg.tool_calls = Some(serde_json::Value::Array(tool_calls));
+                }
+                messages.push(msg);
             }
         }
     }

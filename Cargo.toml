@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Muvon Un Limited <contact@muvon.io>"]
 license = "Apache-2.0"
-description = "High-performance LLM proxy server with response chaining and full request/response logging"
+description = "High-performance LLM proxy server with completion chaining and full request/response logging"
 
 [dependencies]
 octolib = { path = "../octolib", default-features = false }
