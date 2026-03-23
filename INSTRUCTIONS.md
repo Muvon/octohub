@@ -36,7 +36,7 @@ Configuration is stored in `octohub.toml` in the current working directory.
 host = "127.0.0.1"
 port = 8080
 db_path = "octohub.db"
-# api_key = "your-secret-key"  # Optional: set to enable authentication
+api_key = "your-master-secret"  # Optional: enables authentication (see below)
 
 # Model mappings: model_name -> list of fully qualified "provider:model" strings
 # When resolving, randomly pick one from the list (simple load balancing)

@@ -60,9 +60,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config.server.api_key.is_none() {
-        anyhow::bail!(
-            "Master API key (server.api_key) must be set in config. \
-             Admin endpoints require it for authentication."
+        tracing::warn!(
+            "No master API key configured (server.api_key). \
+             Server running without authentication — admin endpoints are disabled."
         );
     }
 
@@ -78,7 +78,9 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("OctoHub server listening on {}", addr);
-    tracing::info!("Admin authentication enabled (master key)");
+    if config.server.api_key.is_some() {
+        tracing::info!("Authentication enabled (master key set)");
+    }
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;

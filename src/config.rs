@@ -68,6 +68,10 @@ impl Config {
                 .with_context(|| format!("Failed to read config file: {}", path))?;
             let mut config: Config = toml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {}", path))?;
+            // Normalize empty api_key to None
+            if config.server.api_key.as_deref() == Some("") {
+                config.server.api_key = None;
+            }
 
             // Override with environment variables if set
             if let Ok(host) = env::var("OCTOHUB_HOST") {
@@ -77,7 +81,11 @@ impl Config {
                 config.server.port = port;
             }
             if let Ok(api_key) = env::var("OCTOHUB_API_KEY") {
-                config.server.api_key = Some(api_key);
+                config.server.api_key = if api_key.is_empty() {
+                    None
+                } else {
+                    Some(api_key)
+                };
             }
             if let Ok(db_path) = env::var("OCTOHUB_DB_PATH") {
                 config.server.db_path = db_path;
@@ -101,7 +109,7 @@ impl Config {
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(default_port()),
-                api_key: env::var("OCTOHUB_API_KEY").ok(),
+                api_key: env::var("OCTOHUB_API_KEY").ok().filter(|k| !k.is_empty()),
                 db_path: env::var("OCTOHUB_DB_PATH").unwrap_or_else(|_| default_db_path()),
             },
             models: HashMap::new(),

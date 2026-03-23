@@ -46,7 +46,6 @@ pub async fn handle_create_completion(
     engine: Arc<ProxyEngine>,
     storage: Arc<dyn Storage>,
 ) -> Response<BoxBody> {
-    // Client auth via api_keys table
     let header = auth_header(&req);
     let api_key_id = match authenticate_client(header.as_deref(), &storage) {
         ClientAuth::Ok(key) => key.id,

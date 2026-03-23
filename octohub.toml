@@ -3,8 +3,8 @@
 [server]
 host = "127.0.0.1"
 port = 8080
+# api_key = "your-master-secret"  # Optional: enables auth for client + admin endpoints
 db_path = "octohub.db"
-# api_key = "your-secret-key"  # Optional: set to enable authentication
 
 # Model mappings: model_name -> list of fully qualified "provider:model" strings
 # When resolving, randomly pick one from the list (simple load balancing)
