@@ -194,27 +194,14 @@ impl Serialize for EmbeddingInput {
 }
 
 /// Response from embedding creation
+/// Returns just the embedding(s):
+/// - Single input: `[0.1, 0.2, ...]`
+/// - Batch input: `[[0.1, ...], [0.2, ...]]`
 #[derive(Debug, Serialize)]
-pub struct CreateEmbeddingResponse {
-    pub id: String,
-    pub object: &'static str,
-    pub model: String,
-    pub data: Vec<EmbeddingData>,
-    pub usage: EmbeddingUsage,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EmbeddingData {
-    pub object: &'static str,
-    pub index: usize,
-    pub embedding: Vec<f32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EmbeddingUsage {
-    pub input_tokens: u64,
-    pub total_tokens: u64,
-    pub request_time_ms: Option<u64>,
+#[serde(untagged)]
+pub enum CreateEmbeddingResponse {
+    Single(Vec<f32>),
+    Batch(Vec<Vec<f32>>),
 }
 
 #[cfg(test)]

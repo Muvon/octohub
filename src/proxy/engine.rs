@@ -256,35 +256,24 @@ impl ProxyEngine {
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
-        // 4. Build response
-        let embedding_id = format!("embd_{}", Uuid::new_v4().simple());
-        let data: Vec<EmbeddingData> = embeddings
-            .into_iter()
-            .enumerate()
-            .map(|(i, emb)| EmbeddingData {
-                object: "embedding",
-                index: i,
-                embedding: emb,
-            })
-            .collect();
+        // 4. Build response (simple: just the embedding(s))
+        let response = match &req.input {
+            EmbeddingInput::Single(_) => {
+                CreateEmbeddingResponse::Single(embeddings.into_iter().next().unwrap_or_default())
+            }
+            EmbeddingInput::Batch(_) => CreateEmbeddingResponse::Batch(embeddings),
+        };
 
         // Approximate token count from input text length (rough: 1 token ≈ 4 chars)
         let approx_tokens = texts.iter().map(|t| t.len() as u64).sum::<u64>() / 4;
-        let usage = EmbeddingUsage {
-            input_tokens: approx_tokens,
-            total_tokens: approx_tokens,
-            request_time_ms: Some(elapsed_ms),
-        };
-
-        let response = CreateEmbeddingResponse {
-            id: embedding_id.clone(),
-            object: "list",
-            model: resolved_model.clone(),
-            data,
-            usage: usage.clone(),
-        };
+        let usage = serde_json::json!({
+            "input_tokens": approx_tokens,
+            "total_tokens": approx_tokens,
+            "request_time_ms": elapsed_ms,
+        });
 
         // 5. Store for observability
+        let embedding_id = format!("embd_{}", Uuid::new_v4().simple());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -296,7 +285,7 @@ impl ProxyEngine {
             resolved_model,
             provider: provider_name,
             input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
-            usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+            usage: usage.clone(),
             created_at: now,
         };
         self.storage.store_embedding(&stored)?;
