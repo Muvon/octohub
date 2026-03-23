@@ -1,11 +1,10 @@
-use super::{ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, TimeBucket, UsageRow};
+use super::{
+    generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
+    StoredEmbedding, TimeBucket, UsageRow,
+};
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
-use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// SQLite-backed storage implementation
 pub struct SqliteStorage {
@@ -76,26 +75,6 @@ impl SqliteStorage {
             conn: Mutex::new(conn),
         })
     }
-}
-
-/// Generate a cryptographically secure API key (32 random bytes, base64url-encoded)
-fn generate_api_key() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Build a masked hint from the last 4 characters of a key
-fn make_key_hint(key: &str) -> String {
-    let suffix: String = key
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("...{}", suffix)
 }
 
 fn lock_conn(conn: &Mutex<Connection>) -> Result<std::sync::MutexGuard<'_, Connection>> {
@@ -172,10 +151,7 @@ impl Storage for SqliteStorage {
         let conn = lock_conn(&self.conn)?;
         let key = generate_api_key();
         let key_hint = make_key_hint(&key);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = now_unix();
 
         conn.execute(
             "INSERT INTO api_keys (name, key, key_hint, status, created_at) VALUES (?1, ?2, ?3, 'active', ?4)",

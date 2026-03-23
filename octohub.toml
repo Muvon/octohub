@@ -4,7 +4,9 @@
 host = "127.0.0.1"
 port = 8080
 api_key = "your-master-secret"  # Optional: enables auth for client + admin endpoints
-db_path = "octohub.db"
+db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
+# db_url = "mysql://user:password@localhost:3306/octohub"
+# db_url = "postgres://user:password@localhost:5432/octohub"
 
 # Model mappings: model_name -> list of fully qualified "provider:model" strings
 # When resolving, randomly pick one from the list (simple load balancing)

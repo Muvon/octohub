@@ -10,7 +10,7 @@ A high-performance LLM proxy server with completion chaining, full request/respo
 - **Multi-tenant API Keys**: Issue and revoke per-client API keys; all usage is tracked per key
 - **Usage Analytics**: Aggregated usage stats by key and time bucket (hour/day/week/month)
 - **Admin API**: Manage keys and query stored data via a master-key-protected admin API
-- **SQLite Storage**: Persistent storage for logs and data
+- **Multi-Database Support**: SQLite (default), MySQL, and PostgreSQL backends
 
 ## Installation
 
@@ -31,7 +31,7 @@ Create `octohub.toml` in your working directory:
 [server]
 host = "127.0.0.1"
 port = 8080
-db_path = "octohub.db"
+db_url = "sqlite://octohub.db"  # Database DSN (see below)
 # api_key = "your-master-secret"  # Optional: enables authentication (see below)
 
 # Model mappings: model_name -> list of fully qualified "provider:model" strings
@@ -48,6 +48,20 @@ db_path = "octohub.db"
 [embedding_models]
 "voyage-3.5" = ["voyage:voyage-3.5"]
 ```
+
+### Database Configuration
+
+OctoHub supports three database backends via the `db_url` setting:
+
+| Backend | DSN format | Example |
+|---|---|---|
+| **SQLite** (default) | `sqlite://path` or bare path | `sqlite://octohub.db` |
+| **MySQL** | `mysql://user:pass@host:port/db` | `mysql://root:secret@localhost:3306/octohub` |
+| **PostgreSQL** | `postgres://user:pass@host:port/db` | `postgres://postgres:secret@localhost:5432/octohub` |
+
+Schema is created automatically on first connection. No manual migration needed.
+
+You can also set the database URL via the `OCTOHUB_DB_URL` environment variable (overrides config file).
 
 > **Note**: `api_key` is optional. If omitted (or set to an empty string), the server starts without authentication — all client endpoints are open and admin endpoints are disabled. A warning is printed at startup. Set it to enable full auth.
 

@@ -16,13 +16,17 @@
 - `src/auth.rs` - Authentication handling
 - `src/api/handler.rs` - Client endpoint handlers (`/v1/completions`, `/v1/embeddings`)
 - `src/api/admin.rs` - Admin endpoint handlers (`/v1/admin/*`)
-- `src/storage/mod.rs` - Storage trait and types
+- `src/storage/mod.rs` - Storage trait, types, and factory (`from_url`)
 - `src/storage/sqlite.rs` - SQLite storage implementation
+- `src/storage/mysql.rs` - MySQL storage implementation
+- `src/storage/postgres.rs` - PostgreSQL storage implementation
 - `src/proxy/engine.rs` - Proxy engine (routes requests to providers)
 
 ### Dependencies
 - `octolib` - Shared library from parent directory (default-features disabled)
 - `rusqlite` - SQLite database (bundled)
+- `mysql` - MySQL database
+- `postgres` - PostgreSQL database
 - `hyper` - HTTP server
 - `tokio` - Async runtime
 - `clap` - CLI argument parsing
@@ -33,8 +37,7 @@
 **There are two completely independent authentication systems. They do not interact.**
 
 ### 1. Client Auth — DB keys (`/v1/completions`, `/v1/embeddings`)
-
-- Keys are stored in the `api_keys` SQLite table
+- Keys are stored in the `api_keys` database table
 - Created and managed via admin endpoints
 - Every request must supply a valid active key: `Authorization: Bearer <client-key>`
 - Validated by `authenticate_client()` in `src/auth.rs` — looks up the key hash in the DB
@@ -69,7 +72,7 @@ Configuration is stored in `octohub.toml` in the current working directory.
 [server]
 host = "127.0.0.1"
 port = 8080
-db_path = "octohub.db"
+db_url = "sqlite://octohub.db"  # Database DSN (see below)
 # api_key = "your-master-secret"  # Optional: enables /v1/admin/* endpoints
 
 # Model mappings: model_name -> list of fully qualified "provider:model" strings
@@ -83,6 +86,20 @@ db_path = "octohub.db"
 # Multiple providers (random selection)
 # "my-model" = ["minimax:minimax-m2.7", "ollama:minimax-m2.7"]
 ```
+
+### Database Configuration
+
+OctoHub supports three database backends via the `db_url` setting:
+
+| Backend | DSN format | Example |
+|---|---|---|
+| **SQLite** (default) | `sqlite://path` or bare path | `sqlite://octohub.db` |
+| **MySQL** | `mysql://user:pass@host:port/db` | `mysql://root:secret@localhost:3306/octohub` |
+| **PostgreSQL** | `postgres://user:pass@host:port/db` | `postgres://postgres:secret@localhost:5432/octohub` |
+
+Schema is created automatically on first connection. No manual migration needed.
+
+Environment variable `OCTOHUB_DB_URL` overrides the config file value.
 
 ## Development Workflow
 

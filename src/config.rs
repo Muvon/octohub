@@ -30,9 +30,13 @@ pub struct ServerConfig {
     pub port: u16,
     /// API key for authentication (optional)
     pub api_key: String,
-    /// SQLite database path
-    #[serde(default = "default_db_path")]
-    pub db_path: String,
+    /// Database URL (DSN). Supported schemes: sqlite://, mysql://, postgres://
+    /// Examples:
+    ///   sqlite://octohub.db       (or just a path for backward compat)
+    ///   mysql://user:pass@host:3306/dbname
+    ///   postgres://user:pass@host:5432/dbname
+    #[serde(default = "default_db_url", alias = "db_path")]
+    pub db_url: String,
 }
 
 fn default_host() -> String {
@@ -43,8 +47,8 @@ fn default_port() -> u16 {
     8080
 }
 
-fn default_db_path() -> String {
-    "octohub.db".to_string()
+fn default_db_url() -> String {
+    "sqlite://octohub.db".to_string()
 }
 
 impl Default for ServerConfig {
@@ -53,7 +57,7 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             api_key: String::new(),
-            db_path: default_db_path(),
+            db_url: default_db_url(),
         }
     }
 }
@@ -72,8 +76,8 @@ impl Config {
             if let Ok(api_key) = env::var("OCTOHUB_API_KEY") {
                 config.server.api_key = api_key;
             }
-            if let Ok(db_path) = env::var("OCTOHUB_DB_PATH") {
-                config.server.db_path = db_path;
+            if let Ok(db_url) = env::var("OCTOHUB_DB_URL") {
+                config.server.db_url = db_url;
             }
 
             tracing::info!("Loaded config from {}", path);
@@ -95,7 +99,7 @@ impl Config {
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(default_port()),
                 api_key: env::var("OCTOHUB_API_KEY").unwrap_or_default(),
-                db_path: env::var("OCTOHUB_DB_PATH").unwrap_or_else(|_| default_db_path()),
+                db_url: env::var("OCTOHUB_DB_URL").unwrap_or_else(|_| default_db_url()),
             },
             models: HashMap::new(),
             embedding_models: HashMap::new(),

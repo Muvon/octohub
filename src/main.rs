@@ -19,7 +19,6 @@ use tokio::net::TcpListener;
 
 use config::Config;
 use proxy::engine::ProxyEngine;
-use storage::sqlite::SqliteStorage;
 use storage::Storage;
 
 type BoxBody = Full<Bytes>;
@@ -65,9 +64,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(config);
 
-    // Initialize storage
-    let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::new(&config.server.db_path)?);
-    tracing::info!("Database initialized at: {}", config.server.db_path);
+    // Initialize storage from DSN
+    let storage: Arc<dyn Storage> = storage::from_url(&config.server.db_url)?;
+    tracing::info!("Database initialized: {}", config.server.db_url);
 
     // Initialize proxy engine
     let engine = Arc::new(ProxyEngine::new(storage.clone(), config.clone()));
