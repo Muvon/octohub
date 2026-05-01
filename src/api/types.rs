@@ -56,6 +56,21 @@ pub enum InputItem {
     /// Output from a function call (tool result)
     #[serde(rename = "function_call_output")]
     FunctionCallOutput { call_id: String, output: String },
+    /// A prior assistant tool call replayed by the client (used when migrating
+    /// mid-conversation from a stateless provider that recorded tool_calls).
+    /// Mirrors `OutputItem::FunctionCall` so clients can copy items verbatim.
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        /// JSON-encoded arguments string (same shape as OutputItem::FunctionCall).
+        arguments: String,
+    },
+    /// A prior assistant reasoning/thinking block replayed by the client.
+    /// Required by DeepSeek when the prior assistant turn produced tool_calls.
+    /// Mirrors `OutputItem::Reasoning`.
+    #[serde(rename = "reasoning")]
+    Reasoning { content: Vec<ContentPart> },
 }
 
 /// A structured content part used in message content or instructions.
@@ -94,6 +109,7 @@ impl ContentValue {
     }
 
     /// First `cache_control.ttl` value found, if any (e.g. "1h").
+    #[cfg(test)]
     pub fn cache_ttl(&self) -> Option<String> {
         match self {
             ContentValue::Parts(parts) => parts.iter().find_map(|p| {
@@ -365,6 +381,31 @@ mod tests {
         } else {
             panic!("Expected Items input");
         }
+    }
+
+    #[test]
+    fn test_deserialize_function_call_input() {
+        // Client migrating from a stateless provider replays the prior assistant
+        // tool call as an input item alongside the matching function_call_output.
+        let json = r#"{
+    		"model": "deepseek:deepseek-chat",
+    		"input": [
+    			{"type": "message", "role": "user", "content": "weather in Paris?"},
+    			{"type": "reasoning", "content": [{"type": "output_text", "text": "Need to call get_weather"}]},
+    			{"type": "function_call", "call_id": "call_xyz", "name": "get_weather", "arguments": "{\"location\":\"Paris\"}"},
+    			{"type": "function_call_output", "call_id": "call_xyz", "output": "18°C cloudy"},
+    			{"type": "message", "role": "user", "content": "and London?"}
+    		]
+    	}"#;
+        let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
+        let Input::Items(items) = &req.input else {
+            panic!("Expected Items input");
+        };
+        assert_eq!(items.len(), 5);
+        assert!(matches!(&items[1], InputItem::Reasoning { .. }));
+        assert!(
+            matches!(&items[2], InputItem::FunctionCall { call_id, name, arguments } if call_id == "call_xyz" && name == "get_weather" && arguments.contains("Paris"))
+        );
     }
 
     #[test]

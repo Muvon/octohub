@@ -89,16 +89,7 @@ impl ProxyEngine {
                 messages.push(Message::user(text));
             }
             Input::Items(items) => {
-                for item in items {
-                    match item {
-                        InputItem::Message { role, content } => {
-                            messages.push(content_to_message(role, content));
-                        }
-                        InputItem::FunctionCallOutput { call_id, output } => {
-                            messages.push(Message::tool(output, call_id, "function"));
-                        }
-                    }
-                }
+                push_items(items, &mut messages);
             }
         }
 
@@ -346,7 +337,7 @@ impl ProxyEngine {
         if let Some(text) = input.as_str() {
             messages.push(Message::user(text));
         } else if let Some(items) = input.as_array() {
-            push_items(items, messages);
+            push_stored_items(items, messages);
         }
         // Handle {"Text": "..."} from serde serialization of Input::Text
         else if let Some(text) = input.get("Text").and_then(|v| v.as_str()) {
@@ -354,7 +345,7 @@ impl ProxyEngine {
         }
         // Handle {"Items": [...]} from serde serialization of Input::Items
         else if let Some(items) = input.get("Items").and_then(|v| v.as_array()) {
-            push_items(items, messages);
+            push_stored_items(items, messages);
         }
     }
 
@@ -445,7 +436,6 @@ fn content_to_message(role: &str, content: &ContentValue) -> Message {
     };
     if content.is_cached() {
         msg.cached = true;
-        msg.cache_ttl = content.cache_ttl();
     }
     msg
 }
@@ -455,27 +445,95 @@ fn content_to_system(content: &ContentValue) -> Message {
     let mut msg = Message::system(&content.text());
     if content.is_cached() {
         msg.cached = true;
-        msg.cache_ttl = content.cache_ttl();
     }
     msg
 }
 
-/// Deserialize each stored input item and append it to the message list.
-/// Silently skips items that fail to parse (forward-compat with new types).
-fn push_items(items: &[serde_json::Value], messages: &mut Vec<Message>) {
+/// Convert input items into octolib `Message`s and append to the list.
+///
+/// FunctionCall and Reasoning items are coalesced onto the preceding assistant
+/// Message (matching how `reconstruct_output` builds them on the way out), so
+/// providers receive a single assistant turn carrying text + tool_calls +
+/// thinking together — required by DeepSeek's `reasoning_content` rule and by
+/// octolib's tool_calls-attached-to-message convention.
+fn push_items(items: &[InputItem], messages: &mut Vec<Message>) {
     for item in items {
-        let Ok(input_item) = serde_json::from_value::<InputItem>(item.clone()) else {
-            continue;
-        };
-        match input_item {
+        match item {
             InputItem::Message { role, content } => {
-                messages.push(content_to_message(&role, &content));
+                messages.push(content_to_message(role, content));
             }
             InputItem::FunctionCallOutput { call_id, output } => {
-                messages.push(Message::tool(&output, &call_id, "function"));
+                messages.push(Message::tool(output, call_id, "function"));
+            }
+            InputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                let args_value: serde_json::Value =
+                    serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
+                let tool_call = serde_json::json!({
+                    "id": call_id,
+                    "name": name,
+                    "arguments": args_value,
+                });
+                attach_tool_call_to_assistant(messages, tool_call);
+            }
+            InputItem::Reasoning { content } => {
+                let text: String = content
+                    .iter()
+                    .map(|c| match c {
+                        ContentPart::OutputText { text } => text.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    attach_thinking_to_assistant(messages, text);
+                }
             }
         }
     }
+}
+
+/// Deserialize stored JSON input items, skipping any that fail to parse
+/// (forward-compat with new types), then forward to `push_items`.
+fn push_stored_items(items: &[serde_json::Value], messages: &mut Vec<Message>) {
+    let typed: Vec<InputItem> = items
+        .iter()
+        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+        .collect();
+    push_items(&typed, messages);
+}
+
+/// Append `tool_call` to the trailing assistant Message's `tool_calls` array,
+/// or create an empty assistant Message carrying it if none precedes.
+fn attach_tool_call_to_assistant(messages: &mut Vec<Message>, tool_call: serde_json::Value) {
+    if let Some(last) = messages.last_mut() {
+        if last.role == "assistant" {
+            match last.tool_calls.as_mut() {
+                Some(serde_json::Value::Array(arr)) => arr.push(tool_call),
+                _ => last.tool_calls = Some(serde_json::Value::Array(vec![tool_call])),
+            }
+            return;
+        }
+    }
+    let mut msg = Message::assistant("");
+    msg.tool_calls = Some(serde_json::Value::Array(vec![tool_call]));
+    messages.push(msg);
+}
+
+/// Attach `text` as a ThinkingBlock on the trailing assistant Message, or create
+/// an empty assistant Message carrying it if none precedes.
+fn attach_thinking_to_assistant(messages: &mut Vec<Message>, text: String) {
+    if let Some(last) = messages.last_mut() {
+        if last.role == "assistant" {
+            last.thinking = Some(ThinkingBlock::new(&text));
+            return;
+        }
+    }
+    let mut msg = Message::assistant("");
+    msg.thinking = Some(ThinkingBlock::new(&text));
+    messages.push(msg);
 }
 
 // Implement Serialize for Input so we can store it
@@ -488,5 +546,88 @@ impl serde::Serialize for Input {
             Input::Text(s) => serializer.serialize_str(s),
             Input::Items(items) => items.serialize(serializer),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(json: &str) -> InputItem {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn function_call_coalesces_onto_preceding_assistant() {
+        // Client replays: user → assistant text → function_call → function_call_output → user
+        // Expected octolib message shape: user / assistant(text + tool_calls) / tool / user
+        let items = vec![
+            item(r#"{"type":"message","role":"user","content":"hi"}"#),
+            item(r#"{"type":"message","role":"assistant","content":"calling tool"}"#),
+            item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
+            item(r#"{"type":"function_call_output","call_id":"c1","output":"ok"}"#),
+            item(r#"{"type":"message","role":"user","content":"thanks"}"#),
+        ];
+        let mut messages = Vec::new();
+        push_items(&items, &mut messages);
+
+        assert_eq!(messages.len(), 4, "tool_call merges into assistant turn");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+        assert!(
+            messages[1].tool_calls.is_some(),
+            "assistant must carry tool_calls"
+        );
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[3].role, "user");
+    }
+
+    #[test]
+    fn function_call_without_preceding_assistant_creates_one() {
+        // Edge case: client sends function_call as the first item with no prior assistant.
+        let items = vec![
+            item(r#"{"type":"message","role":"user","content":"go"}"#),
+            item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
+        ];
+        let mut messages = Vec::new();
+        push_items(&items, &mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert!(messages[1].tool_calls.is_some());
+    }
+
+    #[test]
+    fn reasoning_attaches_thinking_to_preceding_assistant() {
+        // DeepSeek migration path: reasoning + tool_call replayed together must
+        // produce one assistant Message carrying both thinking and tool_calls.
+        let items = vec![
+            item(r#"{"type":"message","role":"user","content":"q"}"#),
+            item(r#"{"type":"message","role":"assistant","content":""}"#),
+            item(r#"{"type":"reasoning","content":[{"type":"output_text","text":"think..."}]}"#),
+            item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
+        ];
+        let mut messages = Vec::new();
+        push_items(&items, &mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, "assistant");
+        assert!(messages[1].thinking.is_some());
+        assert!(messages[1].tool_calls.is_some());
+    }
+
+    #[test]
+    fn multiple_tool_calls_accumulate_on_same_assistant() {
+        let items = vec![
+            item(r#"{"type":"message","role":"assistant","content":""}"#),
+            item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
+            item(r#"{"type":"function_call","call_id":"c2","name":"g","arguments":"{}"}"#),
+        ];
+        let mut messages = Vec::new();
+        push_items(&items, &mut messages);
+
+        assert_eq!(messages.len(), 1);
+        let arr = messages[0].tool_calls.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 2);
     }
 }
