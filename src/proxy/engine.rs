@@ -30,6 +30,10 @@ impl ProxyEngine {
         // 1. Build conversation history from chain
         let mut messages: Vec<Message> = Vec::new();
 
+        // Live system message from req.instructions has priority over chain-stored
+        // instructions because the request carries the current cache_control marker.
+        let mut system_msg: Option<Message> = req.instructions.as_ref().map(content_to_system);
+
         if let Some(ref prev_cmpl_id) = req.previous_completion_id {
             let chain = self
                 .storage
@@ -37,10 +41,11 @@ impl ProxyEngine {
                 .with_context(|| format!("Failed to walk chain from '{}'", prev_cmpl_id))?;
 
             for stored in &chain {
-                // Add instructions as system message (from the first completion that has them)
-                if let Some(ref instr) = stored.instructions {
-                    if !messages.iter().any(|m| m.role == "system") {
-                        messages.push(Message::system(instr));
+                // Fall back to chain-stored instructions only if the request didn't
+                // supply any (cache markers are not preserved on this path).
+                if system_msg.is_none() {
+                    if let Some(ref instr) = stored.instructions {
+                        system_msg = Some(Message::system(instr));
                     }
                 }
 
@@ -52,11 +57,9 @@ impl ProxyEngine {
             }
         }
 
-        // 2. Add instructions if provided and not already in history
-        if let Some(ref instructions) = req.instructions {
-            if !messages.iter().any(|m| m.role == "system") {
-                messages.insert(0, Message::system(instructions));
-            }
+        // 2. Prepend resolved system message (if any) at the head of history
+        if let Some(sys) = system_msg {
+            messages.insert(0, sys);
         }
 
         // 3. Append new input
@@ -68,13 +71,7 @@ impl ProxyEngine {
                 for item in items {
                     match item {
                         InputItem::Message { role, content } => {
-                            let msg = match role.as_str() {
-                                "user" => Message::user(content),
-                                "system" => Message::system(content),
-                                "assistant" => Message::assistant(content),
-                                _ => Message::user(content),
-                            };
-                            messages.push(msg);
+                            messages.push(content_to_message(role, content));
                         }
                         InputItem::FunctionCallOutput { call_id, output } => {
                             messages.push(Message::tool(output, call_id, "function"));
@@ -212,7 +209,7 @@ impl ProxyEngine {
             provider: provider.name().to_string(),
             input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
             output: serde_json::to_value(&output).unwrap_or(serde_json::Value::Null),
-            instructions: req.instructions.clone(),
+            instructions: req.instructions.as_ref().map(|i| i.text()),
             exchange: serde_json::json!({
                 "request": provider_response.exchange.request,
                 "response": provider_response.exchange.response,
@@ -306,24 +303,7 @@ impl ProxyEngine {
         if let Some(text) = input.as_str() {
             messages.push(Message::user(text));
         } else if let Some(items) = input.as_array() {
-            for item in items {
-                if let Ok(input_item) = serde_json::from_value::<InputItem>(item.clone()) {
-                    match input_item {
-                        InputItem::Message { role, content } => {
-                            let msg = match role.as_str() {
-                                "user" => Message::user(&content),
-                                "system" => Message::system(&content),
-                                "assistant" => Message::assistant(&content),
-                                _ => Message::user(&content),
-                            };
-                            messages.push(msg);
-                        }
-                        InputItem::FunctionCallOutput { call_id, output } => {
-                            messages.push(Message::tool(&output, &call_id, "function"));
-                        }
-                    }
-                }
-            }
+            push_items(items, messages);
         }
         // Handle {"Text": "..."} from serde serialization of Input::Text
         else if let Some(text) = input.get("Text").and_then(|v| v.as_str()) {
@@ -331,24 +311,7 @@ impl ProxyEngine {
         }
         // Handle {"Items": [...]} from serde serialization of Input::Items
         else if let Some(items) = input.get("Items").and_then(|v| v.as_array()) {
-            for item in items {
-                if let Ok(input_item) = serde_json::from_value::<InputItem>(item.clone()) {
-                    match input_item {
-                        InputItem::Message { role, content } => {
-                            let msg = match role.as_str() {
-                                "user" => Message::user(&content),
-                                "system" => Message::system(&content),
-                                "assistant" => Message::assistant(&content),
-                                _ => Message::user(&content),
-                            };
-                            messages.push(msg);
-                        }
-                        InputItem::FunctionCallOutput { call_id, output } => {
-                            messages.push(Message::tool(&output, &call_id, "function"));
-                        }
-                    }
-                }
-            }
+            push_items(items, messages);
         }
     }
 
@@ -403,6 +366,52 @@ impl ProxyEngine {
                     msg.tool_calls = Some(serde_json::Value::Array(tool_calls));
                 }
                 messages.push(msg);
+            }
+        }
+    }
+}
+
+/// Build an octolib `Message` from an input message, extracting plain text
+/// from either `ContentValue::Text` or `ContentValue::Parts` and propagating
+/// any `cache_control` markers as `cached`/`cache_ttl` flags.
+fn content_to_message(role: &str, content: &ContentValue) -> Message {
+    let text = content.text();
+    let mut msg = match role {
+        "user" => Message::user(&text),
+        "system" => Message::system(&text),
+        "assistant" => Message::assistant(&text),
+        _ => Message::user(&text),
+    };
+    if content.is_cached() {
+        msg.cached = true;
+        msg.cache_ttl = content.cache_ttl();
+    }
+    msg
+}
+
+/// Build the system message from request `instructions`, preserving cache markers.
+fn content_to_system(content: &ContentValue) -> Message {
+    let mut msg = Message::system(&content.text());
+    if content.is_cached() {
+        msg.cached = true;
+        msg.cache_ttl = content.cache_ttl();
+    }
+    msg
+}
+
+/// Deserialize each stored input item and append it to the message list.
+/// Silently skips items that fail to parse (forward-compat with new types).
+fn push_items(items: &[serde_json::Value], messages: &mut Vec<Message>) {
+    for item in items {
+        let Ok(input_item) = serde_json::from_value::<InputItem>(item.clone()) else {
+            continue;
+        };
+        match input_item {
+            InputItem::Message { role, content } => {
+                messages.push(content_to_message(&role, &content));
+            }
+            InputItem::FunctionCallOutput { call_id, output } => {
+                messages.push(Message::tool(&output, &call_id, "function"));
             }
         }
     }

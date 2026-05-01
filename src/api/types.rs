@@ -9,9 +9,10 @@ pub struct CreateCompletionRequest {
     /// Input content - either a simple string or array of input items
     pub input: Input,
 
-    /// System instructions (optional, sent as system message)
+    /// System instructions — plain string or array of typed text parts.
+    /// Array form carries optional `cache_control` markers per Responses API spec.
     #[serde(default)]
-    pub instructions: Option<String>,
+    pub instructions: Option<ContentValue>,
 
     /// Previous completion ID for multi-turn conversations
     #[serde(default)]
@@ -48,12 +49,63 @@ pub enum Input {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum InputItem {
-    /// A conversation message
+    /// A conversation message. `content` is either a plain string or
+    /// an array of typed parts carrying optional `cache_control`.
     #[serde(rename = "message")]
-    Message { role: String, content: String },
+    Message { role: String, content: ContentValue },
     /// Output from a function call (tool result)
     #[serde(rename = "function_call_output")]
     FunctionCallOutput { call_id: String, output: String },
+}
+
+/// A structured content part used in message content or instructions.
+/// Per Responses API spec: `type` is "text" (instructions) or "input_text" (user content).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentPartInput {
+    #[serde(rename = "type")]
+    pub part_type: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
+}
+
+/// Either a plain string or an array of structured content parts.
+/// Used for both message `content` and system `instructions`. Array form
+/// allows clients to attach `cache_control` markers (ephemeral caching).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContentValue {
+    Text(String),
+    Parts(Vec<ContentPartInput>),
+}
+
+impl ContentValue {
+    /// Concatenated text payload (parts joined without separator).
+    pub fn text(&self) -> String {
+        match self {
+            ContentValue::Text(s) => s.clone(),
+            ContentValue::Parts(parts) => parts.iter().map(|p| p.text.as_str()).collect::<String>(),
+        }
+    }
+
+    /// True when any part carries a `cache_control` marker.
+    pub fn is_cached(&self) -> bool {
+        matches!(self, ContentValue::Parts(parts) if parts.iter().any(|p| p.cache_control.is_some()))
+    }
+
+    /// First `cache_control.ttl` value found, if any (e.g. "1h").
+    pub fn cache_ttl(&self) -> Option<String> {
+        match self {
+            ContentValue::Parts(parts) => parts.iter().find_map(|p| {
+                p.cache_control
+                    .as_ref()
+                    .and_then(|cc| cc.get("ttl"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            }),
+            ContentValue::Text(_) => None,
+        }
+    }
 }
 
 /// Tool definition for function calling
@@ -232,13 +284,72 @@ mod tests {
             "temperature": 0.7
         }"#;
         let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.instructions.as_deref(), Some("You are helpful"));
+        assert_eq!(
+            req.instructions.as_ref().map(|i| i.text()).as_deref(),
+            Some("You are helpful")
+        );
+        assert!(!req.instructions.as_ref().unwrap().is_cached());
         assert_eq!(req.temperature, 0.7);
         if let Input::Items(items) = &req.input {
             assert_eq!(items.len(), 1);
-            assert!(
-                matches!(&items[0], InputItem::Message { role, content } if role == "user" && content == "What is Rust?")
-            );
+            match &items[0] {
+                InputItem::Message { role, content } => {
+                    assert_eq!(role, "user");
+                    assert_eq!(content.text(), "What is Rust?");
+                    assert!(!content.is_cached());
+                }
+                _ => panic!("expected Message"),
+            }
+        } else {
+            panic!("Expected Items input");
+        }
+    }
+
+    #[test]
+    fn test_deserialize_cached_instructions_array() {
+        // Reproduces the failure mode reported by octolib's OctoHub provider:
+        // when system prompt is cached, instructions arrive as an array of
+        // {type, text, cache_control} parts. Must deserialize cleanly.
+        let json = r#"{
+            "model": "octohub:glm-5.1",
+            "input": "hihi",
+            "instructions": [
+                {"type": "text", "text": "You are an assistant.", "cache_control": {"type": "ephemeral"}}
+            ]
+        }"#;
+        let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
+        let instr = req.instructions.expect("instructions present");
+        assert_eq!(instr.text(), "You are an assistant.");
+        assert!(instr.is_cached());
+        assert_eq!(instr.cache_ttl(), None);
+    }
+
+    #[test]
+    fn test_deserialize_cached_message_content_array() {
+        // Mirror failure mode for user message content: array of input_text parts.
+        let json = r#"{
+            "model": "octohub:glm-5.1",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Hello", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                    ]
+                }
+            ]
+        }"#;
+        let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
+        if let Input::Items(items) = &req.input {
+            match &items[0] {
+                InputItem::Message { role, content } => {
+                    assert_eq!(role, "user");
+                    assert_eq!(content.text(), "Hello");
+                    assert!(content.is_cached());
+                    assert_eq!(content.cache_ttl().as_deref(), Some("1h"));
+                }
+                _ => panic!("expected Message"),
+            }
         } else {
             panic!("Expected Items input");
         }

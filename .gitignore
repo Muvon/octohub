@@ -1,3 +1,5 @@
 /target
 octohub.db*
 __pycache__
+octohub.server.toml
+
