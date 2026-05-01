@@ -36,11 +36,30 @@ impl ProxyEngine {
         // instructions because the request carries the current cache_control marker.
         let mut system_msg: Option<Message> = req.instructions.as_ref().map(content_to_system);
 
+        // Tracks whether the supplied previous_completion_id actually resolved.
+        // Unknown IDs are accepted (stateless-provider migration path) but must
+        // not be persisted — that would create dangling chains forever.
+        let mut resolved_prev_id: Option<String> = None;
+
         if let Some(ref prev_cmpl_id) = req.previous_completion_id {
-            let chain = self
-                .storage
-                .walk_chain(prev_cmpl_id)
-                .with_context(|| format!("Failed to walk chain from '{}'", prev_cmpl_id))?;
+            // Unknown IDs are tolerated — the client may be migrating from a stateless
+            // provider (Anthropic, etc.) where they pass the full history inline in
+            // `input`. Hard-failing would break that workflow. Mirrors OpenAI's
+            // guidance: "retry with full input context and previous_response_id null."
+            let chain = match self.storage.walk_chain(prev_cmpl_id) {
+                Ok(chain) => {
+                    resolved_prev_id = Some(prev_cmpl_id.clone());
+                    chain
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        previous_completion_id = %prev_cmpl_id,
+                        error = %err,
+                        "Unknown previous_completion_id — falling back to inline input only",
+                    );
+                    Vec::new()
+                }
+            };
 
             for stored in &chain {
                 // Fall back to chain-stored instructions only if the request didn't
@@ -213,8 +232,9 @@ impl ProxyEngine {
             created_at: now,
         };
 
-        // 9. Store for observability
-        let session_id = if let Some(ref prev_id) = req.previous_completion_id {
+        // 9. Store for observability. Use resolved_prev_id (None if chain didn't
+        // resolve) so we never persist a link to an unknown ID.
+        let session_id = if let Some(ref prev_id) = resolved_prev_id {
             self.storage
                 .get_session_id(prev_id)?
                 .unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()))
@@ -226,7 +246,7 @@ impl ProxyEngine {
             id: completion_id,
             api_key_id,
             session_id,
-            previous_completion_id: req.previous_completion_id.clone(),
+            previous_completion_id: resolved_prev_id,
             input_model: req.model.clone(),
             resolved_model,
             provider: provider.name().to_string(),

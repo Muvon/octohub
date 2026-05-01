@@ -162,8 +162,7 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
         || msg.contains("Failed to resolve model")
         || msg.contains("Failed to resolve embedding model")
         || msg.contains("not available")
-        || msg.contains("Invalid request")
-        || msg.contains("Failed to walk chain");
+        || msg.contains("Invalid request");
 
     let status = if is_client_error {
         StatusCode::BAD_REQUEST
