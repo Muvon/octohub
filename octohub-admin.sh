@@ -5,12 +5,16 @@
 # Usage: ./octohub-admin.sh <command> [args]
 #
 # Environment:
-#   OCTOHUB_URL       Base URL of the server (default: http://127.0.0.1:8080)
-#   OCTOHUB_MASTER_KEY  Master API key (server.api_key from octohub.toml)
+#   OCTOHUB_URL          Full base URL (overrides HOST/PORT if set)
+#   OCTOHUB_SERVER_HOST  Server host (default: 127.0.0.1)
+#   OCTOHUB_SERVER_PORT  Server port (default: 8080)
+#   OCTOHUB_MASTER_KEY   Master API key (server.api_key from octohub.toml)
 
 set -euo pipefail
 
-BASE_URL="${OCTOHUB_URL:-http://127.0.0.1:8080}"
+HOST="${OCTOHUB_SERVER_HOST:-127.0.0.1}"
+PORT="${OCTOHUB_SERVER_PORT:-8080}"
+BASE_URL="${OCTOHUB_URL:-http://${HOST}:${PORT}}"
 MASTER_KEY="${OCTOHUB_MASTER_KEY:-}"
 
 # --- helpers ---
@@ -23,10 +27,18 @@ require_master_key() {
 
 admin_curl() {
   require_master_key
-  curl -sf \
+  local body status
+  body=$(curl -sS -w $'\n%{http_code}' \
     -H "Authorization: Bearer $MASTER_KEY" \
     -H "Content-Type: application/json" \
-    "$@"
+    "$@") || die "curl failed (exit $?) — is the server reachable at $BASE_URL?"
+  status="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+  if [[ "$status" -ge 400 ]]; then
+    echo "$body" >&2
+    die "HTTP $status from $BASE_URL"
+  fi
+  printf '%s' "$body"
 }
 
 pretty() {
@@ -45,8 +57,10 @@ OctoHub Admin CLI
 Usage: $(basename "$0") <command> [args]
 
 Environment variables:
-  OCTOHUB_URL         Server base URL  (default: http://127.0.0.1:8080)
-  OCTOHUB_MASTER_KEY  Master API key   (required for all commands)
+  OCTOHUB_URL          Full server base URL (overrides HOST/PORT)
+  OCTOHUB_SERVER_HOST  Server host         (default: 127.0.0.1)
+  OCTOHUB_SERVER_PORT  Server port         (default: 8080)
+  OCTOHUB_MASTER_KEY   Master API key      (required for all commands)
 
 Commands:
   keys list                        List all API keys
