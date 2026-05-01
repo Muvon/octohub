@@ -3,7 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use octolib::embedding::{create_embedding_provider_from_parts, InputType};
-use octolib::llm::{ChatCompletionParams, FunctionDefinition, Message, ProviderFactory};
+use octolib::llm::{
+    ChatCompletionParams, FunctionDefinition, Message, ProviderFactory, ThinkingBlock,
+};
 use uuid::Uuid;
 
 use crate::api::types::*;
@@ -132,6 +134,20 @@ impl ProxyEngine {
 
         let mut output = Vec::new();
 
+        // Emit reasoning FIRST so it's replayed before assistant message/tool_calls.
+        // DeepSeek requires `reasoning_content` to accompany assistant turns that
+        // produced tool_calls; without it the API returns 400.
+        if let Some(ref thinking) = provider_response.thinking {
+            if !thinking.content.is_empty() {
+                output.push(OutputItem::Reasoning {
+                    id: format!("rsn_{}", Uuid::new_v4().simple()),
+                    content: vec![ContentPart::OutputText {
+                        text: thinking.content.clone(),
+                    }],
+                });
+            }
+        }
+
         // Add function calls if present
         if let Some(ref tool_calls) = provider_response.tool_calls {
             for tc in tool_calls {
@@ -177,6 +193,13 @@ impl ProxyEngine {
                 }
             }),
             total_tokens: exchange_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0),
+            reasoning_tokens: exchange_usage.as_ref().and_then(|u| {
+                if u.reasoning_tokens > 0 {
+                    Some(u.reasoning_tokens)
+                } else {
+                    None
+                }
+            }),
             cost: exchange_usage.as_ref().and_then(|u| u.cost),
             request_time_ms: exchange_usage.as_ref().and_then(|u| u.request_time_ms),
         };
@@ -323,6 +346,7 @@ impl ProxyEngine {
         if let Some(items) = output.as_array() {
             let mut text_parts: Vec<String> = Vec::new();
             let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+            let mut reasoning_text: Option<String> = None;
 
             for item in items {
                 if let Ok(output_item) = serde_json::from_value::<OutputItem>(item.clone()) {
@@ -354,16 +378,33 @@ impl ProxyEngine {
                                 "arguments": args_value,
                             }));
                         }
+                        OutputItem::Reasoning { content, .. } => {
+                            let text: String = content
+                                .iter()
+                                .map(|c| match c {
+                                    ContentPart::OutputText { text } => text.as_str(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !text.is_empty() {
+                                reasoning_text = Some(text);
+                            }
+                        }
                     }
                 }
             }
 
-            // Emit a single assistant message with text + tool_calls
-            if !tool_calls.is_empty() || !text_parts.is_empty() {
+            // Emit a single assistant message with text + tool_calls + thinking.
+            // Thinking must accompany tool_calls for providers like DeepSeek that
+            // require `reasoning_content` continuity in subsequent turns.
+            if !tool_calls.is_empty() || !text_parts.is_empty() || reasoning_text.is_some() {
                 let content = text_parts.join("\n");
                 let mut msg = Message::assistant(&content);
                 if !tool_calls.is_empty() {
                     msg.tool_calls = Some(serde_json::Value::Array(tool_calls));
+                }
+                if let Some(rt) = reasoning_text {
+                    msg.thinking = Some(ThinkingBlock::new(&rt));
                 }
                 messages.push(msg);
             }

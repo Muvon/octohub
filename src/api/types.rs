@@ -160,6 +160,15 @@ pub enum OutputItem {
         name: String,
         arguments: String,
     },
+    /// Reasoning / thinking output (e.g. DeepSeek R1, Claude thinking).
+    /// Must be replayed to providers that require thinking continuity
+    /// (DeepSeek rejects assistant turns with tool_calls if `reasoning_content`
+    /// from the previous turn is missing).
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        content: Vec<ContentPart>,
+    },
 }
 
 /// Content part within a message output
@@ -180,6 +189,9 @@ pub struct Usage {
     pub cache_read_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    /// Tokens spent on internal reasoning (DeepSeek R1, Claude thinking, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     pub total_tokens: u64,
     /// Cost in USD
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -414,6 +426,7 @@ mod tests {
                 output_tokens: 5,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
                 total_tokens: 15,
                 cost: Some(0.0001),
                 request_time_ms: Some(500),
@@ -445,6 +458,7 @@ mod tests {
                 output_tokens: 10,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
                 total_tokens: 30,
                 cost: None,
                 request_time_ms: None,
