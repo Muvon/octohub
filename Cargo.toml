@@ -7,7 +7,7 @@ license = "Apache-2.0"
 description = "High-performance LLM proxy server with completion chaining and full request/response logging"
 
 [dependencies]
-octolib = { version = "0.12.0", default-features = false }
+octolib = { version = "0.19.3", default-features = false }
 # octolib = { path = "../octolib", default-features = false }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
