@@ -11,10 +11,10 @@ use anyhow::Context;
 use bytes::Bytes;
 use clap::Parser;
 use http_body_util::Full;
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
 
 use config::Config;
@@ -95,7 +95,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+            // auto::Builder negotiates HTTP/1 or HTTP/2 from what the client speaks
+            // (HTTP/2 prior-knowledge for plaintext, ALPN for TLS — TLS terminated
+            // upstream). HTTP/1 keep-alive stays disabled so each request closes
+            // its connection — prevents clients from reusing a stale pooled
+            // connection silently dropped by NAT/firewall during long LLM gaps.
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder.http1().keep_alive(false);
+            if let Err(err) = builder.serve_connection(io, service).await {
                 tracing::error!("Connection error from {}: {:?}", remote_addr, err);
             }
         });
