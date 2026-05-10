@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use octolib::embedding::{create_embedding_provider_from_parts, InputType};
 use octolib::llm::{
-    ChatCompletionParams, FunctionDefinition, Message, ProviderFactory, ThinkingBlock,
+    ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData, Message, ProviderFactory,
+    SourceType, ThinkingBlock, VideoAttachment, VideoData,
 };
 use uuid::Uuid;
 
@@ -424,8 +425,9 @@ impl ProxyEngine {
 }
 
 /// Build an octolib `Message` from an input message, extracting plain text
-/// from either `ContentValue::Text` or `ContentValue::Parts` and propagating
-/// any `cache_control` markers as `cached`/`cache_ttl` flags.
+/// from either `ContentValue::Text` or `ContentValue::Parts`, attaching any
+/// `input_image` / `input_video` parts as image/video attachments, and
+/// propagating any `cache_control` markers as `cached`/`cache_ttl` flags.
 fn content_to_message(role: &str, content: &ContentValue) -> Message {
     let text = content.text();
     let mut msg = match role {
@@ -437,7 +439,93 @@ fn content_to_message(role: &str, content: &ContentValue) -> Message {
     if content.is_cached() {
         msg.cached = true;
     }
+
+    let images: Vec<ImageAttachment> = content
+        .image_urls()
+        .into_iter()
+        .filter_map(|u| parse_image_url(&u))
+        .collect();
+    if !images.is_empty() {
+        msg.images = Some(images);
+    }
+
+    let videos: Vec<VideoAttachment> = content
+        .video_urls()
+        .into_iter()
+        .filter_map(|u| parse_video_url(&u))
+        .collect();
+    if !videos.is_empty() {
+        msg.videos = Some(videos);
+    }
+
     msg
+}
+
+/// Parse a Responses-API image URL into an `ImageAttachment`. Supports
+/// `data:<media-type>;base64,<data>` data URIs (decoded to `ImageData::Base64`)
+/// and plain `http(s)://` URLs (passed through as `ImageData::Url`). Returns
+/// `None` for malformed inputs so individual bad parts don't drop the request.
+fn parse_image_url(url: &str) -> Option<ImageAttachment> {
+    if let Some((media_type, data)) = parse_data_uri(url) {
+        Some(ImageAttachment {
+            data: ImageData::Base64(data),
+            media_type,
+            source_type: SourceType::Url,
+            dimensions: None,
+            size_bytes: None,
+        })
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        Some(ImageAttachment {
+            data: ImageData::Url(url.to_string()),
+            media_type: "image/*".to_string(),
+            source_type: SourceType::Url,
+            dimensions: None,
+            size_bytes: None,
+        })
+    } else {
+        tracing::warn!(url = %url, "Skipping unrecognized input_image url");
+        None
+    }
+}
+
+/// Parse a Responses-API video URL into a `VideoAttachment`. Same data-URI /
+/// http(s) handling as `parse_image_url`.
+fn parse_video_url(url: &str) -> Option<VideoAttachment> {
+    if let Some((media_type, data)) = parse_data_uri(url) {
+        Some(VideoAttachment {
+            data: VideoData::Base64(data),
+            media_type,
+            source_type: SourceType::Url,
+            dimensions: None,
+            size_bytes: None,
+            duration_secs: None,
+        })
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        Some(VideoAttachment {
+            data: VideoData::Url(url.to_string()),
+            media_type: "video/*".to_string(),
+            source_type: SourceType::Url,
+            dimensions: None,
+            size_bytes: None,
+            duration_secs: None,
+        })
+    } else {
+        tracing::warn!(url = %url, "Skipping unrecognized input_video url");
+        None
+    }
+}
+
+/// Split a `data:<media-type>;base64,<data>` URI into `(media_type, data)`.
+/// Only the `;base64` form is recognized — that's what octolib emits and what
+/// upstream providers accept after re-encoding.
+fn parse_data_uri(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (header, data) = rest.split_once(',')?;
+    let media_type = header.strip_suffix(";base64")?;
+    if media_type.is_empty() {
+        return None;
+    }
+    Some((media_type.to_string(), data.to_string()))
 }
 
 /// Build the system message from request `instructions`, preserving cache markers.
