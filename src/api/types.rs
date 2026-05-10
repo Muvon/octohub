@@ -74,12 +74,20 @@ pub enum InputItem {
 }
 
 /// A structured content part used in message content or instructions.
-/// Per Responses API spec: `type` is "text" (instructions) or "input_text" (user content).
+/// Per Responses API spec: `type` is "text"/"input_text" (text), "input_image"
+/// (image), or "input_video" (video). For image/video parts, `image_url` or
+/// `video_url` carries either an `https://` URL or a `data:<mime>;base64,...`
+/// data URI; `text` is omitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentPartInput {
     #[serde(rename = "type")]
     pub part_type: String,
-    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<serde_json::Value>,
 }
@@ -96,10 +104,39 @@ pub enum ContentValue {
 
 impl ContentValue {
     /// Concatenated text payload (parts joined without separator).
+    /// Non-text parts (image/video) contribute nothing here.
     pub fn text(&self) -> String {
         match self {
             ContentValue::Text(s) => s.clone(),
-            ContentValue::Parts(parts) => parts.iter().map(|p| p.text.as_str()).collect::<String>(),
+            ContentValue::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| p.text.as_deref())
+                .collect::<String>(),
+        }
+    }
+
+    /// `image_url` values from any `input_image` parts, in order.
+    /// Each is either an `https://` URL or a `data:<mime>;base64,...` data URI.
+    pub fn image_urls(&self) -> Vec<String> {
+        match self {
+            ContentValue::Parts(parts) => parts
+                .iter()
+                .filter(|p| p.part_type == "input_image")
+                .filter_map(|p| p.image_url.clone())
+                .collect(),
+            ContentValue::Text(_) => Vec::new(),
+        }
+    }
+
+    /// `video_url` values from any `input_video` parts, in order.
+    pub fn video_urls(&self) -> Vec<String> {
+        match self {
+            ContentValue::Parts(parts) => parts
+                .iter()
+                .filter(|p| p.part_type == "input_video")
+                .filter_map(|p| p.video_url.clone())
+                .collect(),
+            ContentValue::Text(_) => Vec::new(),
         }
     }
 
