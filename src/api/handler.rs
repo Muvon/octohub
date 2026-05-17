@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -89,11 +88,9 @@ pub async fn handle_create_completion(
     let per_key = engine.config().metrics.per_key;
 
     // Process
-    let start = Instant::now();
     let model_label = create_req.model.clone();
     match engine.process(create_req, &api_key).await {
-        Ok(response) => {
-            let elapsed = start.elapsed();
+        Ok((response, upstream_duration)) => {
             tracing::Span::current().record("tok_in", response.usage.input_tokens);
             tracing::Span::current().record("tok_out", response.usage.output_tokens);
 
@@ -101,7 +98,7 @@ pub async fn handle_create_completion(
                 &response.model,
                 &response.provider,
                 "ok",
-                elapsed,
+                upstream_duration,
                 response.usage.input_tokens,
                 response.usage.output_tokens,
                 Some(api_key.id),
@@ -112,7 +109,6 @@ pub async fn handle_create_completion(
             json_response(StatusCode::OK, body)
         }
         Err(e) => {
-            let elapsed = start.elapsed();
             let (status, msg) = classify_engine_error(&e);
             if status.is_server_error() {
                 tracing::error!(error = %e, "completion failed");
@@ -120,11 +116,13 @@ pub async fn handle_create_completion(
                 tracing::warn!(reason = %msg, "request rejected");
             }
 
+            // Provider/duration unknown on the error path — the call either
+            // never reached an upstream or failed before producing usage.
             crate::metrics::record_completion(
                 &model_label,
                 "unknown",
                 "error",
-                elapsed,
+                std::time::Duration::ZERO,
                 0,
                 0,
                 Some(api_key.id),
@@ -187,26 +185,24 @@ pub async fn handle_create_embedding(
     let per_key = engine.config().metrics.per_key;
 
     let model_label = create_req.model.clone();
-    let start = Instant::now();
     match engine.process_embedding(create_req, &api_key).await {
-        Ok(response) => {
-            let elapsed = start.elapsed();
+        Ok(outcome) => {
+            tracing::Span::current().record("tok_in", outcome.input_tokens);
 
             crate::metrics::record_embedding(
                 &model_label,
-                "unknown",
+                &outcome.provider,
                 "ok",
-                elapsed,
-                0,
+                outcome.upstream_duration,
+                outcome.input_tokens,
                 Some(api_key.id),
                 per_key,
             );
 
-            let body = serde_json::to_value(&response).unwrap_or_default();
+            let body = serde_json::to_value(&outcome.response).unwrap_or_default();
             json_response(StatusCode::OK, body)
         }
         Err(e) => {
-            let elapsed = start.elapsed();
             let (status, msg) = classify_engine_error(&e);
             if status.is_server_error() {
                 tracing::error!(error = %e, "embedding failed");
@@ -218,7 +214,7 @@ pub async fn handle_create_embedding(
                 &model_label,
                 "unknown",
                 "error",
-                elapsed,
+                std::time::Duration::ZERO,
                 0,
                 Some(api_key.id),
                 per_key,
