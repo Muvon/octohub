@@ -12,6 +12,14 @@ pub fn init(cfg: &LoggingConfig) -> Result<()> {
 
     let filter = tracing_subscriber::EnvFilter::try_new(&level)?;
 
+    // ANSI escape codes only when stdout is an interactive terminal — keeps
+    // logs clean when piped to `tee`, journald, or a file even if the user
+    // explicitly picked `format = "pretty"`.
+    let use_ansi = {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
+    };
+
     match cfg.format {
         LogFormat::Json => {
             tracing_subscriber::fmt()
@@ -26,15 +34,16 @@ pub fn init(cfg: &LoggingConfig) -> Result<()> {
             tracing_subscriber::fmt()
                 .compact()
                 .with_target(false)
+                .with_ansi(use_ansi)
                 .with_env_filter(filter)
                 .init();
         }
         LogFormat::Auto => {
-            use std::io::IsTerminal;
-            if std::io::stdout().is_terminal() {
+            if use_ansi {
                 tracing_subscriber::fmt()
                     .compact()
                     .with_target(false)
+                    .with_ansi(true)
                     .with_env_filter(filter)
                     .init();
             } else {

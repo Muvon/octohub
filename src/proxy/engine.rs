@@ -18,6 +18,17 @@ use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
 /// to `403 Forbidden` instead of the generic 400/500.
 pub const MODEL_FORBIDDEN_MARKER: &str = "model_not_allowed_for_key";
 
+/// Result of `process_embedding`. Carries telemetry alongside the response so
+/// the HTTP handler can label `octohub_embedding_*` metrics with the resolved
+/// provider name and the approximate input token count — neither of which is
+/// part of the user-facing response struct.
+pub struct EmbeddingOutcome {
+    pub response: CreateEmbeddingResponse,
+    pub provider: String,
+    pub upstream_duration: std::time::Duration,
+    pub input_tokens: u64,
+}
+
 /// Core proxy engine that processes requests through octolib providers
 pub struct ProxyEngine {
     storage: Arc<dyn Storage>,
@@ -42,12 +53,15 @@ impl ProxyEngine {
         &self.config
     }
 
-    /// Process a create completion request, attributing usage to the given API key
+    /// Process a create completion request, attributing usage to the given API key.
+    /// Returns the response plus the upstream provider call duration — the latter
+    /// drives `octohub_completion_duration_seconds` so the histogram reflects
+    /// provider latency only, excluding our own auth/parse/storage overhead.
     pub async fn process(
         &self,
         req: CreateCompletionRequest,
         api_key: &ApiKey,
-    ) -> Result<CreateCompletionResponse> {
+    ) -> Result<(CreateCompletionResponse, std::time::Duration)> {
         ensure_model_allowed(api_key, &req.model)?;
         // 1. Build conversation history from chain
         let mut messages: Vec<Message> = Vec::new();
@@ -171,7 +185,7 @@ impl ProxyEngine {
             .chat_completion(params)
             .await
             .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
-        let _upstream_duration = upstream_start.elapsed();
+        let upstream_duration = upstream_start.elapsed();
         drop(_permit);
 
         // 8. Build our response
@@ -293,15 +307,18 @@ impl ProxyEngine {
         };
         self.storage.store_completion(&stored)?;
 
-        Ok(response)
+        Ok((response, upstream_duration))
     }
 
-    /// Process an embedding request, attributing usage to the given API key
+    /// Process an embedding request, attributing usage to the given API key.
+    /// Returns the response, the upstream call duration (for the histogram),
+    /// the resolved provider name (so callers can label metrics correctly),
+    /// and the approximate input token count.
     pub async fn process_embedding(
         &self,
         req: CreateEmbeddingRequest,
         api_key: &ApiKey,
-    ) -> Result<CreateEmbeddingResponse> {
+    ) -> Result<EmbeddingOutcome> {
         ensure_model_allowed(api_key, &req.model)?;
 
         let start = std::time::Instant::now();
@@ -339,7 +356,7 @@ impl ProxyEngine {
         }
         crate::metrics::record_queue_wait(&provider_name, queue_wait);
 
-        let _upstream_start = std::time::Instant::now();
+        let upstream_start = std::time::Instant::now();
         let embeddings = provider
             .generate_embeddings_batch(texts.clone(), InputType::None)
             .await
@@ -349,7 +366,7 @@ impl ProxyEngine {
                     provider_name, resolved_model
                 )
             })?;
-        let _upstream_duration = _upstream_start.elapsed();
+        let upstream_duration = upstream_start.elapsed();
         drop(_permit);
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -382,14 +399,19 @@ impl ProxyEngine {
             api_key_id: api_key.id,
             input_model: req.model.clone(),
             resolved_model,
-            provider: provider_name,
+            provider: provider_name.clone(),
             input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
             usage: usage.clone(),
             created_at: now,
         };
         self.storage.store_embedding(&stored)?;
 
-        Ok(response)
+        Ok(EmbeddingOutcome {
+            response,
+            provider: provider_name,
+            upstream_duration,
+            input_tokens: approx_tokens,
+        })
     }
 
     /// Reconstruct input messages from stored JSON
