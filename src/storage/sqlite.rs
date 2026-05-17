@@ -1,6 +1,6 @@
 use super::{
-    generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-    StoredEmbedding, TimeBucket, UsageRow,
+    decode_allowed_models, encode_allowed_models, generate_api_key, make_key_hint, now_unix,
+    ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -32,6 +32,7 @@ impl SqliteStorage {
                 key TEXT NOT NULL UNIQUE,
                 key_hint TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
+                allowed_models TEXT,
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
@@ -71,10 +72,37 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);",
         )?;
 
+        // Additive migrations for upgrades from older schemas. SQLite has no
+        // `ADD COLUMN IF NOT EXISTS`, so we probe PRAGMA table_info first.
+        ensure_column(&conn, "api_keys", "allowed_models", "TEXT")?;
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
+}
+
+/// Add `column` of `decl` to `table` if it's not already present.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let exists: bool = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for r in rows {
+            if r? == column {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !exists {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            table, column, decl
+        ))?;
+    }
+    Ok(())
 }
 
 fn lock_conn(conn: &Mutex<Connection>) -> Result<std::sync::MutexGuard<'_, Connection>> {
@@ -147,15 +175,17 @@ fn build_time_and_key_filter(
 }
 
 impl Storage for SqliteStorage {
-    fn create_api_key(&self, name: &str) -> Result<ApiKey> {
+    fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey> {
         let conn = lock_conn(&self.conn)?;
         let key = generate_api_key();
         let key_hint = make_key_hint(&key);
         let now = now_unix();
+        let allowed_models_json = encode_allowed_models(allowed_models);
 
         conn.execute(
-            "INSERT INTO api_keys (name, key, key_hint, status, created_at) VALUES (?1, ?2, ?3, 'active', ?4)",
-            rusqlite::params![name, key, key_hint, now],
+            "INSERT INTO api_keys (name, key, key_hint, status, allowed_models, created_at)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
+            rusqlite::params![name, key, key_hint, allowed_models_json, now],
         )?;
 
         let id = conn.last_insert_rowid();
@@ -166,14 +196,17 @@ impl Storage for SqliteStorage {
             key,
             key_hint,
             status: "active".to_string(),
+            allowed_models: allowed_models.map(|m| m.to_vec()),
             created_at: now,
         })
     }
 
     fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
         let conn = lock_conn(&self.conn)?;
-        let mut stmt = conn
-            .prepare("SELECT id, name, key_hint, status, created_at FROM api_keys ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, key_hint, status, allowed_models, created_at \
+             FROM api_keys ORDER BY id",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(ApiKey {
                 id: row.get(0)?,
@@ -181,7 +214,8 @@ impl Storage for SqliteStorage {
                 key: String::new(), // Never expose full key in list
                 key_hint: row.get(2)?,
                 status: row.get(3)?,
-                created_at: row.get(4)?,
+                allowed_models: decode_allowed_models(row.get(4)?),
+                created_at: row.get(5)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -190,7 +224,8 @@ impl Storage for SqliteStorage {
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
         let conn = lock_conn(&self.conn)?;
         conn.query_row(
-            "SELECT id, name, key_hint, status, created_at FROM api_keys WHERE id = ?1",
+            "SELECT id, name, key_hint, status, allowed_models, created_at \
+             FROM api_keys WHERE id = ?1",
             rusqlite::params![id],
             |row| {
                 Ok(ApiKey {
@@ -199,7 +234,8 @@ impl Storage for SqliteStorage {
                     key: String::new(),
                     key_hint: row.get(2)?,
                     status: row.get(3)?,
-                    created_at: row.get(4)?,
+                    allowed_models: decode_allowed_models(row.get(4)?),
+                    created_at: row.get(5)?,
                 })
             },
         )
@@ -219,7 +255,8 @@ impl Storage for SqliteStorage {
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let conn = lock_conn(&self.conn)?;
         conn.query_row(
-            "SELECT id, name, key, key_hint, status, created_at FROM api_keys WHERE key = ?1",
+            "SELECT id, name, key, key_hint, status, allowed_models, created_at \
+             FROM api_keys WHERE key = ?1",
             rusqlite::params![key],
             |row| {
                 Ok(ApiKey {
@@ -228,7 +265,8 @@ impl Storage for SqliteStorage {
                     key: row.get(2)?,
                     key_hint: row.get(3)?,
                     status: row.get(4)?,
-                    created_at: row.get(5)?,
+                    allowed_models: decode_allowed_models(row.get(5)?),
+                    created_at: row.get(6)?,
                 })
             },
         )
@@ -530,7 +568,7 @@ mod tests {
     }
 
     fn create_test_key(storage: &SqliteStorage) -> ApiKey {
-        storage.create_api_key("test-key").unwrap()
+        storage.create_api_key("test-key", None).unwrap()
     }
 
     fn make_stored_completion(
@@ -562,7 +600,7 @@ mod tests {
     #[test]
     fn test_create_api_key() {
         let storage = create_test_storage();
-        let key = storage.create_api_key("my-app").unwrap();
+        let key = storage.create_api_key("my-app", None).unwrap();
         assert_eq!(key.name, "my-app");
         assert_eq!(key.status, "active");
         assert!(!key.key.is_empty());
@@ -571,10 +609,40 @@ mod tests {
     }
 
     #[test]
+    fn test_create_api_key_with_allowed_models() {
+        let storage = create_test_storage();
+        let allowed = vec!["gpt".to_string(), "openai:gpt-4o".to_string()];
+        let key = storage.create_api_key("scoped", Some(&allowed)).unwrap();
+        assert_eq!(key.allowed_models.as_deref(), Some(allowed.as_slice()));
+        assert!(key.is_model_allowed("gpt"));
+        assert!(key.is_model_allowed("openai:gpt-4o"));
+        assert!(!key.is_model_allowed("haiku"));
+    }
+
+    #[test]
+    fn test_create_api_key_unrestricted_by_default() {
+        let storage = create_test_storage();
+        let key = storage.create_api_key("open", None).unwrap();
+        assert!(key.allowed_models.is_none());
+        assert!(key.is_model_allowed("anything"));
+    }
+
+    #[test]
+    fn test_allowed_models_round_trip_through_lookup() {
+        // Persist via create_api_key, fetch back through the auth path
+        // (get_api_key_by_key) and confirm the JSON survived the round trip.
+        let storage = create_test_storage();
+        let allowed = vec!["haiku".to_string(), "sonnet".to_string()];
+        let created = storage.create_api_key("scoped", Some(&allowed)).unwrap();
+        let fetched = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
+        assert_eq!(fetched.allowed_models.as_deref(), Some(allowed.as_slice()));
+    }
+
+    #[test]
     fn test_list_api_keys_hides_full_key() {
         let storage = create_test_storage();
-        storage.create_api_key("key-1").unwrap();
-        storage.create_api_key("key-2").unwrap();
+        storage.create_api_key("key-1", None).unwrap();
+        storage.create_api_key("key-2", None).unwrap();
         let keys = storage.list_api_keys().unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys[0].key.is_empty()); // Full key not exposed
@@ -584,7 +652,7 @@ mod tests {
     #[test]
     fn test_get_api_key() {
         let storage = create_test_storage();
-        let created = storage.create_api_key("my-app").unwrap();
+        let created = storage.create_api_key("my-app", None).unwrap();
         let fetched = storage.get_api_key(created.id).unwrap().unwrap();
         assert_eq!(fetched.name, "my-app");
         assert!(fetched.key.is_empty()); // Full key not exposed in get
@@ -593,7 +661,7 @@ mod tests {
     #[test]
     fn test_revoke_api_key() {
         let storage = create_test_storage();
-        let key = storage.create_api_key("my-app").unwrap();
+        let key = storage.create_api_key("my-app", None).unwrap();
         assert!(storage.revoke_api_key(key.id).unwrap());
         // Second revoke returns false (already revoked)
         assert!(!storage.revoke_api_key(key.id).unwrap());
@@ -604,7 +672,7 @@ mod tests {
     #[test]
     fn test_get_api_key_by_key() {
         let storage = create_test_storage();
-        let created = storage.create_api_key("my-app").unwrap();
+        let created = storage.create_api_key("my-app", None).unwrap();
         let found = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
         assert_eq!(found.id, created.id);
         assert_eq!(found.name, "my-app");
@@ -726,8 +794,8 @@ mod tests {
     #[test]
     fn test_list_completions_filtered() {
         let storage = create_test_storage();
-        let key1 = storage.create_api_key("app-1").unwrap();
-        let key2 = storage.create_api_key("app-2").unwrap();
+        let key1 = storage.create_api_key("app-1", None).unwrap();
+        let key2 = storage.create_api_key("app-2", None).unwrap();
 
         storage
             .store_completion(&make_stored_completion("c1", key1.id, None, "a", "b"))

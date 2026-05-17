@@ -21,3 +21,14 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 
 [embedding_models]
 "voyage-3.5" = ["voyage:voyage-3.5"]
+
+# Per-provider concurrency limits. Keyed by the lowercase provider name
+# (ollama, openai, anthropic, ...). Requests beyond `concurrency` queue
+# inside the process — the client connection blocks until a slot frees up.
+# Omit a provider to leave it unlimited.
+#
+# [providers.ollama]
+# concurrency = 4
+#
+# [providers.openai]
+# concurrency = 32

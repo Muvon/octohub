@@ -65,7 +65,13 @@ Environment variables:
 Commands:
   keys list                        List all API keys
   keys get <id>                    Get a single API key by ID
-  keys create <name>               Create a new API key
+  keys create <name> [--allowed-models m1,m2,...]
+                                   Create a new API key. Without
+                                   --allowed-models the key may call any
+                                   model; with it, only the listed names
+                                   (aliases from [models]/[embedding_models]
+                                   or raw "provider:model" strings) are
+                                   accepted.
   keys revoke <id>                 Revoke an API key
 
   usage [--key <id,...>] [--bucket hour|day|week|month] [--since <ts>] [--until <ts>]
@@ -101,9 +107,36 @@ cmd_keys() {
       admin_curl "$BASE_URL/v1/admin/keys/$id" | pretty
       ;;
     create)
-      local name="${1:-}"; [[ -n "$name" ]] || die "Usage: keys create <name>"
-      admin_curl -X POST "$BASE_URL/v1/admin/keys" \
-        -d "{\"name\": \"$name\"}" | pretty
+      local name="${1:-}"; [[ -n "$name" ]] || die "Usage: keys create <name> [--allowed-models m1,m2,...]"
+      shift
+      local allowed_csv=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --allowed-models) allowed_csv="${2:-}"; shift 2 ;;
+          *) die "Unknown flag for 'keys create': $1" ;;
+        esac
+      done
+      # Build the JSON body. When --allowed-models is absent we omit the
+      # field entirely so the server treats the key as unrestricted (matching
+      # the API contract: missing field ≠ empty list).
+      local body
+      if [[ -n "$allowed_csv" ]]; then
+        local json_array="["
+        local first=1
+        IFS=',' read -ra parts <<< "$allowed_csv"
+        for m in "${parts[@]}"; do
+          m="${m## }"; m="${m%% }"
+          [[ -n "$m" ]] || continue
+          [[ $first -eq 1 ]] && first=0 || json_array+=","
+          # Naive escape — model names don't contain quotes in practice.
+          json_array+="\"$m\""
+        done
+        json_array+="]"
+        body="{\"name\": \"$name\", \"allowed_models\": $json_array}"
+      else
+        body="{\"name\": \"$name\"}"
+      fi
+      admin_curl -X POST "$BASE_URL/v1/admin/keys" -d "$body" | pretty
       ;;
     revoke)
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: keys revoke <id>"

@@ -1,6 +1,6 @@
 use super::{
-    generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-    StoredEmbedding, TimeBucket, UsageRow,
+    decode_allowed_models, encode_allowed_models, generate_api_key, make_key_hint, now_unix,
+    ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use mysql::prelude::*;
@@ -31,10 +31,19 @@ impl MysqlStorage {
                 `key` VARCHAR(255) NOT NULL UNIQUE,
                 key_hint VARCHAR(32) NOT NULL,
                 status VARCHAR(16) NOT NULL DEFAULT 'active',
+                allowed_models JSON,
                 created_at BIGINT UNSIGNED NOT NULL,
                 INDEX idx_api_keys_key (`key`),
                 INDEX idx_api_keys_status (status)
             )",
+        )?;
+        // Additive migration for older deployments. Not all MySQL versions
+        // support `ADD COLUMN IF NOT EXISTS`, so we probe information_schema.
+        ensure_column(
+            &mut conn,
+            "api_keys",
+            "allowed_models",
+            "JSON NULL AFTER status",
         )?;
         conn.query_drop(
             "CREATE TABLE IF NOT EXISTS completions (
@@ -77,6 +86,29 @@ impl MysqlStorage {
     }
 }
 
+/// Add `column` of `decl` to `table` if it doesn't exist yet. Uses
+/// `information_schema.columns` to stay compatible across MySQL versions
+/// that don't support `ADD COLUMN IF NOT EXISTS`.
+fn ensure_column(
+    conn: &mut mysql::PooledConn,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<()> {
+    let exists: Option<i64> = conn.exec_first(
+        "SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+        (table, column),
+    )?;
+    if exists.is_none() {
+        conn.query_drop(format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            table, column, decl
+        ))?;
+    }
+    Ok(())
+}
+
 /// Build WHERE clause and positional params for key_ids + since/until filters (MySQL uses `?`).
 fn build_filter(
     key_ids: &[i64],
@@ -111,6 +143,20 @@ fn build_filter(
     };
 
     (clause, params)
+}
+
+/// Read an `ApiKey` from a row without exposing the `key` column (used by
+/// list/get endpoints where the full key must never leave the database).
+fn read_api_key_masked(row: mysql::Row) -> ApiKey {
+    ApiKey {
+        id: row.get("id").unwrap_or_default(),
+        name: row.get("name").unwrap_or_default(),
+        key: String::new(),
+        key_hint: row.get("key_hint").unwrap_or_default(),
+        status: row.get("status").unwrap_or_default(),
+        allowed_models: decode_allowed_models(row.get("allowed_models")),
+        created_at: row.get("created_at").unwrap_or_default(),
+    }
 }
 
 fn read_completion(row: mysql::Row) -> Result<StoredCompletion> {
@@ -159,15 +205,17 @@ fn effective_limit(limit: u32) -> u32 {
 }
 
 impl Storage for MysqlStorage {
-    fn create_api_key(&self, name: &str) -> Result<ApiKey> {
+    fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey> {
         let mut conn = self.pool.get_conn()?;
         let key = generate_api_key();
         let key_hint = make_key_hint(&key);
         let now = now_unix();
+        let allowed_models_json = encode_allowed_models(allowed_models);
 
         conn.exec_drop(
-            "INSERT INTO api_keys (name, `key`, key_hint, status, created_at) VALUES (?, ?, ?, 'active', ?)",
-            (name, &key, &key_hint, now),
+            "INSERT INTO api_keys (name, `key`, key_hint, status, allowed_models, created_at)
+             VALUES (?, ?, ?, 'active', ?, ?)",
+            (name, &key, &key_hint, &allowed_models_json, now),
         )?;
 
         let id: i64 = conn.query_first("SELECT LAST_INSERT_ID()")?.unwrap_or(0);
@@ -178,41 +226,28 @@ impl Storage for MysqlStorage {
             key,
             key_hint,
             status: "active".to_string(),
+            allowed_models: allowed_models.map(|m| m.to_vec()),
             created_at: now,
         })
     }
 
     fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
         let mut conn = self.pool.get_conn()?;
-        let rows: Vec<mysql::Row> =
-            conn.query("SELECT id, name, key_hint, status, created_at FROM api_keys ORDER BY id")?;
-        Ok(rows
-            .into_iter()
-            .map(|row| ApiKey {
-                id: row.get("id").unwrap_or_default(),
-                name: row.get("name").unwrap_or_default(),
-                key: String::new(),
-                key_hint: row.get("key_hint").unwrap_or_default(),
-                status: row.get("status").unwrap_or_default(),
-                created_at: row.get("created_at").unwrap_or_default(),
-            })
-            .collect())
+        let rows: Vec<mysql::Row> = conn.query(
+            "SELECT id, name, key_hint, status, allowed_models, created_at \
+             FROM api_keys ORDER BY id",
+        )?;
+        Ok(rows.into_iter().map(read_api_key_masked).collect())
     }
 
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
         let mut conn = self.pool.get_conn()?;
         let row: Option<mysql::Row> = conn.exec_first(
-            "SELECT id, name, key_hint, status, created_at FROM api_keys WHERE id = ?",
+            "SELECT id, name, key_hint, status, allowed_models, created_at \
+             FROM api_keys WHERE id = ?",
             (id,),
         )?;
-        Ok(row.map(|r| ApiKey {
-            id: r.get("id").unwrap_or_default(),
-            name: r.get("name").unwrap_or_default(),
-            key: String::new(),
-            key_hint: r.get("key_hint").unwrap_or_default(),
-            status: r.get("status").unwrap_or_default(),
-            created_at: r.get("created_at").unwrap_or_default(),
-        }))
+        Ok(row.map(read_api_key_masked))
     }
 
     fn revoke_api_key(&self, id: i64) -> Result<bool> {
@@ -227,7 +262,8 @@ impl Storage for MysqlStorage {
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let mut conn = self.pool.get_conn()?;
         let row: Option<mysql::Row> = conn.exec_first(
-            "SELECT id, name, `key`, key_hint, status, created_at FROM api_keys WHERE `key` = ?",
+            "SELECT id, name, `key`, key_hint, status, allowed_models, created_at \
+             FROM api_keys WHERE `key` = ?",
             (key,),
         )?;
         Ok(row.map(|r| ApiKey {
@@ -236,6 +272,7 @@ impl Storage for MysqlStorage {
             key: r.get("key").unwrap_or_default(),
             key_hint: r.get("key_hint").unwrap_or_default(),
             status: r.get("status").unwrap_or_default(),
+            allowed_models: decode_allowed_models(r.get("allowed_models")),
             created_at: r.get("created_at").unwrap_or_default(),
         }))
     }

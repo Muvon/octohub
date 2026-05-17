@@ -73,6 +73,13 @@ pub async fn handle_create_key(
     #[derive(serde::Deserialize)]
     struct CreateKeyRequest {
         name: String,
+        /// `None` (field absent) → unrestricted, all models allowed.
+        /// `Some(list)` → only these model names accepted on /v1/completions
+        /// and /v1/embeddings. Match is exact against the `model` request
+        /// field as-sent (alias from [models]/[embedding_models] or raw
+        /// `provider:model`).
+        #[serde(default)]
+        allowed_models: Option<Vec<String>>,
     }
 
     let create_req: CreateKeyRequest = match serde_json::from_slice(&body_bytes) {
@@ -89,20 +96,11 @@ pub async fn handle_create_key(
         return error_response(StatusCode::BAD_REQUEST, "Key name must not be empty");
     }
 
-    match storage.create_api_key(create_req.name.trim()) {
+    let allowed_models = create_req.allowed_models.as_deref();
+    match storage.create_api_key(create_req.name.trim(), allowed_models) {
         Ok(key) => {
             // On creation, return the full key (only time it's visible)
-            json_response(
-                StatusCode::CREATED,
-                serde_json::json!({
-                    "id": key.id,
-                    "name": key.name,
-                    "key": key.key,
-                    "key_hint": key.key_hint,
-                    "status": key.status,
-                    "created_at": key.created_at,
-                }),
-            )
+            json_response(StatusCode::CREATED, api_key_response(&key, true))
         }
         Err(e) => {
             tracing::error!("Failed to create API key: {:?}", e);
@@ -112,6 +110,24 @@ pub async fn handle_create_key(
             )
         }
     }
+}
+
+/// Build the JSON view of an `ApiKey`. The full `key` field is included only
+/// at creation time (`include_full_key=true`); list/get responses return only
+/// the masked `key_hint`.
+fn api_key_response(key: &crate::storage::ApiKey, include_full_key: bool) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "id": key.id,
+        "name": key.name,
+        "key_hint": key.key_hint,
+        "status": key.status,
+        "allowed_models": key.allowed_models,
+        "created_at": key.created_at,
+    });
+    if include_full_key {
+        body["key"] = serde_json::Value::String(key.key.clone());
+    }
+    body
 }
 
 /// GET /v1/admin/keys - List all API keys (key field masked)
@@ -126,18 +142,8 @@ pub async fn handle_list_keys(
 
     match storage.list_api_keys() {
         Ok(keys) => {
-            let items: Vec<serde_json::Value> = keys
-                .into_iter()
-                .map(|k| {
-                    serde_json::json!({
-                        "id": k.id,
-                        "name": k.name,
-                        "key_hint": k.key_hint,
-                        "status": k.status,
-                        "created_at": k.created_at,
-                    })
-                })
-                .collect();
+            let items: Vec<serde_json::Value> =
+                keys.iter().map(|k| api_key_response(k, false)).collect();
             json_response(StatusCode::OK, serde_json::json!({ "data": items }))
         }
         Err(e) => {
@@ -159,16 +165,7 @@ pub async fn handle_get_key(
     }
 
     match storage.get_api_key(key_id) {
-        Ok(Some(k)) => json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "id": k.id,
-                "name": k.name,
-                "key_hint": k.key_hint,
-                "status": k.status,
-                "created_at": k.created_at,
-            }),
-        ),
+        Ok(Some(k)) => json_response(StatusCode::OK, api_key_response(&k, false)),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "API key not found"),
         Err(e) => {
             tracing::error!("Failed to get API key: {:?}", e);
