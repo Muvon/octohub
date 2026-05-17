@@ -18,6 +18,11 @@ pub struct Config {
     /// Embedding model mappings (same format as models)
     #[serde(default)]
     pub embedding_models: HashMap<String, Vec<String>>,
+    /// Per-provider tuning (concurrency, etc.). Keyed by lowercase provider
+    /// name as returned by octolib (`ollama`, `openai`, `anthropic`, ...).
+    /// Providers not listed have no concurrency limit applied.
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +42,16 @@ pub struct ServerConfig {
     ///   postgres://user:pass@host:5432/dbname
     #[serde(default = "default_db_url", alias = "db_path")]
     pub db_url: String,
+}
+
+/// Per-provider configuration knobs.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProviderConfig {
+    /// Max in-flight requests this process will send to this provider.
+    /// When the limit is reached, additional requests queue (the client
+    /// connection hangs) until a permit is released. `None` = unlimited.
+    #[serde(default)]
+    pub concurrency: Option<u32>,
 }
 
 fn default_host() -> String {
@@ -73,8 +88,8 @@ impl Config {
             let mut config: Config = toml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {}", path))?;
             // Override with environment variables if set
-            if let Ok(api_key) = env::var("OCTOHUB_API_KEY") {
-                config.server.api_key = api_key;
+            if let Ok(master_key) = env::var("OCTOHUB_MASTER_KEY") {
+                config.server.api_key = master_key;
             }
             if let Ok(db_url) = env::var("OCTOHUB_DB_URL") {
                 config.server.db_url = db_url;
@@ -98,11 +113,12 @@ impl Config {
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(default_port()),
-                api_key: env::var("OCTOHUB_API_KEY").unwrap_or_default(),
+                api_key: env::var("OCTOHUB_MASTER_KEY").unwrap_or_default(),
                 db_url: env::var("OCTOHUB_DB_URL").unwrap_or_else(|_| default_db_url()),
             },
             models: HashMap::new(),
             embedding_models: HashMap::new(),
+            providers: HashMap::new(),
         }
     }
 

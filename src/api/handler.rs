@@ -6,7 +6,7 @@ use hyper::{Request, Response, StatusCode};
 
 use crate::api::types::{CreateCompletionRequest, CreateEmbeddingRequest};
 use crate::auth::{authenticate_client, ClientAuth};
-use crate::proxy::engine::ProxyEngine;
+use crate::proxy::engine::{ProxyEngine, MODEL_FORBIDDEN_MARKER};
 use crate::storage::Storage;
 
 type BoxBody = Full<Bytes>;
@@ -47,8 +47,8 @@ pub async fn handle_create_completion(
     storage: Arc<dyn Storage>,
 ) -> Response<BoxBody> {
     let header = auth_header(&req);
-    let api_key_id = match authenticate_client(header.as_deref(), &storage) {
-        ClientAuth::Ok(key) => key.id,
+    let api_key = match authenticate_client(header.as_deref(), &storage) {
+        ClientAuth::Ok(key) => key,
         ClientAuth::Missing => return error_response(StatusCode::UNAUTHORIZED, "Missing API key"),
         ClientAuth::Invalid => {
             return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key")
@@ -78,7 +78,7 @@ pub async fn handle_create_completion(
     };
 
     // Process
-    match engine.process(create_req, api_key_id).await {
+    match engine.process(create_req, &api_key).await {
         Ok(response) => {
             let body = serde_json::to_value(&response).unwrap_or_default();
             json_response(StatusCode::OK, body)
@@ -107,8 +107,8 @@ pub async fn handle_create_embedding(
     storage: Arc<dyn Storage>,
 ) -> Response<BoxBody> {
     let header = auth_header(&req);
-    let api_key_id = match authenticate_client(header.as_deref(), &storage) {
-        ClientAuth::Ok(key) => key.id,
+    let api_key = match authenticate_client(header.as_deref(), &storage) {
+        ClientAuth::Ok(key) => key,
         ClientAuth::Missing => return error_response(StatusCode::UNAUTHORIZED, "Missing API key"),
         ClientAuth::Invalid => {
             return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key")
@@ -135,7 +135,7 @@ pub async fn handle_create_embedding(
         }
     };
 
-    match engine.process_embedding(create_req, api_key_id).await {
+    match engine.process_embedding(create_req, &api_key).await {
         Ok(response) => {
             let body = serde_json::to_value(&response).unwrap_or_default();
             json_response(StatusCode::OK, body)
@@ -153,11 +153,19 @@ pub async fn handle_create_embedding(
 }
 
 /// Classify engine errors into HTTP status codes.
-/// Client errors (bad model, bad input) → 400, server errors → 500.
+/// Per-key model restriction → 403, bad model/input → 400, otherwise 500.
 fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
     let msg = format!("{}", error);
 
-    // Model/provider resolution failures are client errors
+    if msg.contains(MODEL_FORBIDDEN_MARKER) {
+        // Strip the internal marker before returning the message to clients —
+        // it's a routing hint, not part of the user-facing error.
+        let cleaned = msg
+            .replace(&format!("{}: ", MODEL_FORBIDDEN_MARKER), "")
+            .replace(MODEL_FORBIDDEN_MARKER, "");
+        return (StatusCode::FORBIDDEN, cleaned);
+    }
+
     let is_client_error = msg.contains("not found in config")
         || msg.contains("Failed to resolve model")
         || msg.contains("Failed to resolve embedding model")

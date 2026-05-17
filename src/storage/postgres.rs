@@ -1,6 +1,6 @@
 use super::{
-    generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-    StoredEmbedding, TimeBucket, UsageRow,
+    encode_allowed_models, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage,
+    StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use postgres::{Client, NoTls};
@@ -32,8 +32,10 @@ impl PostgresStorage {
                 key TEXT NOT NULL UNIQUE,
                 key_hint TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
+                allowed_models JSONB,
                 created_at BIGINT NOT NULL
             );
+            ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS allowed_models JSONB;
             CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
             CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
 
@@ -127,6 +129,35 @@ fn build_filter(
     (clause, params, idx)
 }
 
+/// Pull the `allowed_models` JSONB column out of a row as `Option<Vec<String>>`.
+/// Falls back to `None` (unrestricted) on missing/invalid shapes — fail open
+/// so a hand-edited row can't accidentally lock an operator out.
+fn read_allowed_models(row: &postgres::Row) -> Option<Vec<String>> {
+    let value: Option<serde_json::Value> = row
+        .try_get::<_, Option<serde_json::Value>>("allowed_models")
+        .ok()
+        .flatten();
+    let arr = value?.as_array()?.clone();
+    let list: Vec<String> = arr
+        .into_iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    Some(list)
+}
+
+/// Read an `ApiKey` without exposing the `key` column.
+fn read_api_key_masked(row: &postgres::Row) -> ApiKey {
+    ApiKey {
+        id: row.get("id"),
+        name: row.get("name"),
+        key: String::new(),
+        key_hint: row.get("key_hint"),
+        status: row.get("status"),
+        allowed_models: read_allowed_models(row),
+        created_at: row.get::<_, i64>("created_at") as u64,
+    }
+}
+
 fn read_completion(row: &postgres::Row) -> StoredCompletion {
     StoredCompletion {
         id: row.get("id"),
@@ -167,15 +198,19 @@ fn effective_limit(limit: u32) -> i64 {
 }
 
 impl Storage for PostgresStorage {
-    fn create_api_key(&self, name: &str) -> Result<ApiKey> {
+    fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey> {
         let mut client = self.lock_client()?;
         let key = generate_api_key();
         let key_hint = make_key_hint(&key);
         let now = now_unix() as i64;
+        // Encoded as text and cast to jsonb in SQL — keeps the binding type
+        // uniform with the other backends instead of two parallel code paths.
+        let allowed_models_json = encode_allowed_models(allowed_models);
 
         let row = client.query_one(
-            "INSERT INTO api_keys (name, key, key_hint, status, created_at) VALUES ($1, $2, $3, 'active', $4) RETURNING id",
-            &[&name, &key, &key_hint, &now],
+            "INSERT INTO api_keys (name, key, key_hint, status, allowed_models, created_at)
+             VALUES ($1, $2, $3, 'active', $4::jsonb, $5) RETURNING id",
+            &[&name, &key, &key_hint, &allowed_models_json, &now],
         )?;
         let id: i64 = row.get(0);
 
@@ -185,6 +220,7 @@ impl Storage for PostgresStorage {
             key,
             key_hint,
             status: "active".to_string(),
+            allowed_models: allowed_models.map(|m| m.to_vec()),
             created_at: now as u64,
         })
     }
@@ -192,36 +228,21 @@ impl Storage for PostgresStorage {
     fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
         let mut client = self.lock_client()?;
         let rows = client.query(
-            "SELECT id, name, key_hint, status, created_at FROM api_keys ORDER BY id",
+            "SELECT id, name, key_hint, status, allowed_models, created_at \
+             FROM api_keys ORDER BY id",
             &[],
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| ApiKey {
-                id: row.get("id"),
-                name: row.get("name"),
-                key: String::new(),
-                key_hint: row.get("key_hint"),
-                status: row.get("status"),
-                created_at: row.get::<_, i64>("created_at") as u64,
-            })
-            .collect())
+        Ok(rows.iter().map(read_api_key_masked).collect())
     }
 
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
         let mut client = self.lock_client()?;
         let rows = client.query(
-            "SELECT id, name, key_hint, status, created_at FROM api_keys WHERE id = $1",
+            "SELECT id, name, key_hint, status, allowed_models, created_at \
+             FROM api_keys WHERE id = $1",
             &[&id],
         )?;
-        Ok(rows.first().map(|row| ApiKey {
-            id: row.get("id"),
-            name: row.get("name"),
-            key: String::new(),
-            key_hint: row.get("key_hint"),
-            status: row.get("status"),
-            created_at: row.get::<_, i64>("created_at") as u64,
-        }))
+        Ok(rows.first().map(read_api_key_masked))
     }
 
     fn revoke_api_key(&self, id: i64) -> Result<bool> {
@@ -236,7 +257,8 @@ impl Storage for PostgresStorage {
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let mut client = self.lock_client()?;
         let rows = client.query(
-            "SELECT id, name, key, key_hint, status, created_at FROM api_keys WHERE key = $1",
+            "SELECT id, name, key, key_hint, status, allowed_models, created_at \
+             FROM api_keys WHERE key = $1",
             &[&key],
         )?;
         Ok(rows.first().map(|row| ApiKey {
@@ -245,6 +267,7 @@ impl Storage for PostgresStorage {
             key: row.get("key"),
             key_hint: row.get("key_hint"),
             status: row.get("status"),
+            allowed_models: read_allowed_models(row),
             created_at: row.get::<_, i64>("created_at") as u64,
         }))
     }

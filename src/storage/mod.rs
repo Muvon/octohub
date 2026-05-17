@@ -20,7 +20,23 @@ pub struct ApiKey {
     pub key_hint: String,
     /// "active" or "revoked"
     pub status: String,
+    /// Models this key may request (matched against the `model` field as
+    /// sent — alias or `provider:model`). `None` means unrestricted; the
+    /// admin omitted the list at creation time. An empty `Some(vec![])`
+    /// is an explicit lockout (admin disabled all models).
+    pub allowed_models: Option<Vec<String>>,
     pub created_at: u64,
+}
+
+impl ApiKey {
+    /// Check whether this key is permitted to call `model`. Unrestricted
+    /// keys (`allowed_models == None`) pass everything through.
+    pub fn is_model_allowed(&self, model: &str) -> bool {
+        match &self.allowed_models {
+            None => true,
+            Some(list) => list.iter().any(|m| m == model),
+        }
+    }
 }
 
 /// Stored completion record from the database
@@ -97,7 +113,9 @@ pub enum TimeBucket {
 /// Storage trait for completion persistence
 pub trait Storage: Send + Sync {
     // API key management
-    fn create_api_key(&self, name: &str) -> Result<ApiKey>;
+    /// Create a new API key. `allowed_models` is persisted as-is: `None`
+    /// means unrestricted, `Some(list)` restricts to that exact set.
+    fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey>;
     fn list_api_keys(&self) -> Result<Vec<ApiKey>>;
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>>;
     fn revoke_api_key(&self, id: i64) -> Result<bool>;
@@ -145,6 +163,26 @@ pub(crate) fn make_key_hint(key: &str) -> String {
         .rev()
         .collect();
     format!("...{}", suffix)
+}
+
+/// Encode an `allowed_models` list into the JSON text we persist. Returns
+/// `None` for the unrestricted case so the column stores SQL NULL.
+pub(crate) fn encode_allowed_models(models: Option<&[String]>) -> Option<String> {
+    models.map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".to_string()))
+}
+
+/// Decode an `allowed_models` JSON string back into a list. Invalid JSON
+/// falls back to unrestricted rather than locking the key out — fail open
+/// for a hand-edited DB row beats a 403 for the operator.
+pub(crate) fn decode_allowed_models(raw: Option<String>) -> Option<Vec<String>> {
+    let raw = raw?;
+    match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(list) => Some(list),
+        Err(err) => {
+            tracing::warn!(error = %err, raw = %raw, "Invalid allowed_models JSON — treating key as unrestricted");
+            None
+        }
+    }
 }
 
 /// Current unix timestamp in seconds

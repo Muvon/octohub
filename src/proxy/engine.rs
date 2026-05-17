@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use octolib::embedding::{create_embedding_provider_from_parts, InputType};
 use octolib::llm::{
     ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData, Message, ProviderFactory,
@@ -11,25 +11,40 @@ use uuid::Uuid;
 
 use crate::api::types::*;
 use crate::config::Config;
-use crate::storage::{Storage, StoredCompletion, StoredEmbedding};
+use crate::proxy::limiter::ProviderLimiter;
+use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
+
+/// Marker added to model-restriction errors so the HTTP layer can map them
+/// to `403 Forbidden` instead of the generic 400/500.
+pub const MODEL_FORBIDDEN_MARKER: &str = "model_not_allowed_for_key";
 
 /// Core proxy engine that processes requests through octolib providers
 pub struct ProxyEngine {
     storage: Arc<dyn Storage>,
     config: Arc<Config>,
+    limiter: Arc<ProviderLimiter>,
 }
 
 impl ProxyEngine {
-    pub fn new(storage: Arc<dyn Storage>, config: Arc<Config>) -> Self {
-        Self { storage, config }
+    pub fn new(
+        storage: Arc<dyn Storage>,
+        config: Arc<Config>,
+        limiter: Arc<ProviderLimiter>,
+    ) -> Self {
+        Self {
+            storage,
+            config,
+            limiter,
+        }
     }
 
     /// Process a create completion request, attributing usage to the given API key
     pub async fn process(
         &self,
         req: CreateCompletionRequest,
-        api_key_id: i64,
+        api_key: &ApiKey,
     ) -> Result<CreateCompletionResponse> {
+        ensure_model_allowed(api_key, &req.model)?;
         // 1. Build conversation history from chain
         let mut messages: Vec<Message> = Vec::new();
 
@@ -130,11 +145,15 @@ impl ProxyEngine {
             params.tools = Some(tools);
         }
 
-        // 7. Call provider
+        // 7. Call provider — hold a concurrency permit (if configured) for the
+        //    full duration of the upstream call. Dropping `_permit` after the
+        //    `.await` resolves wakes the next queued request.
+        let _permit = self.limiter.acquire(&provider_name).await;
         let provider_response = provider
             .chat_completion(params)
             .await
             .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
+        drop(_permit);
 
         // 8. Build our response
         let completion_id = format!("cmpl_{}", Uuid::new_v4().simple());
@@ -236,7 +255,7 @@ impl ProxyEngine {
 
         let stored = StoredCompletion {
             id: completion_id,
-            api_key_id,
+            api_key_id: api_key.id,
             session_id,
             previous_completion_id: resolved_prev_id,
             input_model: req.model.clone(),
@@ -261,8 +280,10 @@ impl ProxyEngine {
     pub async fn process_embedding(
         &self,
         req: CreateEmbeddingRequest,
-        api_key_id: i64,
+        api_key: &ApiKey,
     ) -> Result<CreateEmbeddingResponse> {
+        ensure_model_allowed(api_key, &req.model)?;
+
         let start = std::time::Instant::now();
 
         // 1. Resolve provider and model
@@ -277,11 +298,13 @@ impl ProxyEngine {
             octolib::embedding::parse_provider_model(&provider_model)?;
         let provider = create_embedding_provider_from_parts(&provider_type, &model_name).await?;
 
-        // 3. Generate embeddings
+        // 3. Generate embeddings — gated by the same per-provider concurrency
+        // limit as completions. Permit released as soon as the call returns.
         let texts: Vec<String> = match &req.input {
             EmbeddingInput::Single(s) => vec![s.clone()],
             EmbeddingInput::Batch(v) => v.clone(),
         };
+        let _permit = self.limiter.acquire(&provider_name).await;
         let embeddings = provider
             .generate_embeddings_batch(texts.clone(), InputType::None)
             .await
@@ -291,6 +314,7 @@ impl ProxyEngine {
                     provider_name, resolved_model
                 )
             })?;
+        drop(_permit);
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -319,7 +343,7 @@ impl ProxyEngine {
 
         let stored = StoredEmbedding {
             id: embedding_id,
-            api_key_id,
+            api_key_id: api_key.id,
             input_model: req.model.clone(),
             resolved_model,
             provider: provider_name,
@@ -622,6 +646,20 @@ fn attach_thinking_to_assistant(messages: &mut Vec<Message>, text: String) {
     let mut msg = Message::assistant("");
     msg.thinking = Some(ThinkingBlock::new(&text));
     messages.push(msg);
+}
+
+/// Reject the request if `api_key.allowed_models` is set and `model` isn't
+/// in it. The error message embeds `MODEL_FORBIDDEN_MARKER` so the HTTP
+/// layer can return `403 Forbidden` rather than the default 400/500.
+fn ensure_model_allowed(api_key: &ApiKey, model: &str) -> Result<()> {
+    if api_key.is_model_allowed(model) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{}: model '{}' is not permitted for this API key",
+        MODEL_FORBIDDEN_MARKER,
+        model
+    ))
 }
 
 // Implement Serialize for Input so we can store it

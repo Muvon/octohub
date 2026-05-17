@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 
 use config::Config;
 use proxy::engine::ProxyEngine;
+use proxy::limiter::ProviderLimiter;
 use storage::Storage;
 
 type BoxBody = Full<Bytes>;
@@ -68,8 +69,11 @@ async fn main() -> anyhow::Result<()> {
     let storage: Arc<dyn Storage> = storage::from_url(&config.server.db_url)?;
     tracing::info!("Database initialized: {}", config.server.db_url);
 
+    // Per-provider concurrency gate. Unconfigured providers run unthrottled.
+    let limiter = Arc::new(ProviderLimiter::from_config(&config));
+
     // Initialize proxy engine
-    let engine = Arc::new(ProxyEngine::new(storage.clone(), config.clone()));
+    let engine = Arc::new(ProxyEngine::new(storage.clone(), config.clone(), limiter));
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;

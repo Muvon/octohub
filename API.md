@@ -392,13 +392,15 @@ Create a new client API key.
 
 ```json
 {
-  "name": "string"
+  "name": "string",
+  "allowed_models": ["string"]
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | ✅ | Human-readable label for this key (e.g. `"mobile-app"`, `"ci-pipeline"`). |
+| `allowed_models` | string[] | — | Whitelist of `model` values this key may request. Match is exact against the `model` field as sent — either an alias from `[models]`/`[embedding_models]` or a raw `provider:model` string. Omit the field for an unrestricted key. Requests to a non-allowed model return `403 Forbidden`. |
 
 #### Response `201 Created`
 
@@ -409,6 +411,7 @@ Create a new client API key.
   "key": "abc123...xyz",
   "key_hint": "...xyz",
   "status": "active",
+  "allowed_models": ["gpt", "openai:gpt-4o"],
   "created_at": 1700000000
 }
 ```
@@ -422,15 +425,23 @@ Create a new client API key.
 | `key` | Full 43-character base64url key. Only shown once. |
 | `key_hint` | Last 4 characters prefixed with `...` for identification. |
 | `status` | `"active"` or `"revoked"`. |
+| `allowed_models` | The model whitelist as configured. `null` means unrestricted. |
 | `created_at` | Unix timestamp. |
 
-#### Example
+#### Examples
 
 ```bash
+# Unrestricted key — may call any model
 curl -X POST http://127.0.0.1:8080/v1/admin/keys \
   -H "Authorization: Bearer <master-key>" \
   -H "Content-Type: application/json" \
   -d '{"name": "mobile-app"}'
+
+# Restricted key — limited to two models
+curl -X POST http://127.0.0.1:8080/v1/admin/keys \
+  -H "Authorization: Bearer <master-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "ci-pipeline", "allowed_models": ["gpt", "anthropic:claude-haiku-4-5"]}'
 ```
 
 ---
@@ -449,6 +460,7 @@ List all API keys. The full key value is never returned — only the hint.
       "name": "mobile-app",
       "key_hint": "...xyz",
       "status": "active",
+      "allowed_models": null,
       "created_at": 1700000000
     },
     {
@@ -456,6 +468,7 @@ List all API keys. The full key value is never returned — only the hint.
       "name": "ci-pipeline",
       "key_hint": "...abc",
       "status": "revoked",
+      "allowed_models": ["gpt", "anthropic:claude-haiku-4-5"],
       "created_at": 1700001000
     }
   ]
@@ -483,6 +496,7 @@ Get a single API key by its numeric ID.
   "name": "mobile-app",
   "key_hint": "...xyz",
   "status": "active",
+  "allowed_models": null,
   "created_at": 1700000000
 }
 ```
@@ -675,6 +689,26 @@ curl "http://127.0.0.1:8080/v1/admin/embeddings?key_id=1&limit=20&offset=40" \
 
 ---
 
+## Per-Provider Concurrency
+
+Each model alias resolves to a real upstream provider (`ollama`, `openai`, `anthropic`, ...). OctoHub can cap the number of in-flight requests it forwards to each provider. Configure in `octohub.toml`:
+
+```toml
+[providers.ollama]
+concurrency = 4
+
+[providers.openai]
+concurrency = 32
+```
+
+Provider names are case-insensitive. Omit a provider to leave it unlimited.
+
+When a provider is at its limit, additional requests **queue inside the OctoHub process** — the client's HTTP connection stays open and blocks until a slot frees up. This is intentional throttling, not an error; clients see it as a longer-than-usual response, never a `429`. The default HTTP/1 keep-alive is disabled at the server, so no stale pooled connection lingers across the wait.
+
+The limiter is process-local. It tracks completions and embeddings together (both flow through the same provider connection).
+
+---
+
 ## Supported Providers
 
 ### Completions (`/v1/completions`)
@@ -746,5 +780,6 @@ All errors follow this format:
 |---|---|
 | `400` | Bad request (missing/invalid fields, bad model name) |
 | `401` | Missing or invalid API key |
+| `403` | The API key is not permitted to use the requested model (see `allowed_models`) |
 | `404` | Unknown endpoint |
 | `500` | Internal error (provider failure, storage error) |
