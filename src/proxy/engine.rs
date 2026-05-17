@@ -38,6 +38,10 @@ impl ProxyEngine {
         }
     }
 
+    pub fn config(&self) -> &Arc<Config> {
+        &self.config
+    }
+
     /// Process a create completion request, attributing usage to the given API key
     pub async fn process(
         &self,
@@ -115,6 +119,9 @@ impl ProxyEngine {
             .resolve_model(&req.model)
             .with_context(|| format!("Failed to resolve model '{}'", req.model))?;
 
+        // Record provider in request span
+        tracing::Span::current().record("provider", provider_name.as_str());
+
         // 5. Get provider instance
         let provider = ProviderFactory::create_provider(&provider_name)
             .with_context(|| format!("Provider '{}' not available", provider_name))?;
@@ -148,11 +155,23 @@ impl ProxyEngine {
         // 7. Call provider — hold a concurrency permit (if configured) for the
         //    full duration of the upstream call. Dropping `_permit` after the
         //    `.await` resolves wakes the next queued request.
+        let queue_start = std::time::Instant::now();
         let _permit = self.limiter.acquire(&provider_name).await;
+        let queue_wait = queue_start.elapsed();
+        if queue_wait.as_millis() > 0 {
+            tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
+        }
+        if queue_wait.as_millis() > 100 {
+            tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
+        }
+        crate::metrics::record_queue_wait(&provider_name, queue_wait);
+
+        let upstream_start = std::time::Instant::now();
         let provider_response = provider
             .chat_completion(params)
             .await
             .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
+        let _upstream_duration = upstream_start.elapsed();
         drop(_permit);
 
         // 8. Build our response
@@ -238,6 +257,7 @@ impl ProxyEngine {
             id: completion_id.clone(),
             object: "completion",
             model: resolved_model.clone(),
+            provider: provider.name().to_string(),
             output: output.clone(),
             usage: usage.clone(),
             created_at: now,
@@ -292,6 +312,9 @@ impl ProxyEngine {
             .resolve_embedding_model(&req.model)
             .with_context(|| format!("Failed to resolve embedding model '{}'", req.model))?;
 
+        // Record provider in request span
+        tracing::Span::current().record("provider", provider_name.as_str());
+
         // 2. Parse provider type and create provider
         let provider_model = format!("{}:{}", provider_name, resolved_model);
         let (provider_type, model_name) =
@@ -304,7 +327,19 @@ impl ProxyEngine {
             EmbeddingInput::Single(s) => vec![s.clone()],
             EmbeddingInput::Batch(v) => v.clone(),
         };
+
+        let queue_start = std::time::Instant::now();
         let _permit = self.limiter.acquire(&provider_name).await;
+        let queue_wait = queue_start.elapsed();
+        if queue_wait.as_millis() > 0 {
+            tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
+        }
+        if queue_wait.as_millis() > 100 {
+            tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
+        }
+        crate::metrics::record_queue_wait(&provider_name, queue_wait);
+
+        let _upstream_start = std::time::Instant::now();
         let embeddings = provider
             .generate_embeddings_batch(texts.clone(), InputType::None)
             .await
@@ -314,6 +349,7 @@ impl ProxyEngine {
                     provider_name, resolved_model
                 )
             })?;
+        let _upstream_duration = _upstream_start.elapsed();
         drop(_permit);
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -507,7 +543,7 @@ fn parse_image_url(url: &str) -> Option<ImageAttachment> {
             size_bytes: None,
         })
     } else {
-        tracing::warn!(url = %url, "Skipping unrecognized input_image url");
+        tracing::warn!(url = %url, kind = "image", "skipping unrecognized media url");
         None
     }
 }
@@ -534,7 +570,7 @@ fn parse_video_url(url: &str) -> Option<VideoAttachment> {
             duration_secs: None,
         })
     } else {
-        tracing::warn!(url = %url, "Skipping unrecognized input_video url");
+        tracing::warn!(url = %url, kind = "video", "skipping unrecognized media url");
         None
     }
 }

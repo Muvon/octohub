@@ -7,6 +7,16 @@ api_key = "your-master-secret"  # Optional: enables auth for client + admin endp
 db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 # db_url = "mysql://user:password@localhost:3306/octohub"
 # db_url = "postgres://user:password@localhost:5432/octohub"
+# trust_forwarded_for = false   # Only enable behind a trusted reverse proxy
+
+# [logging]
+# format = "auto"               # auto (pretty if TTY, else JSON), pretty, or json
+# level = "info"                 # Override RUST_LOG; absent = RUST_LOG or "info"
+
+# [metrics]
+# enabled = true
+# bind = "127.0.0.1:9090"
+# per_key = false                # Add api_key_id label to completion/embedding metrics
 
 # Model mappings: model_name -> list of fully qualified "provider:model" strings
 # When resolving, randomly pick one from the list (simple load balancing)

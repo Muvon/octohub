@@ -122,3 +122,121 @@ cargo fmt --all -- --check
 1. Run clippy before finalizing code
 2. Run fmt to ensure consistent formatting
 3. Test changes with cargo test
+
+## Observability
+
+### Logging
+
+OctoHub uses `tracing-subscriber` with structured, span-based logging.
+
+**Format auto-detection** (default `Auto`):
+- If stdout is a TTY → compact pretty format
+- If stdout is not a TTY → JSON format
+
+Override via config `[logging]` section or environment variables:
+
+| Variable | Values | Default |
+|---|---|---|
+| `OCTOHUB_LOG_FORMAT` | `auto`, `pretty`, `json` | `auto` |
+| `OCTOHUB_LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` | `info` (or `RUST_LOG`) |
+
+Precedence for level: `OCTOHUB_LOG_LEVEL` → `RUST_LOG` → `"info"`.
+
+**Sample pretty line:**
+```
+2024-01-15T10:30:01.234Z INFO octohub starting version="0.1.0" bind="127.0.0.1:8080" db="sqlite" admin_auth=true providers="none" models=1 embed_models=1 metrics=true
+```
+
+**Sample JSON line:**
+```json
+{"timestamp":"2024-01-15T10:30:01.234Z","level":"INFO","message":"request completed","req_id":"01HMQGSB3R","method":"POST","route":"/v1/completions","path":"/v1/completions","remote":"10.0.0.1","status":200,"dur_ms":1523,"api_key_id":1,"model":"minimax-m2.7","provider":"minimax","queued_ms":0,"tok_in":56,"tok_out":120}
+```
+
+**Request span fields:**
+
+| Field | Description |
+|---|---|
+| `req_id` | ULID request ID (or client-provided `X-Request-Id`) |
+| `method` | HTTP method |
+| `route` | Low-cardinality route label (e.g. `/v1/completions`, `/v1/admin/keys`, `/health`, `other`) |
+| `path` | Full request path |
+| `remote` | Effective remote address (peer or `X-Forwarded-For` if trusted) |
+| `status` | HTTP response status code |
+| `dur_ms` | Total request duration in milliseconds |
+| `api_key_id` | Client API key ID (after successful auth) |
+| `model` | Request model name |
+| `provider` | Resolved provider name |
+| `queued_ms` | Time queued waiting for provider permit (0 if no wait) |
+| `tok_in` | Input tokens from response usage |
+| `tok_out` | Output tokens from response usage |
+
+### Metrics
+
+Prometheus metrics exposed via a separate HTTP endpoint.
+
+**Configuration:**
+
+```toml
+[metrics]
+enabled = true
+bind = "127.0.0.1:9090"
+per_key = false  # Add api_key_id label to completion/embedding metrics
+```
+
+Environment overrides: `OCTOHUB_METRICS_ENABLED` (`true`/`false`/`1`/`0`), `OCTOHUB_METRICS_BIND`.
+
+**Metrics exposed:**
+
+| Name | Type | Labels | Description |
+|---|---|---|---|
+| `octohub_build_info` | gauge | `version` | Build version (always 1) |
+| `octohub_requests_total` | counter | `route`, `method`, `status` | Total HTTP requests |
+| `octohub_request_duration_seconds` | histogram | `route`, `method` | Request duration |
+| `octohub_requests_in_flight` | gauge | `route` | Current in-flight requests |
+| `octohub_completions_total` | counter | `model`, `provider`, `status`, `api_key_id`* | Completion requests |
+| `octohub_completion_duration_seconds` | histogram | `model`, `provider` | Upstream call duration |
+| `octohub_completion_tokens_total` | counter | `model`, `provider`, `direction` | Token counts (`direction=in\|out`) |
+| `octohub_embeddings_total` | counter | `model`, `provider`, `status`, `api_key_id`* | Embedding requests |
+| `octohub_embedding_duration_seconds` | histogram | `model`, `provider` | Upstream call duration |
+| `octohub_embedding_tokens_total` | counter | `model`, `provider`, `direction` | Token counts |
+| `octohub_provider_queue_wait_seconds` | histogram | `provider` | Time queued for permit |
+| `octohub_provider_permits_available` | gauge | `provider` | Available concurrency permits |
+| `octohub_provider_in_flight` | gauge | `provider` | In-flight requests |
+
+\* `api_key_id` label only present when `per_key = true`.
+
+**Prometheus scrape config:**
+```yaml
+scrape_configs:
+  - job_name: octohub
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+```
+
+**Sample queries:**
+```promql
+# P95 request latency by route
+histogram_quantile(0.95, sum(rate(octohub_request_duration_seconds_bucket[5m])) by (route, le))
+
+# Error rate by route
+sum(rate(octohub_requests_total{status=~"5.."}[5m])) by (route) / sum(rate(octohub_requests_total[5m])) by (route)
+
+# Provider queue wait P99
+histogram_quantile(0.99, sum(rate(octohub_provider_queue_wait_seconds_bucket[5m])) by (provider, le))
+
+# Completion tokens/sec by model
+sum(rate(octohub_completion_tokens_total{direction="out"}[5m])) by (model)
+```
+
+### Request ID
+
+Every request is assigned a unique ID and returned in the `X-Request-Id` response header.
+
+- If the incoming request includes a valid `X-Request-Id` header (1–64 chars, `[A-Za-z0-9._-]`), it is passed through unchanged.
+- Otherwise, a new ULID is generated.
+
+### X-Forwarded-For
+
+Set `trust_forwarded_for = true` under `[server]` to use `Forwarded` (RFC 7239) or `X-Forwarded-For` headers for the `remote` log field.
+
+**Security warning:** Only enable this when OctoHub runs behind a trusted reverse proxy. With this enabled, clients can spoof their IP address in logs.

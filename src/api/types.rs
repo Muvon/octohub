@@ -186,6 +186,8 @@ pub struct CreateCompletionResponse {
     pub object: &'static str,
     /// Model used
     pub model: String,
+    /// Provider name that handled this request
+    pub provider: String,
     /// Output items
     pub output: Vec<OutputItem>,
     /// Token usage
@@ -492,6 +494,7 @@ mod tests {
             id: "cmpl_001".to_string(),
             object: "completion",
             model: "gpt-4o".to_string(),
+            provider: "openai".to_string(),
             output: vec![OutputItem::Message {
                 id: "msg_001".to_string(),
                 role: "assistant".to_string(),
@@ -525,6 +528,7 @@ mod tests {
             id: "cmpl_002".to_string(),
             object: "completion",
             model: "gpt-4o".to_string(),
+            provider: "openai".to_string(),
             output: vec![OutputItem::FunctionCall {
                 id: "fc_001".to_string(),
                 call_id: "call_abc".to_string(),
