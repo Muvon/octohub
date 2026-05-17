@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -49,11 +50,17 @@ pub async fn handle_create_completion(
     let header = auth_header(&req);
     let api_key = match authenticate_client(header.as_deref(), &storage) {
         ClientAuth::Ok(key) => key,
-        ClientAuth::Missing => return error_response(StatusCode::UNAUTHORIZED, "Missing API key"),
+        ClientAuth::Missing => {
+            tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
+            return error_response(StatusCode::UNAUTHORIZED, "Missing API key");
+        }
         ClientAuth::Invalid => {
-            return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key")
+            tracing::warn!(kind = "client", reason = "invalid_token", "auth failed");
+            return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key");
         }
     };
+
+    tracing::Span::current().record("api_key_id", api_key.id);
 
     // Read body
     let body_bytes = match req.collect().await {
@@ -77,19 +84,53 @@ pub async fn handle_create_completion(
         }
     };
 
+    tracing::Span::current().record("model", create_req.model.as_str());
+
+    let per_key = engine.config().metrics.per_key;
+
     // Process
+    let start = Instant::now();
+    let model_label = create_req.model.clone();
     match engine.process(create_req, &api_key).await {
         Ok(response) => {
+            let elapsed = start.elapsed();
+            tracing::Span::current().record("tok_in", response.usage.input_tokens);
+            tracing::Span::current().record("tok_out", response.usage.output_tokens);
+
+            crate::metrics::record_completion(
+                &response.model,
+                &response.provider,
+                "ok",
+                elapsed,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                Some(api_key.id),
+                per_key,
+            );
+
             let body = serde_json::to_value(&response).unwrap_or_default();
             json_response(StatusCode::OK, body)
         }
         Err(e) => {
+            let elapsed = start.elapsed();
             let (status, msg) = classify_engine_error(&e);
             if status.is_server_error() {
-                tracing::error!("Request processing failed: {:?}", e);
+                tracing::error!(error = %e, "completion failed");
             } else {
-                tracing::warn!("Request rejected: {}", msg);
+                tracing::warn!(reason = %msg, "request rejected");
             }
+
+            crate::metrics::record_completion(
+                &model_label,
+                "unknown",
+                "error",
+                elapsed,
+                0,
+                0,
+                Some(api_key.id),
+                per_key,
+            );
+
             error_response(status, &msg)
         }
     }
@@ -109,11 +150,17 @@ pub async fn handle_create_embedding(
     let header = auth_header(&req);
     let api_key = match authenticate_client(header.as_deref(), &storage) {
         ClientAuth::Ok(key) => key,
-        ClientAuth::Missing => return error_response(StatusCode::UNAUTHORIZED, "Missing API key"),
+        ClientAuth::Missing => {
+            tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
+            return error_response(StatusCode::UNAUTHORIZED, "Missing API key");
+        }
         ClientAuth::Invalid => {
-            return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key")
+            tracing::warn!(kind = "client", reason = "invalid_token", "auth failed");
+            return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key");
         }
     };
+
+    tracing::Span::current().record("api_key_id", api_key.id);
 
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -135,18 +182,48 @@ pub async fn handle_create_embedding(
         }
     };
 
+    tracing::Span::current().record("model", create_req.model.as_str());
+
+    let per_key = engine.config().metrics.per_key;
+
+    let model_label = create_req.model.clone();
+    let start = Instant::now();
     match engine.process_embedding(create_req, &api_key).await {
         Ok(response) => {
+            let elapsed = start.elapsed();
+
+            crate::metrics::record_embedding(
+                &model_label,
+                "unknown",
+                "ok",
+                elapsed,
+                0,
+                Some(api_key.id),
+                per_key,
+            );
+
             let body = serde_json::to_value(&response).unwrap_or_default();
             json_response(StatusCode::OK, body)
         }
         Err(e) => {
+            let elapsed = start.elapsed();
             let (status, msg) = classify_engine_error(&e);
             if status.is_server_error() {
-                tracing::error!("Embedding request failed: {:?}", e);
+                tracing::error!(error = %e, "embedding failed");
             } else {
-                tracing::warn!("Embedding request rejected: {}", msg);
+                tracing::warn!(reason = %msg, "embedding request rejected");
             }
+
+            crate::metrics::record_embedding(
+                &model_label,
+                "unknown",
+                "error",
+                elapsed,
+                0,
+                Some(api_key.id),
+                per_key,
+            );
+
             error_response(status, &msg)
         }
     }

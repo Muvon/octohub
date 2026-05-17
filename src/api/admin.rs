@@ -43,6 +43,12 @@ fn check_admin(
     if authenticate_admin(header, master_key) {
         Ok(())
     } else {
+        let reason = if header.and_then(|h| h.strip_prefix("Bearer ")).is_some() {
+            "invalid_token"
+        } else {
+            "missing_token"
+        };
+        tracing::warn!(kind = "admin", reason = reason, "auth failed");
         Err(Box::new(error_response(
             StatusCode::UNAUTHORIZED,
             "Invalid or missing admin API key",
@@ -103,7 +109,7 @@ pub async fn handle_create_key(
             json_response(StatusCode::CREATED, api_key_response(&key, true))
         }
         Err(e) => {
-            tracing::error!("Failed to create API key: {:?}", e);
+            tracing::error!(error = %e, "create key failed");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("Failed to create API key: {}", e),
@@ -147,7 +153,7 @@ pub async fn handle_list_keys(
             json_response(StatusCode::OK, serde_json::json!({ "data": items }))
         }
         Err(e) => {
-            tracing::error!("Failed to list API keys: {:?}", e);
+            tracing::error!(error = %e, "list keys failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to list API keys")
         }
     }
@@ -168,7 +174,7 @@ pub async fn handle_get_key(
         Ok(Some(k)) => json_response(StatusCode::OK, api_key_response(&k, false)),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "API key not found"),
         Err(e) => {
-            tracing::error!("Failed to get API key: {:?}", e);
+            tracing::error!(error = %e, "get key failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get API key")
         }
     }
@@ -189,7 +195,7 @@ pub async fn handle_revoke_key(
         Ok(true) => json_response(StatusCode::OK, serde_json::json!({"status": "revoked"})),
         Ok(false) => error_response(StatusCode::NOT_FOUND, "API key not found"),
         Err(e) => {
-            tracing::error!("Failed to revoke API key: {:?}", e);
+            tracing::error!(error = %e, "revoke key failed");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to revoke API key",
@@ -235,7 +241,7 @@ pub async fn handle_usage(
             json_response(StatusCode::OK, serde_json::json!({ "data": items }))
         }
         Err(e) => {
-            tracing::error!("Failed to get usage: {:?}", e);
+            tracing::error!(error = %e, "get usage failed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to get usage")
         }
     }
@@ -277,7 +283,7 @@ pub async fn handle_list_completions(
             json_response(StatusCode::OK, serde_json::json!({ "data": items }))
         }
         Err(e) => {
-            tracing::error!("Failed to list completions: {:?}", e);
+            tracing::error!(error = %e, "list completions failed");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to list completions",
@@ -320,7 +326,7 @@ pub async fn handle_list_embeddings(
             json_response(StatusCode::OK, serde_json::json!({ "data": items }))
         }
         Err(e) => {
-            tracing::error!("Failed to list embeddings: {:?}", e);
+            tracing::error!(error = %e, "list embeddings failed");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to list embeddings",

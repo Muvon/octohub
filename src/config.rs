@@ -4,6 +4,55 @@ use std::env;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Logging output format.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Pretty if stdout is a terminal, JSON otherwise.
+    #[default]
+    Auto,
+    /// Human-readable compact format.
+    Pretty,
+    /// Machine-readable JSON.
+    Json,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub format: LogFormat,
+    #[serde(default)]
+    pub level: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_bind")]
+    pub bind: String,
+    #[serde(default)]
+    pub per_key: bool,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: default_metrics_bind(),
+            per_key: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_metrics_bind() -> String {
+    "127.0.0.1:9090".to_string()
+}
+
 /// Server configuration loaded from TOML file (with env fallback)
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -23,6 +72,12 @@ pub struct Config {
     /// Providers not listed have no concurrency limit applied.
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// Logging configuration
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    /// Metrics configuration
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +97,10 @@ pub struct ServerConfig {
     ///   postgres://user:pass@host:5432/dbname
     #[serde(default = "default_db_url", alias = "db_path")]
     pub db_url: String,
+    /// Trust X-Forwarded-For / Forwarded headers for remote IP detection.
+    /// Only enable behind a trusted reverse proxy.
+    #[serde(default)]
+    pub trust_forwarded_for: bool,
 }
 
 /// Per-provider configuration knobs.
@@ -73,6 +132,7 @@ impl Default for ServerConfig {
             port: default_port(),
             api_key: String::new(),
             db_url: default_db_url(),
+            trust_forwarded_for: false,
         }
     }
 }
@@ -94,6 +154,7 @@ impl Config {
             if let Ok(db_url) = env::var("OCTOHUB_DB_URL") {
                 config.server.db_url = db_url;
             }
+            Self::apply_env_overrides(&mut config);
 
             tracing::info!("Loaded config from {}", path);
             Ok(config)
@@ -104,9 +165,30 @@ impl Config {
         }
     }
 
+    /// Apply environment variable overrides to a loaded config.
+    fn apply_env_overrides(config: &mut Config) {
+        if let Ok(fmt) = env::var("OCTOHUB_LOG_FORMAT") {
+            match fmt.to_lowercase().as_str() {
+                "auto" => config.logging.format = LogFormat::Auto,
+                "pretty" => config.logging.format = LogFormat::Pretty,
+                "json" => config.logging.format = LogFormat::Json,
+                _ => {}
+            }
+        }
+        if let Ok(level) = env::var("OCTOHUB_LOG_LEVEL") {
+            config.logging.level = Some(level);
+        }
+        if let Ok(bind) = env::var("OCTOHUB_METRICS_BIND") {
+            config.metrics.bind = bind;
+        }
+        if let Ok(val) = env::var("OCTOHUB_METRICS_ENABLED") {
+            config.metrics.enabled = val == "true" || val == "1";
+        }
+    }
+
     /// Load from environment variables only (fallback)
     fn from_env() -> Self {
-        Self {
+        let mut config = Self {
             server: ServerConfig {
                 host: env::var("OCTOHUB_HOST").unwrap_or_else(|_| default_host()),
                 port: env::var("OCTOHUB_PORT")
@@ -115,11 +197,16 @@ impl Config {
                     .unwrap_or(default_port()),
                 api_key: env::var("OCTOHUB_MASTER_KEY").unwrap_or_default(),
                 db_url: env::var("OCTOHUB_DB_URL").unwrap_or_else(|_| default_db_url()),
+                trust_forwarded_for: false,
             },
             models: HashMap::new(),
             embedding_models: HashMap::new(),
             providers: HashMap::new(),
-        }
+            logging: LoggingConfig::default(),
+            metrics: MetricsConfig::default(),
+        };
+        Self::apply_env_overrides(&mut config);
+        config
     }
 
     /// Resolve a model name to (provider, model_name)

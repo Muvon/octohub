@@ -7,16 +7,17 @@ use crate::config::Config;
 
 /// Per-provider concurrency gate.
 ///
-/// Holds one `Arc<Semaphore>` per configured provider. Providers that don't
-/// appear in `[providers]` are unlimited. Callers acquire a permit before
-/// dispatching to the provider; the permit is dropped when the request
-/// finishes (or fails), which wakes the next queued waiter.
+/// Holds one `(configured_max, Arc<Semaphore>)` per configured provider.
+/// Providers that don't appear in `[providers]` are unlimited. Callers
+/// acquire a permit before dispatching to the provider; the permit is
+/// dropped when the request finishes (or fails), which wakes the next
+/// queued waiter.
 ///
 /// When a provider is at its limit, `acquire().await` parks the caller until
 /// a permit is available. From the client's perspective this surfaces as a
 /// hanging HTTP request — intentional throttling, not an error response.
 pub struct ProviderLimiter {
-    semaphores: HashMap<String, Arc<Semaphore>>,
+    semaphores: HashMap<String, (u32, Arc<Semaphore>)>,
 }
 
 impl ProviderLimiter {
@@ -28,16 +29,12 @@ impl ProviderLimiter {
             if let Some(limit) = provider_cfg.concurrency {
                 if limit > 0 {
                     let key = name.to_ascii_lowercase();
-                    semaphores.insert(key, Arc::new(Semaphore::new(limit as usize)));
+                    semaphores.insert(key, (limit, Arc::new(Semaphore::new(limit as usize))));
                 }
             }
         }
-        if !semaphores.is_empty() {
-            let summary: Vec<String> = semaphores
-                .iter()
-                .map(|(k, s)| format!("{}={}", k, s.available_permits()))
-                .collect();
-            tracing::info!("Provider concurrency limits: {}", summary.join(", "));
+        for (name, (limit, _)) in &semaphores {
+            tracing::info!(provider = %name, concurrency = limit, "provider concurrency configured");
         }
         Self { semaphores }
     }
@@ -51,8 +48,16 @@ impl ProviderLimiter {
     /// as `None` rather than a hard error.
     pub async fn acquire(&self, provider: &str) -> Option<OwnedSemaphorePermit> {
         let key = provider.to_ascii_lowercase();
-        let sem = self.semaphores.get(&key)?.clone();
-        sem.acquire_owned().await.ok()
+        let (_, sem) = self.semaphores.get(&key)?;
+        sem.clone().acquire_owned().await.ok()
+    }
+
+    /// Snapshot of all configured providers: (name, available_permits, configured_max).
+    pub fn snapshot(&self) -> Vec<(String, usize, usize)> {
+        self.semaphores
+            .iter()
+            .map(|(name, (max, sem))| (name.clone(), sem.available_permits(), *max as usize))
+            .collect()
     }
 }
 
@@ -77,6 +82,8 @@ mod tests {
             models: HashMap::new(),
             embedding_models: HashMap::new(),
             providers,
+            logging: Default::default(),
+            metrics: Default::default(),
         };
         ProviderLimiter::from_config(&config)
     }

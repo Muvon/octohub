@@ -1,21 +1,27 @@
 mod api;
 mod auth;
 mod config;
+mod http_util;
+mod logging;
+mod metrics;
 mod proxy;
 mod storage;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
 use clap::Parser;
 use http_body_util::Full;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response};
+use hyper::{HeaderMap, Method, Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
+use tracing::Instrument;
+use ulid::Ulid;
 
 use config::Config;
 use proxy::engine::ProxyEngine;
@@ -38,16 +44,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Args::parse();
     let mut config = Config::load(args.config)?;
+
+    // Initialize logging (must happen after config load so we have LogFormat)
+    logging::init(&config.logging)?;
 
     // Override bind address if specified
     if let Some(bind) = args.bind {
@@ -60,42 +61,71 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config.server.api_key.is_empty() {
-        tracing::warn!("Master API key is empty (server.api_key). Consider setting a strong key.");
+        tracing::warn!("Master API key is empty (server.api_key). Admin endpoints disabled.");
     }
 
     let config = Arc::new(config);
 
     // Initialize storage from DSN
     let storage: Arc<dyn Storage> = storage::from_url(&config.server.db_url)?;
-    tracing::info!("Database initialized: {}", config.server.db_url);
 
     // Per-provider concurrency gate. Unconfigured providers run unthrottled.
     let limiter = Arc::new(ProviderLimiter::from_config(&config));
+
+    // Initialize metrics
+    if let Some(handle) = metrics::init(&config.metrics)? {
+        let bind = config.metrics.bind.clone();
+        let limiter_clone = limiter.clone();
+        tokio::spawn(metrics::serve(handle, bind));
+        tokio::spawn(metrics::provider_gauge_loop(limiter_clone));
+    }
 
     // Initialize proxy engine
     let engine = Arc::new(ProxyEngine::new(storage.clone(), config.clone(), limiter));
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!("OctoHub server listening on {}", addr);
-    tracing::info!("Authentication enabled (master key configured)");
+
+    // Structured startup banner
+    let db_kind = if config.server.db_url.starts_with("mysql://") {
+        "mysql"
+    } else if config.server.db_url.starts_with("postgres://")
+        || config.server.db_url.starts_with("postgresql://")
+    {
+        "postgres"
+    } else {
+        "sqlite"
+    };
+    let provider_summary = build_provider_summary(&config);
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        bind = %addr,
+        db = db_kind,
+        admin_auth = !config.server.api_key.is_empty(),
+        providers = %provider_summary,
+        models = config.models.len(),
+        embed_models = config.embedding_models.len(),
+        metrics = config.metrics.enabled,
+        "octohub starting"
+    );
+    if config.metrics.enabled {
+        tracing::info!(bind = %config.metrics.bind, "metrics endpoint listening");
+    }
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let engine = engine.clone();
         let storage = storage.clone();
-        let master_key = config.server.api_key.clone();
+        let config = config.clone();
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let engine = engine.clone();
                 let storage = storage.clone();
-                let master_key = master_key.clone();
+                let config = config.clone();
                 async move {
-                    Ok::<_, hyper::Error>(
-                        route(req, engine, storage, &master_key, remote_addr).await,
-                    )
+                    Ok::<_, hyper::Error>(route(req, engine, storage, &config, remote_addr).await)
                 }
             });
 
@@ -107,40 +137,148 @@ async fn main() -> anyhow::Result<()> {
             let mut builder = auto::Builder::new(TokioExecutor::new());
             builder.http1().keep_alive(false);
             if let Err(err) = builder.serve_connection(io, service).await {
-                tracing::error!("Connection error from {}: {:?}", remote_addr, err);
+                tracing::error!(remote = %remote_addr, error = %err, "connection error");
             }
         });
     }
+}
+
+/// Build a concise provider summary for the startup banner, e.g. "ollama:4,minimax:8"
+fn build_provider_summary(config: &Config) -> String {
+    if config.providers.is_empty() {
+        return "none".to_string();
+    }
+    let mut parts: Vec<String> = config
+        .providers
+        .iter()
+        .map(|(name, cfg)| match cfg.concurrency {
+            Some(c) => format!("{}:{}", name, c),
+            None => format!("{}:unlimited", name),
+        })
+        .collect();
+    parts.sort();
+    parts.join(",")
+}
+
+fn classify_route(path: &str) -> &'static str {
+    if path == "/v1/completions" {
+        "/v1/completions"
+    } else if path == "/v1/embeddings" {
+        "/v1/embeddings"
+    } else if path.starts_with("/v1/admin/keys") {
+        "/v1/admin/keys"
+    } else if path == "/v1/admin/usage" {
+        "/v1/admin/usage"
+    } else if path == "/v1/admin/completions" {
+        "/v1/admin/completions"
+    } else if path == "/v1/admin/embeddings" {
+        "/v1/admin/embeddings"
+    } else if path == "/health" {
+        "/health"
+    } else {
+        "other"
+    }
+}
+
+fn extract_request_id(headers: &HeaderMap) -> String {
+    if let Some(val) = headers.get("X-Request-Id").and_then(|v| v.to_str().ok()) {
+        // Validate: 1-64 chars, alphanumeric + .-_
+        if !val.is_empty()
+            && val.len() <= 64
+            && val
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        {
+            return val.to_string();
+        }
+    }
+    Ulid::new().to_string()
+}
+
+fn attach_request_id(mut response: Response<BoxBody>, request_id: &str) -> Response<BoxBody> {
+    response.headers_mut().insert(
+        "X-Request-Id",
+        request_id
+            .parse()
+            .unwrap_or_else(|_| "unknown".parse().unwrap()),
+    );
+    response
 }
 
 async fn route(
     req: Request<hyper::body::Incoming>,
     engine: Arc<ProxyEngine>,
     storage: Arc<dyn Storage>,
-    master_key: &str,
+    config: &Arc<Config>,
     remote_addr: SocketAddr,
 ) -> Response<BoxBody> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let route_label = classify_route(&path);
+    let request_id = extract_request_id(req.headers());
+    let effective_remote = http_util::effective_remote(
+        req.headers(),
+        remote_addr,
+        config.server.trust_forwarded_for,
+    );
 
-    tracing::info!("{} {} from {}", method, path, remote_addr);
+    let span = tracing::info_span!(
+        "request",
+        req_id = %request_id,
+        method = %method,
+        route = %route_label,
+        path = %path,
+        remote = %effective_remote,
+        status = tracing::field::Empty,
+        dur_ms = tracing::field::Empty,
+        api_key_id = tracing::field::Empty,
+        model = tracing::field::Empty,
+        provider = tracing::field::Empty,
+        queued_ms = tracing::field::Empty,
+        tok_in = tracing::field::Empty,
+        tok_out = tracing::field::Empty,
+    );
 
-    // Admin endpoints: /v1/admin/* (master key auth)
-    if path.starts_with("/v1/admin/") {
-        return route_admin(req, method, &path, storage, master_key).await;
-    }
+    let start = Instant::now();
+    let _flight = metrics::in_flight_guard(route_label);
+    let master_key = config.server.api_key.clone();
+    let method_str = method.as_str().to_owned();
 
-    // Client endpoints (api_keys table auth)
-    match (method, path.as_str()) {
-        (Method::POST, "/v1/completions") => {
-            api::handler::handle_create_completion(req, engine, storage).await
+    let response = async {
+        // Admin endpoints: /v1/admin/* (master key auth)
+        if path.starts_with("/v1/admin/") {
+            return route_admin(req, method, &path, storage, &master_key).await;
         }
-        (Method::POST, "/v1/embeddings") => {
-            api::handler::handle_create_embedding(req, engine, storage).await
+
+        // Client endpoints (api_keys table auth)
+        match (method, path.as_str()) {
+            (Method::POST, "/v1/completions") => {
+                api::handler::handle_create_completion(req, engine, storage).await
+            }
+            (Method::POST, "/v1/embeddings") => {
+                api::handler::handle_create_embedding(req, engine, storage).await
+            }
+            (Method::GET, "/health") => api::handler::handle_health(),
+            _ => not_found(),
         }
-        (Method::GET, "/health") => api::handler::handle_health(),
-        _ => not_found(),
     }
+    .instrument(span.clone())
+    .await;
+
+    let elapsed = start.elapsed();
+    span.record("status", response.status().as_u16());
+    span.record("dur_ms", elapsed.as_millis() as u64);
+
+    metrics::record_request(
+        route_label,
+        &method_str,
+        response.status().as_u16(),
+        elapsed,
+    );
+
+    tracing::info!(parent: &span, "request completed");
+
+    attach_request_id(response, &request_id)
 }
 
 async fn route_admin(
