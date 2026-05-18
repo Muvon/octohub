@@ -718,12 +718,25 @@ fn push_items(items: &[InputItem], messages: &mut Vec<Message>) {
 
 /// Deserialize stored JSON input items, skipping any that fail to parse
 /// (forward-compat with new types), then forward to `push_items`.
+///
+/// Strips `cache_control` markers from reconstructed messages. `cache_control`
+/// is a per-request hint to the upstream provider — "check/extend prompt cache
+/// here on THIS request". It is NOT a persistent property of the conversation.
+/// Replaying historical markers from every prior completion accumulates them
+/// across the chain and blows past Anthropic's hard limit of 4 cache_control
+/// blocks per request. Only the live request's `instructions` + `input`
+/// (handled in `process` directly, not via this function) should carry markers.
 fn push_stored_items(items: &[serde_json::Value], messages: &mut Vec<Message>) {
     let typed: Vec<InputItem> = items
         .iter()
         .filter_map(|v| serde_json::from_value(v.clone()).ok())
         .collect();
+    let before_len = messages.len();
     push_items(&typed, messages);
+    for msg in &mut messages[before_len..] {
+        msg.cached = false;
+        msg.cache_ttl = None;
+    }
 }
 
 /// Append `tool_call` to the trailing assistant Message's `tool_calls` array,
