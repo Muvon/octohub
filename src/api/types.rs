@@ -22,9 +22,25 @@ pub struct CreateCompletionRequest {
     #[serde(default = "default_temperature")]
     pub temperature: f32,
 
+    /// Top-p nucleus sampling (0.0 to 1.0). Proxied straight to the upstream
+    /// provider so client-controlled sampling actually takes effect.
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+
     /// Maximum output tokens (0 = provider default)
     #[serde(default)]
     pub max_output_tokens: u32,
+
+    /// Reasoning effort hint for thinking-capable models. Accepted values:
+    /// "low" | "medium" | "high" | "xhigh" | "max". Unknown values are
+    /// ignored (provider default applies). Proxied through unchanged.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+
+    /// Structured output format request (Responses API `text` field).
+    /// Carries either `{format: {type: "json_object"}}` or a JSON schema.
+    #[serde(default)]
+    pub text: Option<TextConfig>,
 
     /// Tool definitions for function calling
     #[serde(default)]
@@ -33,6 +49,38 @@ pub struct CreateCompletionRequest {
 
 fn default_temperature() -> f32 {
     1.0
+}
+
+fn default_top_p() -> f32 {
+    1.0
+}
+
+/// Responses-API `text` configuration object — only `format` is meaningful
+/// to the proxy today; future fields (e.g. verbosity) can be added without
+/// breaking the wire shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TextConfig {
+    pub format: TextFormat,
+}
+
+/// Output format selector. `json_object` requests free-form JSON; `json_schema`
+/// pins the response to a schema and optionally enforces strict adherence.
+///
+/// Note: the wire shape also carries a `name` string (octolib hardcodes
+/// "response_schema") — we accept and ignore it via `#[serde(default)]` on
+/// any extra fields, since octolib's `StructuredOutputRequest` has no name
+/// slot and nothing downstream uses it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TextFormat {
+    /// Free-form JSON output ("type": "json_object")
+    JsonObject,
+    /// JSON conforming to a schema ("type": "json_schema")
+    JsonSchema {
+        schema: serde_json::Value,
+        #[serde(default)]
+        strict: bool,
+    },
 }
 
 /// Input can be a simple string or an array of typed items

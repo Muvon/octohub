@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use octolib::embedding::{create_embedding_provider_from_parts, InputType};
 use octolib::llm::{
-    ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData, Message, ProviderFactory,
-    SourceType, ThinkingBlock, VideoAttachment, VideoData,
+    ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData, Message, OutputFormat,
+    ProviderFactory, ReasoningEffort, ResponseMode, SourceType, StructuredOutputRequest,
+    ThinkingBlock, VideoAttachment, VideoData,
 };
 use uuid::Uuid;
 
@@ -155,17 +156,59 @@ impl ProxyEngine {
                 .collect::<Vec<_>>()
         });
 
+        // Sampling: forward temperature + top_p straight from the client.
+        // top_k is not part of the Responses-API wire shape (octolib client
+        // never sends it), so we leave it at a neutral default; upstream
+        // providers that don't honor it ignore it harmlessly.
         let mut params = ChatCompletionParams::new(
             &messages,
             &resolved_model,
             req.temperature,
-            1.0,
+            req.top_p,
             50,
             req.max_output_tokens,
         );
 
         if let Some(tools) = tools {
             params.tools = Some(tools);
+        }
+
+        // Reasoning effort: parse client string into octolib enum and pass
+        // through. Unknown values silently fall back to provider default —
+        // we never want a malformed effort hint to fail the whole request.
+        if let Some(ref eff) = req.reasoning_effort {
+            params.reasoning_effort = match eff.to_lowercase().as_str() {
+                "low" => Some(ReasoningEffort::Low),
+                "medium" => Some(ReasoningEffort::Medium),
+                "high" => Some(ReasoningEffort::High),
+                "xhigh" => Some(ReasoningEffort::XHigh),
+                "max" => Some(ReasoningEffort::Max),
+                _ => None,
+            };
+        }
+
+        // Structured output: map the Responses-API `text.format` shape onto
+        // octolib's StructuredOutputRequest so the upstream provider receives
+        // the schema (or json_object request) the client asked for. Without
+        // this, JSON-mode and JSON-Schema requests through the proxy silently
+        // fall back to free-form text.
+        if let Some(ref text) = req.text {
+            params.response_format = Some(match &text.format {
+                TextFormat::JsonObject => StructuredOutputRequest {
+                    format: OutputFormat::Json,
+                    mode: ResponseMode::Auto,
+                    schema: None,
+                },
+                TextFormat::JsonSchema { schema, strict } => StructuredOutputRequest {
+                    format: OutputFormat::JsonSchema,
+                    mode: if *strict {
+                        ResponseMode::Strict
+                    } else {
+                        ResponseMode::Auto
+                    },
+                    schema: Some(schema.clone()),
+                },
+            });
         }
 
         // 7. Call provider — hold a concurrency permit (if configured) for the
