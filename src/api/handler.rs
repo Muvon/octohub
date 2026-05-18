@@ -111,7 +111,10 @@ pub async fn handle_create_completion(
         Err(e) => {
             let (status, msg) = classify_engine_error(&e);
             if status.is_server_error() {
-                tracing::error!(error = %e, "completion failed");
+                // `?e` (Debug) prints the full anyhow chain — "Caused by: …" lines
+                // for each layer. `%e` (Display) only shows the outermost context,
+                // which hid the actual upstream error body and HTTP status.
+                tracing::error!(error = ?e, "completion failed");
             } else {
                 tracing::warn!(reason = %msg, "request rejected");
             }
@@ -205,7 +208,7 @@ pub async fn handle_create_embedding(
         Err(e) => {
             let (status, msg) = classify_engine_error(&e);
             if status.is_server_error() {
-                tracing::error!(error = %e, "embedding failed");
+                tracing::error!(error = ?e, "embedding failed");
             } else {
                 tracing::warn!(reason = %msg, "embedding request rejected");
             }
@@ -228,28 +231,34 @@ pub async fn handle_create_embedding(
 /// Classify engine errors into HTTP status codes.
 /// Per-key model restriction → 403, bad model/input → 400, otherwise 500.
 fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
-    let msg = format!("{}", error);
+    // Top-level message — used only for classification heuristics and for
+    // client-error responses (where our own marker is the correct user-facing
+    // text). For 500s we surface the full chain below.
+    let top = format!("{}", error);
 
-    if msg.contains(MODEL_FORBIDDEN_MARKER) {
+    if top.contains(MODEL_FORBIDDEN_MARKER) {
         // Strip the internal marker before returning the message to clients —
         // it's a routing hint, not part of the user-facing error.
-        let cleaned = msg
+        let cleaned = top
             .replace(&format!("{}: ", MODEL_FORBIDDEN_MARKER), "")
             .replace(MODEL_FORBIDDEN_MARKER, "");
         return (StatusCode::FORBIDDEN, cleaned);
     }
 
-    let is_client_error = msg.contains("not found in config")
-        || msg.contains("Failed to resolve model")
-        || msg.contains("Failed to resolve embedding model")
-        || msg.contains("not available")
-        || msg.contains("Invalid request");
+    let is_client_error = top.contains("not found in config")
+        || top.contains("Failed to resolve model")
+        || top.contains("Failed to resolve embedding model")
+        || top.contains("not available")
+        || top.contains("Invalid request");
 
-    let status = if is_client_error {
-        StatusCode::BAD_REQUEST
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
+    if is_client_error {
+        return (StatusCode::BAD_REQUEST, top);
+    }
 
-    (status, msg)
+    // Server-side failure (most commonly an upstream provider error). Surface
+    // the full anyhow chain via `{:#}` so callers see "Provider 'anthropic'
+    // chat_completion failed: Anthropic API error 401: { ... }" instead of
+    // just the outer wrap. Without this the client gets a useless top
+    // message and has to read server logs to diagnose anything.
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", error))
 }
