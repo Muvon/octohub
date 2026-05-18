@@ -148,7 +148,9 @@ impl ProxyEngine {
                     name: t.name.clone(),
                     description: t.description.clone().unwrap_or_default(),
                     parameters: t.parameters.clone().unwrap_or(serde_json::json!({})),
-                    cache_control: None,
+                    // Pass-through: octohub is a proxy. Whatever cache marker
+                    // the client attached to this tool goes upstream unchanged.
+                    cache_control: t.cache_control.clone(),
                 })
                 .collect::<Vec<_>>()
         });
@@ -520,6 +522,11 @@ fn content_to_message(role: &str, content: &ContentValue) -> Message {
     };
     if content.is_cached() {
         msg.cached = true;
+        // Proxy semantics: forward the full marker, including TTL. Without
+        // this the upstream provider receives `cached` but falls back to its
+        // default TTL (5m for Anthropic), so client-requested longer TTLs
+        // (e.g. "1h") were silently downgraded.
+        msg.cache_ttl = content.cache_ttl();
     }
 
     let images: Vec<ImageAttachment> = content
@@ -615,6 +622,7 @@ fn content_to_system(content: &ContentValue) -> Message {
     let mut msg = Message::system(&content.text());
     if content.is_cached() {
         msg.cached = true;
+        msg.cache_ttl = content.cache_ttl();
     }
     msg
 }
