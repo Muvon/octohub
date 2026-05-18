@@ -146,7 +146,6 @@ impl ContentValue {
     }
 
     /// First `cache_control.ttl` value found, if any (e.g. "1h").
-    #[cfg(test)]
     pub fn cache_ttl(&self) -> Option<String> {
         match self {
             ContentValue::Parts(parts) => parts.iter().find_map(|p| {
@@ -175,6 +174,11 @@ pub struct ToolDefinition {
     /// JSON Schema for parameters
     #[serde(default)]
     pub parameters: Option<serde_json::Value>,
+    /// Optional ephemeral cache marker. Clients attach this to the last tool
+    /// to anchor a cache boundary covering the entire tools section. We are a
+    /// proxy: pass it through to the upstream provider unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// Completion response object
