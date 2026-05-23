@@ -229,7 +229,14 @@ pub struct ToolDefinition {
     pub cache_control: Option<serde_json::Value>,
 }
 
-/// Completion response object
+/// Completion response object.
+///
+/// Mirrors `octolib::llm::ProviderResponse`. Fields that vary per request
+/// (`structured_output`, `finish_reason`) are skipped from serialization
+/// when absent so the wire shape stays compact. The proxy is a transparent
+/// pass-through: every meaningful field returned by the upstream provider
+/// is surfaced here verbatim — the client must not have to re-derive
+/// anything from `output` text.
 #[derive(Debug, Serialize)]
 pub struct CreateCompletionResponse {
     /// Unique completion ID
@@ -244,6 +251,18 @@ pub struct CreateCompletionResponse {
     pub output: Vec<OutputItem>,
     /// Token usage
     pub usage: Usage,
+    /// Parsed structured output when the request attached a JSON schema and
+    /// the upstream provider produced schema-conforming JSON. Mirrored
+    /// straight from `ProviderResponse.structured_output` — clients SHOULD
+    /// prefer this over re-parsing `output[].content[].text`, since the
+    /// upstream may have validated against the schema server-side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Value>,
+    /// Why the upstream model stopped generating, when the provider reports
+    /// it. Values are provider-specific (`stop`, `length`, `tool_calls`,
+    /// `content_filter`, etc.) — surfaced as-is, no normalisation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
     /// Unix timestamp of creation
     pub created_at: u64,
 }
@@ -564,6 +583,8 @@ mod tests {
                 cost: Some(0.0001),
                 request_time_ms: Some(500),
             },
+            structured_output: None,
+            finish_reason: None,
             created_at: 1700000000,
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -572,6 +593,10 @@ mod tests {
         assert_eq!(json["output"][0]["type"], "message");
         assert_eq!(json["output"][0]["content"][0]["type"], "output_text");
         assert_eq!(json["output"][0]["content"][0]["text"], "Hello!");
+        assert!(json.get("structured_output").is_none(),
+            "absent structured_output must be skipped from serialization");
+        assert!(json.get("finish_reason").is_none(),
+            "absent finish_reason must be skipped from serialization");
     }
 
     #[test]
@@ -597,11 +622,50 @@ mod tests {
                 cost: None,
                 request_time_ms: None,
             },
+            structured_output: None,
+            finish_reason: Some("tool_calls".to_string()),
             created_at: 1700000000,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["output"][0]["type"], "function_call");
         assert_eq!(json["output"][0]["name"], "get_weather");
         assert_eq!(json["output"][0]["call_id"], "call_abc");
+        assert_eq!(json["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn test_serialize_completion_with_structured_output() {
+        // When the upstream provider returns schema-validated JSON, the
+        // proxy MUST mirror it under `structured_output` so clients can
+        // consume it directly without re-parsing `output[].content[].text`.
+        let resp = CreateCompletionResponse {
+            id: "cmpl_003".to_string(),
+            object: "completion",
+            model: "gpt-5-nano".to_string(),
+            provider: "openai".to_string(),
+            output: vec![OutputItem::Message {
+                id: "msg_003".to_string(),
+                role: "assistant".to_string(),
+                content: vec![ContentPart::OutputText {
+                    text: r#"{"answer":42}"#.to_string(),
+                }],
+            }],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: 15,
+                cost: None,
+                request_time_ms: None,
+            },
+            structured_output: Some(serde_json::json!({"answer": 42})),
+            finish_reason: Some("stop".to_string()),
+            created_at: 1700000000,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["structured_output"]["answer"], 42);
+        assert_eq!(json["finish_reason"], "stop");
     }
 }

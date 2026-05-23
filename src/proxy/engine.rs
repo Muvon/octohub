@@ -319,6 +319,11 @@ impl ProxyEngine {
             provider: provider.name().to_string(),
             output: output.clone(),
             usage: usage.clone(),
+            // Mirror everything the upstream provider returned: clients must
+            // not have to re-parse text to recover schema-validated JSON or
+            // know why generation stopped.
+            structured_output: provider_response.structured_output.clone(),
+            finish_reason: provider_response.finish_reason.clone(),
             created_at: now,
         };
 
