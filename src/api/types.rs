@@ -593,10 +593,14 @@ mod tests {
         assert_eq!(json["output"][0]["type"], "message");
         assert_eq!(json["output"][0]["content"][0]["type"], "output_text");
         assert_eq!(json["output"][0]["content"][0]["text"], "Hello!");
-        assert!(json.get("structured_output").is_none(),
-            "absent structured_output must be skipped from serialization");
-        assert!(json.get("finish_reason").is_none(),
-            "absent finish_reason must be skipped from serialization");
+        assert!(
+            json.get("structured_output").is_none(),
+            "absent structured_output must be skipped from serialization"
+        );
+        assert!(
+            json.get("finish_reason").is_none(),
+            "absent finish_reason must be skipped from serialization"
+        );
     }
 
     #[test]
