@@ -143,3 +143,7 @@ jobs:
 
       - name: Run security audit
         run: cargo audit
+
+  brief:
+    uses: muvon/ci-workflow/.github/workflows/brief.yml@master
+    secrets: inherit
