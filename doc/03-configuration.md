@@ -66,6 +66,8 @@ Defined in `src/config.rs:83`. All keys optional except as noted.
 | `api_key` | `""` | Master key. Empty string = admin endpoints return 401, server logs a warning at startup (`src/main.rs:63`). |
 | `db_url` | `"sqlite://octohub.db"` | DSN. Accepts `sqlite://…`, `mysql://…`, `postgres://…`, or a bare path (treated as SQLite). |
 | `trust_forwarded_for` | `false` | Honor `Forwarded` / `X-Forwarded-For` for the `remote` log field. **Only enable behind a trusted reverse proxy** — see [08 — Deployment](./08-deployment.md#x-forwarded-for). |
+| `provider_queue_timeout_secs` | `60` | Maximum wait for a provider concurrency permit. Exceeding it returns `503`. |
+| `upstream_timeout_secs` | `360` | Maximum duration of the complete provider operation, including octolib retries. Exceeding it returns `504`. |
 
 The legacy alias `db_path` is also accepted and treated as `db_url`
 (`src/config.rs:98`).
@@ -187,6 +189,8 @@ loaded (`src/config.rs:190`).
 |---|---|---|
 | `OCTOHUB_MASTER_KEY` | `[server].api_key` | Master admin key. |
 | `OCTOHUB_DB_URL` | `[server].db_url` | Useful in containerized deployments. |
+| `OCTOHUB_PROVIDER_QUEUE_TIMEOUT_SECS` | `[server].provider_queue_timeout_secs` | Overrides the provider queue deadline. |
+| `OCTOHUB_UPSTREAM_TIMEOUT_SECS` | `[server].upstream_timeout_secs` | Overrides the complete upstream operation deadline. |
 | `OCTOHUB_HOST` | `[server].host` | Only when no config file is loaded. |
 | `OCTOHUB_PORT` | `[server].port` | Only when no config file is loaded. |
 | `OCTOHUB_LOG_FORMAT` | `[logging].format` | `auto`, `pretty`, or `json`. |

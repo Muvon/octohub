@@ -6,7 +6,7 @@ use hyper::{Request, Response, StatusCode};
 
 use crate::api::types::{CreateCompletionRequest, CreateEmbeddingRequest};
 use crate::auth::{authenticate_client, ClientAuth};
-use crate::proxy::engine::{ProxyEngine, MODEL_FORBIDDEN_MARKER};
+use crate::proxy::engine::{ProxyEngine, ProxyTimeoutError, MODEL_FORBIDDEN_MARKER};
 use crate::storage::Storage;
 
 type BoxBody = Full<Bytes>;
@@ -235,6 +235,15 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
     // client-error responses (where our own marker is the correct user-facing
     // text). For 500s we surface the full chain below.
     let top = format!("{}", error);
+    let full = format!("{:#}", error);
+
+    if let Some(timeout) = error.downcast_ref::<ProxyTimeoutError>() {
+        let status = match timeout {
+            ProxyTimeoutError::ProviderQueue { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyTimeoutError::Upstream { .. } => StatusCode::GATEWAY_TIMEOUT,
+        };
+        return (status, timeout.to_string());
+    }
 
     if top.contains(MODEL_FORBIDDEN_MARKER) {
         // Strip the internal marker before returning the message to clients —
@@ -260,5 +269,40 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
     // chat_completion failed: Anthropic API error 401: { ... }" instead of
     // just the outer wrap. Without this the client gets a useless top
     // message and has to read server logs to diagnose anything.
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", error))
+    (StatusCode::INTERNAL_SERVER_ERROR, full)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn queue_timeout_maps_to_service_unavailable() {
+        let error = anyhow::Error::new(ProxyTimeoutError::ProviderQueue {
+            provider: "ollama".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+        });
+        let (status, message) = classify_engine_error(&error);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(message.contains("waiting for provider 'ollama' capacity"));
+    }
+
+    #[test]
+    fn wrapped_upstream_timeout_maps_to_gateway_timeout() {
+        let error = Err::<(), _>(anyhow::Error::new(ProxyTimeoutError::Upstream {
+            provider: "anthropic".to_string(),
+            timeout: std::time::Duration::from_secs(360),
+        }))
+        .context("Provider chat_completion failed")
+        .unwrap_err();
+        let (status, message) = classify_engine_error(&error);
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            message,
+            "provider 'anthropic' exceeded the 360s operation deadline"
+        );
+    }
 }

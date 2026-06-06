@@ -8,6 +8,8 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 # db_url = "mysql://user:password@localhost:3306/octohub"
 # db_url = "postgres://user:password@localhost:5432/octohub"
 # trust_forwarded_for = false   # Only enable behind a trusted reverse proxy
+# provider_queue_timeout_secs = 60  # Max wait for provider capacity
+# upstream_timeout_secs = 360       # Complete provider operation, including retries
 
 # [logging]
 # format = "auto"               # auto (pretty if TTY, else JSON), pretty, or json

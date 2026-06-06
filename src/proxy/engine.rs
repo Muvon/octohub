@@ -19,6 +19,39 @@ use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
 /// to `403 Forbidden` instead of the generic 400/500.
 pub const MODEL_FORBIDDEN_MARKER: &str = "model_not_allowed_for_key";
 
+#[derive(Debug)]
+pub enum ProxyTimeoutError {
+    ProviderQueue {
+        provider: String,
+        timeout: std::time::Duration,
+    },
+    Upstream {
+        provider: String,
+        timeout: std::time::Duration,
+    },
+}
+
+impl std::fmt::Display for ProxyTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderQueue { provider, timeout } => write!(
+                f,
+                "timed out after {}s waiting for provider '{}' capacity",
+                timeout.as_secs(),
+                provider
+            ),
+            Self::Upstream { provider, timeout } => write!(
+                f,
+                "provider '{}' exceeded the {}s operation deadline",
+                provider,
+                timeout.as_secs()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProxyTimeoutError {}
+
 /// Result of `process_embedding`. Carries telemetry alongside the response so
 /// the HTTP handler can label `octohub_embedding_*` metrics with the resolved
 /// provider name and the approximate input token count — neither of which is
@@ -215,7 +248,16 @@ impl ProxyEngine {
         //    full duration of the upstream call. Dropping `_permit` after the
         //    `.await` resolves wakes the next queued request.
         let queue_start = std::time::Instant::now();
-        let _permit = self.limiter.acquire(&provider_name).await;
+        let queue_timeout =
+            std::time::Duration::from_secs(self.config.server.provider_queue_timeout_secs);
+        let _permit = tokio::time::timeout(queue_timeout, self.limiter.acquire(&provider_name))
+            .await
+            .map_err(|_| {
+                anyhow!(ProxyTimeoutError::ProviderQueue {
+                    provider: provider_name.clone(),
+                    timeout: queue_timeout,
+                })
+            })?;
         let queue_wait = queue_start.elapsed();
         if queue_wait.as_millis() > 0 {
             tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
@@ -226,10 +268,20 @@ impl ProxyEngine {
         crate::metrics::record_queue_wait(&provider_name, queue_wait);
 
         let upstream_start = std::time::Instant::now();
-        let provider_response = provider
-            .chat_completion(params)
-            .await
-            .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
+        let upstream_timeout =
+            std::time::Duration::from_secs(self.config.server.upstream_timeout_secs);
+        let provider_response =
+            tokio::time::timeout(upstream_timeout, provider.chat_completion(params))
+                .await
+                .map_err(|_| {
+                    anyhow!(ProxyTimeoutError::Upstream {
+                        provider: provider.name().to_string(),
+                        timeout: upstream_timeout,
+                    })
+                })?
+                .with_context(|| {
+                    format!("Provider '{}' chat_completion failed", provider.name())
+                })?;
         let upstream_duration = upstream_start.elapsed();
         drop(_permit);
 
@@ -396,7 +448,16 @@ impl ProxyEngine {
         };
 
         let queue_start = std::time::Instant::now();
-        let _permit = self.limiter.acquire(&provider_name).await;
+        let queue_timeout =
+            std::time::Duration::from_secs(self.config.server.provider_queue_timeout_secs);
+        let _permit = tokio::time::timeout(queue_timeout, self.limiter.acquire(&provider_name))
+            .await
+            .map_err(|_| {
+                anyhow!(ProxyTimeoutError::ProviderQueue {
+                    provider: provider_name.clone(),
+                    timeout: queue_timeout,
+                })
+            })?;
         let queue_wait = queue_start.elapsed();
         if queue_wait.as_millis() > 0 {
             tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
@@ -407,15 +468,25 @@ impl ProxyEngine {
         crate::metrics::record_queue_wait(&provider_name, queue_wait);
 
         let upstream_start = std::time::Instant::now();
-        let embeddings = provider
-            .generate_embeddings_batch(texts.clone(), InputType::None)
-            .await
-            .with_context(|| {
-                format!(
-                    "Embedding provider '{}' failed for model '{}'",
-                    provider_name, resolved_model
-                )
-            })?;
+        let upstream_timeout =
+            std::time::Duration::from_secs(self.config.server.upstream_timeout_secs);
+        let embeddings = tokio::time::timeout(
+            upstream_timeout,
+            provider.generate_embeddings_batch(texts.clone(), InputType::None),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(ProxyTimeoutError::Upstream {
+                provider: provider_name.clone(),
+                timeout: upstream_timeout,
+            })
+        })?
+        .with_context(|| {
+            format!(
+                "Embedding provider '{}' failed for model '{}'",
+                provider_name, resolved_model
+            )
+        })?;
         let upstream_duration = upstream_start.elapsed();
         drop(_permit);
 
