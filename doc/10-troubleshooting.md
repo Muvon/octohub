@@ -175,7 +175,9 @@ What to check:
 Fixes:
 
 - Raise the cap (or remove the section entirely).
-- Add timeouts on the client side.
+- Increase `provider_queue_timeout_secs` if queued requests should wait longer.
+- Increase `upstream_timeout_secs` only when legitimate provider operations
+  need more than the default six minutes.
 - Restart the server to clear any in-process state.
 
 ### Metrics endpoint unreachable (connection refused)

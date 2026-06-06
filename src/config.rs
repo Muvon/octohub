@@ -101,6 +101,13 @@ pub struct ServerConfig {
     /// Only enable behind a trusted reverse proxy.
     #[serde(default)]
     pub trust_forwarded_for: bool,
+    /// Maximum time to wait for a provider concurrency permit.
+    #[serde(default = "default_provider_queue_timeout_secs")]
+    pub provider_queue_timeout_secs: u64,
+    /// Maximum time for the complete upstream provider operation, including
+    /// octolib retries and response parsing.
+    #[serde(default = "default_upstream_timeout_secs")]
+    pub upstream_timeout_secs: u64,
 }
 
 /// Per-provider configuration knobs.
@@ -125,6 +132,14 @@ fn default_db_url() -> String {
     "sqlite://octohub.db".to_string()
 }
 
+fn default_provider_queue_timeout_secs() -> u64 {
+    60
+}
+
+fn default_upstream_timeout_secs() -> u64 {
+    6 * 60
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -133,6 +148,8 @@ impl Default for ServerConfig {
             api_key: String::new(),
             db_url: default_db_url(),
             trust_forwarded_for: false,
+            provider_queue_timeout_secs: default_provider_queue_timeout_secs(),
+            upstream_timeout_secs: default_upstream_timeout_secs(),
         }
     }
 }
@@ -184,6 +201,16 @@ impl Config {
         if let Ok(val) = env::var("OCTOHUB_METRICS_ENABLED") {
             config.metrics.enabled = val == "true" || val == "1";
         }
+        if let Ok(val) = env::var("OCTOHUB_PROVIDER_QUEUE_TIMEOUT_SECS") {
+            if let Ok(seconds) = val.parse() {
+                config.server.provider_queue_timeout_secs = seconds;
+            }
+        }
+        if let Ok(val) = env::var("OCTOHUB_UPSTREAM_TIMEOUT_SECS") {
+            if let Ok(seconds) = val.parse() {
+                config.server.upstream_timeout_secs = seconds;
+            }
+        }
     }
 
     /// Load from environment variables only (fallback)
@@ -198,6 +225,8 @@ impl Config {
                 api_key: env::var("OCTOHUB_MASTER_KEY").unwrap_or_default(),
                 db_url: env::var("OCTOHUB_DB_URL").unwrap_or_else(|_| default_db_url()),
                 trust_forwarded_for: false,
+                provider_queue_timeout_secs: default_provider_queue_timeout_secs(),
+                upstream_timeout_secs: default_upstream_timeout_secs(),
             },
             models: HashMap::new(),
             embedding_models: HashMap::new(),
@@ -262,5 +291,33 @@ impl Config {
         let model_name = selected[pos + 1..].to_string();
 
         Ok((provider, model_name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_timeout_defaults_are_bounded() {
+        let config = ServerConfig::default();
+        assert_eq!(config.provider_queue_timeout_secs, 60);
+        assert_eq!(config.upstream_timeout_secs, 360);
+    }
+
+    #[test]
+    fn server_timeouts_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            api_key = ""
+            provider_queue_timeout_secs = 45
+            upstream_timeout_secs = 420
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.server.provider_queue_timeout_secs, 45);
+        assert_eq!(config.server.upstream_timeout_secs, 420);
     }
 }

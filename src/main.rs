@@ -106,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
         models = config.models.len(),
         embed_models = config.embedding_models.len(),
         metrics = config.metrics.enabled,
+        provider_queue_timeout_secs = config.server.provider_queue_timeout_secs,
+        upstream_timeout_secs = config.server.upstream_timeout_secs,
         "octohub starting"
     );
     if config.metrics.enabled {
