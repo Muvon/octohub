@@ -2,7 +2,7 @@ use super::{
     decode_allowed_models, encode_allowed_models, generate_api_key, make_key_hint, now_unix,
     ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use std::sync::Mutex;
 
@@ -309,33 +309,56 @@ impl Storage for SqliteStorage {
             .map_err(Into::into)
     }
 
-    fn get_session_id(&self, id: &str) -> Result<Option<String>> {
-        let conn = lock_conn(&self.conn)?;
-        conn.query_row(
-            "SELECT session_id FROM completions WHERE id = ?1",
-            rusqlite::params![id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
     fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
-        let mut chain = Vec::new();
-        let mut current_id = Some(id.to_string());
-
-        // Walk backwards through the chain
-        while let Some(ref cid) = current_id {
-            let completion = self
-                .get_completion(cid)?
-                .with_context(|| format!("Completion '{}' not found in chain", cid))?;
-            let prev = completion.previous_completion_id.clone();
-            chain.push(completion);
-            current_id = prev;
+        let conn = lock_conn(&self.conn)?;
+        // Single recursive CTE — one round-trip regardless of chain depth.
+        // Anchor is the requested (tail) completion; each recursive step follows
+        // previous_completion_id toward the root. A `depth` counter lets us
+        // sort oldest-first by reversing the walk order.
+        // Both CTE branches qualify columns with `c.` to avoid ambiguity in the JOIN.
+        let cols_prefixed = COMPLETION_COLUMNS
+            .split(',')
+            .map(|c| format!("c.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH RECURSIVE chain({cols}, depth) AS (\
+               SELECT {cols}, 0 FROM completions AS c WHERE id = ?1 \
+               UNION ALL \
+               SELECT {prefixed}, chain.depth + 1 FROM completions c \
+               JOIN chain ON c.id = chain.previous_completion_id \
+             ) \
+             SELECT {cols} FROM chain ORDER BY depth DESC",
+            cols = COMPLETION_COLUMNS,
+            prefixed = cols_prefixed,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![id], read_completion)?;
+        let chain = rows.collect::<Result<Vec<_>, _>>()?;
+        // Validate completeness: every non-root row must have its predecessor present.
+        if chain.len() > 1 {
+            let ids: std::collections::HashSet<&str> =
+                chain.iter().map(|c| c.id.as_str()).collect();
+            for c in &chain {
+                if let Some(ref prev_id) = c.previous_completion_id {
+                    if !ids.contains(prev_id.as_str()) {
+                        anyhow::bail!(
+                            "Chain broken: completion {} references missing predecessor {}",
+                            c.id,
+                            prev_id
+                        );
+                    }
+                }
+            }
+        } else if let Some(c) = chain.first() {
+            // Single entry: if it has a previous_completion_id the predecessor is missing.
+            if c.previous_completion_id.is_some() {
+                anyhow::bail!(
+                    "Chain broken: completion {} references missing predecessor",
+                    c.id
+                );
+            }
         }
-
-        // Reverse to get oldest-first order
-        chain.reverse();
         Ok(chain)
     }
 

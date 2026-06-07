@@ -124,10 +124,11 @@ pub trait Storage: Send + Sync {
 
     // Completions
     fn store_completion(&self, completion: &StoredCompletion) -> Result<()>;
+    #[allow(dead_code)]
     fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>>;
-    /// Get session_id for a given completion id (used to inherit session on chained requests)
-    fn get_session_id(&self, id: &str) -> Result<Option<String>>;
-    /// Walk the chain of previous_completion_id links, returning completions oldest-first
+    /// Walk the chain of previous_completion_id links, returning completions oldest-first.
+    /// Only populates the fields needed for chain replay: id, session_id,
+    /// previous_completion_id, input, output, instructions.
     fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>>;
     fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>>;
 

@@ -108,13 +108,23 @@ impl ProxyEngine {
         // Unknown IDs are accepted (stateless-provider migration path) but must
         // not be persisted — that would create dangling chains forever.
         let mut resolved_prev_id: Option<String> = None;
+        // session_id inherited from the tail of the resolved chain.
+        let mut inherited_session_id: Option<String> = None;
 
         if let Some(ref prev_cmpl_id) = req.previous_completion_id {
             // Unknown IDs are tolerated — the client may be migrating from a stateless
             // provider (Anthropic, etc.) where they pass the full history inline in
             // `input`. Hard-failing would break that workflow. Mirrors OpenAI's
             // guidance: "retry with full input context and previous_response_id null."
-            let chain = match self.storage.walk_chain(prev_cmpl_id) {
+            let chain_start = std::time::Instant::now();
+            let storage = self.storage.clone();
+            let prev_id = prev_cmpl_id.clone();
+            let chain_result =
+                tokio::task::spawn_blocking(move || storage.walk_chain(&prev_id)).await?;
+            let chain_ms = chain_start.elapsed().as_millis() as u64;
+            tracing::Span::current().record("chain_ms", chain_ms);
+
+            let chain = match chain_result {
                 Ok(chain) => {
                     resolved_prev_id = Some(prev_cmpl_id.clone());
                     chain
@@ -128,6 +138,9 @@ impl ProxyEngine {
                     Vec::new()
                 }
             };
+
+            // Inherit session_id from the most recent (last) chain entry.
+            inherited_session_id = chain.last().map(|c| c.session_id.clone());
 
             for stored in &chain {
                 // Fall back to chain-stored instructions only if the request didn't
@@ -283,6 +296,7 @@ impl ProxyEngine {
                     format!("Provider '{}' chat_completion failed", provider.name())
                 })?;
         let upstream_duration = upstream_start.elapsed();
+        tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
         drop(_permit);
 
         // 8. Build our response
@@ -381,13 +395,9 @@ impl ProxyEngine {
 
         // 9. Store for observability. Use resolved_prev_id (None if chain didn't
         // resolve) so we never persist a link to an unknown ID.
-        let session_id = if let Some(ref prev_id) = resolved_prev_id {
-            self.storage
-                .get_session_id(prev_id)?
-                .unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()))
-        } else {
-            format!("sess_{}", Uuid::new_v4().simple())
-        };
+        // session_id comes from the chain tail — no extra DB query needed.
+        let session_id =
+            inherited_session_id.unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()));
 
         let stored = StoredCompletion {
             id: completion_id,
@@ -407,7 +417,10 @@ impl ProxyEngine {
             usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
             created_at: now,
         };
-        self.storage.store_completion(&stored)?;
+        let store_start = std::time::Instant::now();
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || storage.store_completion(&stored)).await??;
+        tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
 
         Ok((response, upstream_duration))
     }
@@ -488,6 +501,7 @@ impl ProxyEngine {
             )
         })?;
         let upstream_duration = upstream_start.elapsed();
+        tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
         drop(_permit);
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -525,7 +539,10 @@ impl ProxyEngine {
             usage: usage.clone(),
             created_at: now,
         };
-        self.storage.store_embedding(&stored)?;
+        let store_start = std::time::Instant::now();
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || storage.store_embedding(&stored)).await??;
+        tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
 
         Ok(EmbeddingOutcome {
             response,

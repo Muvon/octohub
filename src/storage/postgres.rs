@@ -3,28 +3,31 @@ use super::{
     StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
-use postgres::{Client, NoTls};
+use postgres::NoTls;
+use r2d2_postgres::PostgresConnectionManager;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// PostgreSQL-backed storage implementation
 pub struct PostgresStorage {
-    client: Mutex<Client>,
+    pool: r2d2::Pool<PostgresConnectionManager<NoTls>>,
 }
 
 impl PostgresStorage {
     /// Create a new PostgreSQL storage, initializing the schema
     pub fn new(url: &str) -> Result<Self> {
-        let client = Client::connect(url, NoTls).context("Failed to connect to PostgreSQL")?;
-        let storage = Self {
-            client: Mutex::new(client),
-        };
+        let manager =
+            PostgresConnectionManager::new(url.parse().context("Invalid PostgreSQL DSN")?, NoTls);
+        let pool = r2d2::Pool::builder()
+            .max_size(10)
+            .build(manager)
+            .context("Failed to create PostgreSQL connection pool")?;
+        let storage = Self { pool };
         storage.init_schema()?;
         Ok(storage)
     }
 
     fn init_schema(&self) -> Result<()> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         client.batch_execute(
             "CREATE TABLE IF NOT EXISTS api_keys (
                 id BIGSERIAL PRIMARY KEY,
@@ -73,12 +76,6 @@ impl PostgresStorage {
             CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);",
         )?;
         Ok(())
-    }
-
-    fn lock_client(&self) -> Result<std::sync::MutexGuard<'_, Client>> {
-        self.client
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))
     }
 }
 
@@ -199,7 +196,7 @@ fn effective_limit(limit: u32) -> i64 {
 
 impl Storage for PostgresStorage {
     fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let key = generate_api_key();
         let key_hint = make_key_hint(&key);
         let now = now_unix() as i64;
@@ -226,7 +223,7 @@ impl Storage for PostgresStorage {
     }
 
     fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let rows = client.query(
             "SELECT id, name, key_hint, status, allowed_models, created_at \
              FROM api_keys ORDER BY id",
@@ -236,7 +233,7 @@ impl Storage for PostgresStorage {
     }
 
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let rows = client.query(
             "SELECT id, name, key_hint, status, allowed_models, created_at \
              FROM api_keys WHERE id = $1",
@@ -246,7 +243,7 @@ impl Storage for PostgresStorage {
     }
 
     fn revoke_api_key(&self, id: i64) -> Result<bool> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let affected = client.execute(
             "UPDATE api_keys SET status = 'revoked' WHERE id = $1 AND status = 'active'",
             &[&id],
@@ -255,7 +252,7 @@ impl Storage for PostgresStorage {
     }
 
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let rows = client.query(
             "SELECT id, name, key, key_hint, status, allowed_models, created_at \
              FROM api_keys WHERE key = $1",
@@ -273,7 +270,7 @@ impl Storage for PostgresStorage {
     }
 
     fn store_completion(&self, completion: &StoredCompletion) -> Result<()> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let created_at = completion.created_at as i64;
         client.execute(
             "INSERT INTO completions (id, api_key_id, session_id, previous_completion_id, input_model, resolved_model, provider, input, output, instructions, exchange, usage, created_at)
@@ -298,36 +295,29 @@ impl Storage for PostgresStorage {
     }
 
     fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let rows = client.query("SELECT * FROM completions WHERE id = $1", &[&id])?;
         Ok(rows.first().map(read_completion))
     }
 
-    fn get_session_id(&self, id: &str) -> Result<Option<String>> {
-        let mut client = self.lock_client()?;
-        let rows = client.query("SELECT session_id FROM completions WHERE id = $1", &[&id])?;
-        Ok(rows.first().map(|row| row.get("session_id")))
-    }
-
     fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
-        let mut chain = Vec::new();
-        let mut current_id = Some(id.to_string());
-
-        while let Some(ref cid) = current_id {
-            let completion = self
-                .get_completion(cid)?
-                .with_context(|| format!("Completion '{}' not found in chain", cid))?;
-            let prev = completion.previous_completion_id.clone();
-            chain.push(completion);
-            current_id = prev;
-        }
-
-        chain.reverse();
-        Ok(chain)
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        // Single recursive CTE — one round-trip regardless of chain depth.
+        let rows = client.query(
+            "WITH RECURSIVE chain AS (\
+               SELECT * FROM completions WHERE id = $1 \
+               UNION ALL \
+               SELECT c.* FROM completions c \
+               JOIN chain ON c.id = chain.previous_completion_id \
+             ) \
+             SELECT * FROM chain ORDER BY created_at ASC",
+            &[&id],
+        )?;
+        Ok(rows.iter().map(read_completion).collect())
     }
 
     fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let (where_clause, mut params, mut idx) =
             build_filter(&filter.key_ids, filter.since, filter.until);
 
@@ -353,7 +343,7 @@ impl Storage for PostgresStorage {
     }
 
     fn store_embedding(&self, embedding: &StoredEmbedding) -> Result<()> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let created_at = embedding.created_at as i64;
         client.execute(
             "INSERT INTO embeddings (id, api_key_id, input_model, resolved_model, provider, input, usage, created_at)
@@ -373,7 +363,7 @@ impl Storage for PostgresStorage {
     }
 
     fn list_embeddings(&self, filter: &ListFilter) -> Result<Vec<StoredEmbedding>> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let (where_clause, mut params, mut idx) =
             build_filter(&filter.key_ids, filter.since, filter.until);
 
@@ -405,7 +395,7 @@ impl Storage for PostgresStorage {
         since: Option<u64>,
         until: Option<u64>,
     ) -> Result<Vec<UsageRow>> {
-        let mut client = self.lock_client()?;
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
 
         let bucket_expr = match bucket {
             Some(TimeBucket::Hour) => "(created_at / 3600) * 3600",

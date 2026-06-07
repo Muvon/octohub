@@ -53,7 +53,8 @@ Verified against the current source tree:
 
 | Feature | Where |
 |---|---|
-| OpenAI-style `POST /v1/completions` and `POST /v1/embeddings` | `src/api/handler.rs:44`, `src/api/handler.rs:146` |
+| OpenAI-style `POST /v1/completions` (Responses API) and `POST /v1/embeddings` | `src/api/handler.rs:44`, `src/api/handler.rs:146` |
+| Classic OpenAI `POST /v1/chat/completions` (Chat Completions API) | `src/api/handler.rs:284` |
 | Multi-turn chain (`previous_completion_id`) | `src/proxy/engine.rs:79` |
 | Reasoning/thinking replay (DeepSeek-compatible) | `src/proxy/engine.rs:248` |
 | Structured output (`text.format` → JSON schema) | `src/proxy/engine.rs:195` |

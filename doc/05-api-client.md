@@ -10,11 +10,32 @@ Sources: [`src/api/handler.rs`](../../src/api/handler.rs),
 
 ## Endpoints
 
-| Method | Path | Handler | Auth |
-|---|---|---|---|
-| `POST` | `/v1/completions` | `handle_create_completion` at `src/api/handler.rs:44` | client key |
-| `POST` | `/v1/embeddings` | `handle_create_embedding` at `src/api/handler.rs:146` | client key |
-| `GET`  | `/health` | `handle_health` at `src/api/handler.rs:141` | none |
+| Method | Path | Style | Handler | Auth |
+|---|---|---|---|---|
+| `POST` | `/v1/completions` | OctoHub Responses API | `handle_create_completion` at `src/api/handler.rs:44` | client key |
+| `POST` | `/v1/chat/completions` | Classic OpenAI Chat Completions | `handle_chat_completion` at `src/api/handler.rs:284` | client key |
+| `POST` | `/v1/embeddings` | OpenAI-compatible | `handle_create_embedding` at `src/api/handler.rs:146` | client key |
+| `GET`  | `/health` | — | `handle_health` at `src/api/handler.rs:141` | none |
+
+## Which completion endpoint to use
+
+**`/v1/completions`** — OctoHub's native Responses API. Used by Octomind.
+Supports multi-turn chains via `previous_completion_id`, reasoning-block
+replay for thinking models, and a richer output structure (`output[]` array
+with typed items). Choose this when building against OctoHub directly.
+
+**`/v1/chat/completions`** — Classic OpenAI Chat Completions. A drop-in
+replacement for `api.openai.com/v1/chat/completions`. Use this when pointing
+an existing OpenAI-compatible client (Python `openai` SDK, LangChain,
+LiteLLM, any third-party tool) at OctoHub — no code changes on the client
+side, just swap the `base_url`.
+
+Both endpoints share the **same engine, same storage, same auth, same
+metrics**. The completion `id` returned is the same DB row either way. The
+only difference is the wire format going in and coming out.
+
+> **Streaming:** `/v1/chat/completions` does not support `"stream": true`.
+> Requests with streaming enabled return `501 Not Implemented`.
 
 All client responses include an `X-Request-Id` header
 (`src/main.rs:198`). Use it to correlate against server logs and
@@ -164,6 +185,83 @@ Use your SDK's retry policy.
 If you want OctoHub to load-balance across providers, that's the
 `[models]` config — see [03 — Configuration](./03-configuration.md).
 The list is sampled **once per request**, randomly.
+
+## `POST /v1/chat/completions`
+
+Classic OpenAI Chat Completions. Point any OpenAI-compatible client here
+by setting `base_url = "http://127.0.0.1:8080/v1"`. Internally this is
+identical to `/v1/completions` — same engine, same DB row, same auth.
+
+### Request schema
+
+```jsonc
+{
+  "model": "minimax-m2.7",
+  "messages": [
+    {"role": "system", "content": "Be concise."},
+    {"role": "user",   "content": "What is Rust?"}
+  ],
+  "temperature": 1.0,      // optional, default 1.0
+  "top_p": 1.0,            // optional, default 1.0
+  "max_tokens": 512,       // optional, 0/null = provider default
+  "stream": false,         // optional — true returns 501
+  "tools": [...],          // optional — classic nested-function shape
+  "tool_choice": "auto"    // optional — accepted and ignored
+}
+```
+
+Message conversion (transparent to the caller):
+
+| Classic role | Becomes |
+|---|---|
+| `system` | `instructions` (multiple system messages joined with `\n`) |
+| `user` / `assistant` (text) | `message` input item |
+| `assistant` + `tool_calls` | one `function_call` input item per call |
+| `tool` | `function_call_output` (matched by `tool_call_id`) |
+
+### Response schema
+
+```jsonc
+{
+  "id": "cmpl_01JXXXXXXXXXX",   // DB completion id
+  "object": "chat.completion",
+  "created": 1749300000,
+  "model": "minimax:minimax-m2.7",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "Rust is a systems language…",
+      "tool_calls": null          // populated when the model calls a tool
+    },
+    "finish_reason": "stop"       // always a string; "stop" fallback
+  }],
+  "usage": {
+    "prompt_tokens": 18,
+    "completion_tokens": 9,
+    "total_tokens": 27
+  }
+}
+```
+
+Reasoning blocks from thinking models are not included (invisible to
+classic clients by design).
+
+### Python SDK example
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8080/v1",
+    api_key="<client-api-key>",
+)
+resp = client.chat.completions.create(
+    model="minimax-m2.7",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(resp.choices[0].message.content)
+```
 
 ## `POST /v1/embeddings`
 

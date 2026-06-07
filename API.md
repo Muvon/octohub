@@ -10,7 +10,7 @@ OctoHub has two authentication layers, both controlled by the `api_key` setting 
 
 **If `api_key` is set**: full authentication is enforced on both layers.
 
-### Client endpoints (`/v1/completions`, `/v1/embeddings`)
+### Client endpoints (`/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`)
 
 Authenticated with a **client API key** issued via the admin API. Pass it as a Bearer token:
 
@@ -47,9 +47,23 @@ All errors return JSON:
 
 ## Client Endpoints
 
+OctoHub exposes two completion APIs. Use whichever fits your client:
+
+| Endpoint | Style | Best for |
+|---|---|---|
+| `POST /v1/completions` | **OctoHub Responses API** | Octomind and native OctoHub clients. Multi-turn chains, reasoning replay, richer output shape. |
+| `POST /v1/chat/completions` | **Classic OpenAI Chat Completions** | Any OpenAI-compatible SDK or tool (LangChain, LiteLLM, curl with `openai` libs, etc.). Drop-in replacement. |
+| `POST /v1/embeddings` | OpenAI-compatible | Embedding clients. |
+
+Both completion endpoints hit the **same proxy engine** and write to the **same `completions` table** with the same `id`, auth, metrics, and logging. The only difference is the wire format.
+
+> **Note:** `POST /v1/chat/completions` does not support streaming (`"stream": true`). Requests with streaming enabled receive `501 Not Implemented`.
+
+---
+
 ### POST /v1/completions
 
-Create a model response. Supports multi-turn conversations via response chaining, system instructions, and function calling.
+OctoHub's native Responses API. Supports multi-turn conversation chains, reasoning-block replay, and a richer output structure. Used by Octomind.
 
 #### Request
 
@@ -269,6 +283,156 @@ curl -X POST http://127.0.0.1:8080/v1/completions \
 ```
 
 OctoHub randomly picks one provider from the list for load balancing.
+
+---
+
+### POST /v1/chat/completions
+
+Classic OpenAI Chat Completions API. Compatible with any OpenAI-compatible client or SDK. Internally converts to the same engine call as `/v1/completions` — all completions are stored in the DB with the same `id`, auth key, tokens, and provider metadata.
+
+#### Request
+
+```json
+{
+  "model": "string",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "temperature": 1.0,
+  "top_p": 1.0,
+  "max_tokens": null,
+  "stream": false,
+  "tools": null,
+  "tool_choice": null
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `model` | string | ✅ | — | Model identifier — same as `/v1/completions`. |
+| `messages` | array | ✅ | — | Conversation history. Roles: `system`, `user`, `assistant`, `tool`. |
+| `temperature` | float | — | `1.0` | Sampling temperature. |
+| `top_p` | float | — | `1.0` | Nucleus sampling. |
+| `max_tokens` | integer | — | provider default | Maximum output tokens. |
+| `stream` | bool | — | `false` | Streaming is **not supported** — `true` returns `501`. |
+| `tools` | array | — | `null` | Classic tool definitions (nested `function` object). |
+| `tool_choice` | any | — | `null` | Accepted and ignored — provider decides. |
+
+**Message conversion rules:**
+- `role=system` messages → `instructions` (concatenated with newline if multiple)
+- `role=tool` messages → `function_call_output` (keyed by `tool_call_id`)
+- `role=assistant` with `tool_calls` → one `function_call` input item per call
+- All other messages → `message` input items (content string or parts preserved)
+
+#### Response
+
+Standard OpenAI Chat Completions response shape:
+
+```json
+{
+  "id": "cmpl_01JXXXXXXXXXX",
+  "object": "chat.completion",
+  "created": 1749300000,
+  "model": "openai:gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! How can I help?",
+        "tool_calls": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 8,
+    "total_tokens": 18
+  }
+}
+```
+
+- `id` is the same ULID-based completion ID stored in the DB — use it to look up the record via the admin API
+- `finish_reason` is always a string; falls back to `"stop"` when the upstream doesn't report one
+- Tool call responses: `choices[0].message.content` is `null`, `tool_calls` is populated
+- Reasoning blocks from thinking models are **not** surfaced in the classic response (invisible to classic clients)
+
+#### Examples
+
+##### Using the Python openai SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8080/v1",
+    api_key="<client-api-key>",
+)
+
+response = client.chat.completions.create(
+    model="openai:gpt-4o",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Explain Rust in one sentence."},
+    ],
+)
+print(response.choices[0].message.content)
+```
+
+##### Using curl
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer <client-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai:gpt-4o",
+    "messages": [
+      {"role": "system", "content": "Be concise."},
+      {"role": "user", "content": "What is Rust?"}
+    ]
+  }'
+```
+
+##### Tool calling
+
+```bash
+# Step 1: ask with tools
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer <client-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai:gpt-4o",
+    "messages": [{"role": "user", "content": "What is the weather in NYC?"}],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get current weather",
+          "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"]
+          }
+        }
+      }
+    ]
+  }'
+# Response: choices[0].message.tool_calls[0] = {id, type, function: {name, arguments}}
+
+# Step 2: send result back
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer <client-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai:gpt-4o",
+    "messages": [
+      {"role": "user", "content": "What is the weather in NYC?"},
+      {"role": "assistant", "tool_calls": [{"id": "call_xyz", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\":\"NYC\"}"}}]},
+      {"role": "tool", "tool_call_id": "call_xyz", "content": "72°F, sunny"}
+    ]
+  }'
+```
 
 ---
 

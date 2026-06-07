@@ -63,8 +63,7 @@ impl MysqlStorage {
                 INDEX idx_completions_api_key (api_key_id),
                 INDEX idx_completions_session (session_id),
                 INDEX idx_completions_previous (previous_completion_id),
-                INDEX idx_completions_created (created_at),
-                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+                INDEX idx_completions_created (created_at)
             )",
         )?;
         conn.query_drop(
@@ -78,8 +77,7 @@ impl MysqlStorage {
                 `usage` JSON NOT NULL,
                 created_at BIGINT UNSIGNED NOT NULL,
                 INDEX idx_embeddings_api_key (api_key_id),
-                INDEX idx_embeddings_created (created_at),
-                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+                INDEX idx_embeddings_created (created_at)
             )",
         )?;
         Ok(())
@@ -308,28 +306,20 @@ impl Storage for MysqlStorage {
         row.map(read_completion).transpose()
     }
 
-    fn get_session_id(&self, id: &str) -> Result<Option<String>> {
-        let mut conn = self.pool.get_conn()?;
-        let row: Option<String> =
-            conn.exec_first("SELECT session_id FROM completions WHERE id = ?", (id,))?;
-        Ok(row)
-    }
-
     fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
-        let mut chain = Vec::new();
-        let mut current_id = Some(id.to_string());
-
-        while let Some(ref cid) = current_id {
-            let completion = self
-                .get_completion(cid)?
-                .with_context(|| format!("Completion '{}' not found in chain", cid))?;
-            let prev = completion.previous_completion_id.clone();
-            chain.push(completion);
-            current_id = prev;
-        }
-
-        chain.reverse();
-        Ok(chain)
+        let mut conn = self.pool.get_conn()?;
+        // Single recursive CTE — one round-trip regardless of chain depth.
+        let rows: Vec<mysql::Row> = conn.exec(
+            "WITH RECURSIVE chain AS (\
+               SELECT * FROM completions WHERE id = ? \
+               UNION ALL \
+               SELECT c.* FROM completions c \
+               JOIN chain ON c.id = chain.previous_completion_id \
+             ) \
+             SELECT * FROM chain ORDER BY created_at ASC",
+            (id,),
+        )?;
+        rows.into_iter().map(read_completion).collect()
     }
 
     fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {
