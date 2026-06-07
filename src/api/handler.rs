@@ -4,7 +4,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 
-use crate::api::types::{CreateCompletionRequest, CreateEmbeddingRequest};
+use crate::api::types::{
+    ChatCompletionRequest, ChatCompletionResponse, CreateCompletionRequest, CreateEmbeddingRequest,
+};
 use crate::auth::{authenticate_client, ClientAuth};
 use crate::proxy::engine::{ProxyEngine, ProxyTimeoutError, MODEL_FORBIDDEN_MARKER};
 use crate::storage::Storage;
@@ -47,7 +49,12 @@ pub async fn handle_create_completion(
     storage: Arc<dyn Storage>,
 ) -> Response<BoxBody> {
     let header = auth_header(&req);
-    let api_key = match authenticate_client(header.as_deref(), &storage) {
+    let storage_clone = storage.clone();
+    let auth_result =
+        tokio::task::spawn_blocking(move || authenticate_client(header.as_deref(), &storage_clone))
+            .await
+            .unwrap_or(ClientAuth::Invalid);
+    let api_key = match auth_result {
         ClientAuth::Ok(key) => key,
         ClientAuth::Missing => {
             tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
@@ -58,7 +65,6 @@ pub async fn handle_create_completion(
             return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key");
         }
     };
-
     tracing::Span::current().record("api_key_id", api_key.id);
 
     // Read body
@@ -149,7 +155,12 @@ pub async fn handle_create_embedding(
     storage: Arc<dyn Storage>,
 ) -> Response<BoxBody> {
     let header = auth_header(&req);
-    let api_key = match authenticate_client(header.as_deref(), &storage) {
+    let storage_clone = storage.clone();
+    let auth_result =
+        tokio::task::spawn_blocking(move || authenticate_client(header.as_deref(), &storage_clone))
+            .await
+            .unwrap_or(ClientAuth::Invalid);
+    let api_key = match auth_result {
         ClientAuth::Ok(key) => key,
         ClientAuth::Missing => {
             tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
@@ -160,7 +171,6 @@ pub async fn handle_create_embedding(
             return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key");
         }
     };
-
     tracing::Span::current().record("api_key_id", api_key.id);
 
     let body_bytes = match req.collect().await {
@@ -270,6 +280,111 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
     // just the outer wrap. Without this the client gets a useless top
     // message and has to read server logs to diagnose anything.
     (StatusCode::INTERNAL_SERVER_ERROR, full)
+}
+
+/// Handle POST /v1/chat/completions (classic OpenAI-compatible)
+pub async fn handle_chat_completion(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    let header = auth_header(&req);
+    let storage_clone = storage.clone();
+    let auth_result =
+        tokio::task::spawn_blocking(move || authenticate_client(header.as_deref(), &storage_clone))
+            .await
+            .unwrap_or(ClientAuth::Invalid);
+    let api_key = match auth_result {
+        ClientAuth::Ok(key) => key,
+        ClientAuth::Missing => {
+            tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
+            return error_response(StatusCode::UNAUTHORIZED, "Missing API key");
+        }
+        ClientAuth::Invalid => {
+            tracing::warn!(kind = "client", reason = "invalid_token", "auth failed");
+            return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key");
+        }
+    };
+    tracing::Span::current().record("api_key_id", api_key.id);
+
+    // Read body
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read request body: {}", e),
+            );
+        }
+    };
+
+    // Parse classic chat request
+    let chat_req: ChatCompletionRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid request JSON: {}", e),
+            );
+        }
+    };
+
+    if chat_req.stream {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Streaming is not supported on this endpoint",
+        );
+    }
+
+    // Convert to internal representation — same engine path as /v1/completions
+    let model_label = chat_req.model.clone();
+    let create_req: CreateCompletionRequest = chat_req.into();
+    tracing::Span::current().record("model", create_req.model.as_str());
+
+    let per_key = engine.config().metrics.per_key;
+
+    match engine.process(create_req, &api_key).await {
+        Ok((response, upstream_duration)) => {
+            tracing::Span::current().record("tok_in", response.usage.input_tokens);
+            tracing::Span::current().record("tok_out", response.usage.output_tokens);
+
+            crate::metrics::record_completion(
+                &response.model,
+                &response.provider,
+                "ok",
+                upstream_duration,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                Some(api_key.id),
+                per_key,
+            );
+
+            let chat_resp: ChatCompletionResponse = response.into();
+            let body = serde_json::to_value(&chat_resp).unwrap_or_default();
+            json_response(StatusCode::OK, body)
+        }
+        Err(e) => {
+            let (status, msg) = classify_engine_error(&e);
+            if status.is_server_error() {
+                tracing::error!(error = ?e, "completion failed");
+            } else {
+                tracing::warn!(reason = %msg, "request rejected");
+            }
+
+            crate::metrics::record_completion(
+                &model_label,
+                "unknown",
+                "error",
+                std::time::Duration::ZERO,
+                0,
+                0,
+                Some(api_key.id),
+                per_key,
+            );
+
+            error_response(status, &msg)
+        }
+    }
 }
 
 #[cfg(test)]

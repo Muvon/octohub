@@ -165,6 +165,8 @@ fn build_provider_summary(config: &Config) -> String {
 fn classify_route(path: &str) -> &'static str {
     if path == "/v1/completions" {
         "/v1/completions"
+    } else if path == "/v1/chat/completions" {
+        "/v1/chat/completions"
     } else if path == "/v1/embeddings" {
         "/v1/embeddings"
     } else if path.starts_with("/v1/admin/keys") {
@@ -237,6 +239,9 @@ async fn route(
         model = tracing::field::Empty,
         provider = tracing::field::Empty,
         queued_ms = tracing::field::Empty,
+        chain_ms = tracing::field::Empty,
+        upstream_ms = tracing::field::Empty,
+        store_ms = tracing::field::Empty,
         tok_in = tracing::field::Empty,
         tok_out = tracing::field::Empty,
     );
@@ -256,6 +261,9 @@ async fn route(
         match (method, path.as_str()) {
             (Method::POST, "/v1/completions") => {
                 api::handler::handle_create_completion(req, engine, storage).await
+            }
+            (Method::POST, "/v1/chat/completions") => {
+                api::handler::handle_chat_completion(req, engine, storage).await
             }
             (Method::POST, "/v1/embeddings") => {
                 api::handler::handle_create_embedding(req, engine, storage).await

@@ -394,6 +394,382 @@ pub enum CreateEmbeddingResponse {
     Batch(Vec<Vec<f32>>),
 }
 
+// ── Classic OpenAI Chat Completions types ────────────────────────────────────
+
+/// Classic `POST /v1/chat/completions` request.
+/// Converted to `CreateCompletionRequest` before hitting the engine so all
+/// storage, logging, and metrics paths remain unchanged.
+#[derive(Debug, Deserialize)]
+pub struct ChatCompletionRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Streaming is not supported — callers that set this to true receive 501.
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default)]
+    pub tools: Option<Vec<ChatTool>>,
+    /// Accepted and ignored — tool selection is left to the upstream provider.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+/// A single message in the classic `messages` array.
+#[derive(Debug, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    /// Content is either a plain string or an array of typed content parts.
+    /// `null` is valid for assistant messages that only contain tool_calls.
+    #[serde(default)]
+    pub content: Option<ChatMessageContent>,
+    /// Tool calls emitted by an assistant turn (replayed in subsequent turns).
+    #[serde(default)]
+    pub tool_calls: Option<Vec<ChatToolCall>>,
+    /// For `role=tool` messages: the call_id this result belongs to.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    /// For `role=tool` messages: the function name (informational, not required
+    /// by all providers).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub name: Option<String>,
+}
+
+/// Content is either a plain string or an array of typed content parts.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+/// A single typed content part in the classic parts array.
+#[derive(Debug, Deserialize)]
+pub struct ChatContentPart {
+    #[serde(rename = "type")]
+    pub part_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    /// `image_url` object: `{"url": "https://..."}` or data URI.
+    #[serde(default)]
+    pub image_url: Option<ChatImageUrl>,
+}
+
+/// Classic image_url wrapper.
+#[derive(Debug, Deserialize)]
+pub struct ChatImageUrl {
+    pub url: String,
+}
+
+/// Classic tool definition.
+#[derive(Debug, Deserialize)]
+pub struct ChatTool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ChatFunction,
+}
+
+/// Function definition inside a classic tool.
+#[derive(Debug, Deserialize)]
+pub struct ChatFunction {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// Classic tool-call entry emitted by an assistant message.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ChatToolCallFunction,
+}
+
+/// Function name + JSON-encoded arguments inside a tool call.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Classic `POST /v1/chat/completions` response.
+#[derive(Debug, Serialize)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatChoice>,
+    pub usage: ChatUsage,
+}
+
+/// A single choice in the classic response.
+#[derive(Debug, Serialize)]
+pub struct ChatChoice {
+    pub index: u32,
+    pub message: ChatResponseMessage,
+    /// OpenAI spec: always a string on complete responses. Fall back to "stop"
+    /// when the upstream provider doesn't report a stop reason.
+    pub finish_reason: String,
+}
+
+/// Assistant message in the classic response.
+#[derive(Debug, Serialize)]
+pub struct ChatResponseMessage {
+    pub role: &'static str,
+    /// `null` when the response consists entirely of tool calls.
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+/// Token usage in the classic response.
+#[derive(Debug, Serialize)]
+pub struct ChatUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+// ── Conversion: ChatCompletionRequest → CreateCompletionRequest ──────────────
+
+impl From<ChatCompletionRequest> for CreateCompletionRequest {
+    fn from(chat: ChatCompletionRequest) -> Self {
+        // Collect system messages into a single instructions string.
+        let system_text: String = chat
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .filter_map(|m| content_as_text(m.content.as_ref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let instructions = if system_text.is_empty() {
+            None
+        } else {
+            Some(ContentValue::Text(system_text))
+        };
+
+        // Convert non-system messages to InputItems.
+        let items: Vec<InputItem> = chat
+            .messages
+            .into_iter()
+            .filter(|m| m.role != "system")
+            .flat_map(chat_message_to_input_items)
+            .collect();
+
+        // Convert classic tool definitions to Responses API format.
+        let tools = chat.tools.map(|ts| {
+            ts.into_iter()
+                .map(|t| ToolDefinition {
+                    tool_type: t.tool_type,
+                    name: t.function.name,
+                    description: t.function.description,
+                    parameters: t.function.parameters,
+                    cache_control: None,
+                })
+                .collect()
+        });
+
+        CreateCompletionRequest {
+            model: chat.model,
+            input: Input::Items(items),
+            instructions,
+            previous_completion_id: None,
+            temperature: chat.temperature,
+            top_p: chat.top_p,
+            max_output_tokens: chat.max_tokens.unwrap_or(0),
+            reasoning_effort: None,
+            text: None,
+            tools,
+        }
+    }
+}
+
+/// Extract plain text from a `ChatMessageContent`, joining parts.
+fn content_as_text(content: Option<&ChatMessageContent>) -> Option<String> {
+    match content? {
+        ChatMessageContent::Text(s) => Some(s.clone()),
+        ChatMessageContent::Parts(parts) => {
+            let text: String = parts
+                .iter()
+                .filter(|p| p.part_type == "text")
+                .filter_map(|p| p.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("");
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+    }
+}
+
+/// Convert a single `ChatMessage` into one or more `InputItem`s.
+/// - `role=tool` → `FunctionCallOutput`
+/// - `role=assistant` with tool_calls → one `FunctionCall` per call, then
+///   optionally a `Message` for any text content
+/// - everything else → `Message`
+fn chat_message_to_input_items(msg: ChatMessage) -> Vec<InputItem> {
+    match msg.role.as_str() {
+        "tool" => {
+            let call_id = msg.tool_call_id.unwrap_or_default();
+            let output = content_as_text(msg.content.as_ref()).unwrap_or_default();
+            vec![InputItem::FunctionCallOutput { call_id, output }]
+        }
+        "assistant" => {
+            let mut items: Vec<InputItem> = Vec::new();
+            if let Some(tool_calls) = msg.tool_calls {
+                for tc in tool_calls {
+                    items.push(InputItem::FunctionCall {
+                        call_id: tc.id,
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
+                    });
+                }
+            }
+            // Include any text content from the assistant turn.
+            if let Some(text) = content_as_text(msg.content.as_ref()) {
+                items.push(InputItem::Message {
+                    role: "assistant".into(),
+                    content: content_value_from_chat(msg.content.as_ref(), &text),
+                });
+            }
+            items
+        }
+        role => {
+            let content = content_value_from_chat_owned(msg.content);
+            vec![InputItem::Message {
+                role: role.to_string(),
+                content,
+            }]
+        }
+    }
+}
+
+/// Build a `ContentValue` from a classic message's content, preserving image
+/// parts when present.
+fn content_value_from_chat(content: Option<&ChatMessageContent>, _text: &str) -> ContentValue {
+    match content {
+        None => ContentValue::Text(String::new()),
+        Some(ChatMessageContent::Text(s)) => ContentValue::Text(s.clone()),
+        Some(ChatMessageContent::Parts(parts)) => ContentValue::Parts(
+            parts
+                .iter()
+                .map(|p| ContentPartInput {
+                    part_type: if p.part_type == "image_url" {
+                        "input_image".into()
+                    } else {
+                        p.part_type.clone()
+                    },
+                    text: p.text.clone(),
+                    image_url: p.image_url.as_ref().map(|u| u.url.clone()),
+                    video_url: None,
+                    cache_control: None,
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn content_value_from_chat_owned(content: Option<ChatMessageContent>) -> ContentValue {
+    match content {
+        None => ContentValue::Text(String::new()),
+        Some(ChatMessageContent::Text(s)) => ContentValue::Text(s),
+        Some(ChatMessageContent::Parts(parts)) => ContentValue::Parts(
+            parts
+                .into_iter()
+                .map(|p| ContentPartInput {
+                    part_type: if p.part_type == "image_url" {
+                        "input_image".into()
+                    } else {
+                        p.part_type
+                    },
+                    text: p.text,
+                    image_url: p.image_url.map(|u| u.url),
+                    video_url: None,
+                    cache_control: None,
+                })
+                .collect(),
+        ),
+    }
+}
+
+// ── Conversion: CreateCompletionResponse → ChatCompletionResponse ────────────
+
+impl From<CreateCompletionResponse> for ChatCompletionResponse {
+    fn from(resp: CreateCompletionResponse) -> Self {
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut tool_calls: Vec<ChatToolCall> = Vec::new();
+
+        for item in resp.output {
+            match item {
+                OutputItem::Message { content, .. } => {
+                    for part in content {
+                        let ContentPart::OutputText { text } = part;
+                        text_parts.push(text);
+                    }
+                }
+                OutputItem::FunctionCall {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    tool_calls.push(ChatToolCall {
+                        id,
+                        call_type: "function".into(),
+                        function: ChatToolCallFunction { name, arguments },
+                    });
+                }
+                // Reasoning blocks are invisible to classic clients.
+                OutputItem::Reasoning { .. } => {}
+            }
+        }
+
+        let content = if text_parts.is_empty() {
+            None
+        } else {
+            Some(text_parts.join(""))
+        };
+        let tool_calls_opt = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        };
+
+        ChatCompletionResponse {
+            id: resp.id,
+            object: "chat.completion",
+            created: resp.created_at,
+            model: resp.model,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: "assistant",
+                    content,
+                    tool_calls: tool_calls_opt,
+                },
+                finish_reason: resp.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            }],
+            usage: ChatUsage {
+                prompt_tokens: resp.usage.input_tokens,
+                completion_tokens: resp.usage.output_tokens,
+                total_tokens: resp.usage.total_tokens,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
