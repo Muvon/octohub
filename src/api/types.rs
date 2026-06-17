@@ -103,7 +103,18 @@ pub enum InputItem {
     Message { role: String, content: ContentValue },
     /// Output from a function call (tool result)
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+        /// Optional ephemeral cache marker, mirroring `ContentPartInput.cache_control`
+        /// and `ToolDefinition.cache_control`. In an agent loop the tool result is
+        /// usually the conversation tail, where the client anchors its rolling cache
+        /// breakpoint — so it MUST round-trip. We are a proxy: forward it upstream
+        /// unchanged. Without this field the marker is silently dropped on tool
+        /// results (the bulk of an agent context), defeating prompt caching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<serde_json::Value>,
+    },
     /// A prior assistant tool call replayed by the client (used when migrating
     /// mid-conversation from a stateless provider that recorded tool_calls).
     /// Mirrors `OutputItem::FunctionCall` so clients can copy items verbatim.
@@ -624,7 +635,11 @@ fn chat_message_to_input_items(msg: ChatMessage) -> Vec<InputItem> {
         "tool" => {
             let call_id = msg.tool_call_id.unwrap_or_default();
             let output = content_as_text(msg.content.as_ref()).unwrap_or_default();
-            vec![InputItem::FunctionCallOutput { call_id, output }]
+            vec![InputItem::FunctionCallOutput {
+                call_id,
+                output,
+                cache_control: None,
+            }]
         }
         "assistant" => {
             let mut items: Vec<InputItem> = Vec::new();
@@ -908,7 +923,7 @@ mod tests {
         if let Input::Items(items) = &req.input {
             assert_eq!(items.len(), 1);
             assert!(
-                matches!(&items[0], InputItem::FunctionCallOutput { call_id, output } if call_id == "call_abc123" && output == "72°F sunny")
+                matches!(&items[0], InputItem::FunctionCallOutput { call_id, output, .. } if call_id == "call_abc123" && output == "72°F sunny")
             );
         } else {
             panic!("Expected Items input");

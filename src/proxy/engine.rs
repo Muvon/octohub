@@ -776,8 +776,20 @@ fn push_items(items: &[InputItem], messages: &mut Vec<Message>) {
             InputItem::Message { role, content } => {
                 messages.push(content_to_message(role, content));
             }
-            InputItem::FunctionCallOutput { call_id, output } => {
-                messages.push(Message::tool(output, call_id, "function"));
+            InputItem::FunctionCallOutput {
+                call_id,
+                output,
+                cache_control,
+            } => {
+                let mut msg = Message::tool(output, call_id, "function");
+                // Forward the client's cache marker so the upstream provider caches
+                // the prefix ending at this tool result — the common agent-loop tail
+                // breakpoint. Mirrors `content_to_message` for Message items.
+                if let Some(cc) = cache_control {
+                    msg.cached = true;
+                    msg.cache_ttl = cc.get("ttl").and_then(|v| v.as_str()).map(String::from);
+                }
+                messages.push(msg);
             }
             InputItem::FunctionCall {
                 call_id,
@@ -936,6 +948,44 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].role, "assistant");
         assert!(messages[1].tool_calls.is_some());
+    }
+
+    #[test]
+    fn function_call_output_forwards_cache_control() {
+        // A tool result carrying a cache marker must propagate to the upstream
+        // Message (cached + ttl) — it's the agent-loop tail breakpoint. Regression
+        // for the proxy silently dropping markers on tool results.
+        let cached = item(
+            r#"{"type":"function_call_output","call_id":"c1","output":"ok","cache_control":{"type":"ephemeral","ttl":"1h"}}"#,
+        );
+        let plain = item(r#"{"type":"function_call_output","call_id":"c2","output":"ok"}"#);
+        let mut messages = Vec::new();
+        push_items(&[cached, plain], &mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].cached, "marked tool result must stay cached");
+        assert_eq!(messages[0].cache_ttl.as_deref(), Some("1h"));
+        assert!(
+            !messages[1].cached,
+            "unmarked tool result must not be cached"
+        );
+    }
+
+    #[test]
+    fn stored_items_strip_tool_cache_control() {
+        // Replayed-from-chain history must NOT carry markers (anti-accumulation vs
+        // Anthropic's 4-breakpoint limit); only live input anchors the breakpoint.
+        let stored = vec![serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "ok",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        })];
+        let mut messages = Vec::new();
+        push_stored_items(&stored, &mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert!(!messages[0].cached, "replayed history markers are stripped");
     }
 
     #[test]

@@ -274,12 +274,38 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
         return (StatusCode::BAD_REQUEST, top);
     }
 
-    // Server-side failure (most commonly an upstream provider error). Surface
-    // the full anyhow chain via `{:#}` so callers see "Provider 'anthropic'
-    // chat_completion failed: Anthropic API error 401: { ... }" instead of
-    // just the outer wrap. Without this the client gets a useless top
-    // message and has to read server logs to diagnose anything.
+    // Upstream provider client-errors (4xx) are PERMANENT for this request — most
+    // importantly a 400 "prompt is too long" (context overflow). octolib formats
+    // them as "... API error <code> ...". Returning 500 here makes octolib's retry
+    // classifier (`is_retryable_status`: 429 || >=500) re-send the IDENTICAL request
+    // in a backoff loop forever. Map an upstream 4xx to the same status so the caller
+    // fails fast; a 429 stays legitimately retryable, and 5xx still flows to 500 below.
+    if let Some(code) = upstream_status_code(&full) {
+        if (400..500).contains(&code) {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+            return (status, full);
+        }
+    }
+
+    // Server-side failure (most commonly an upstream provider 5xx). Surface the
+    // full anyhow chain via `{:#}` so callers see "Provider 'anthropic'
+    // chat_completion failed: Anthropic API error 503: { ... }" instead of just
+    // the outer wrap. Without this the client gets a useless top message and has
+    // to read server logs to diagnose anything.
     (StatusCode::INTERNAL_SERVER_ERROR, full)
+}
+
+/// Extract the upstream HTTP status embedded in an octolib provider error.
+/// octolib formats provider failures as "... API error <code> <message>", e.g.
+/// "ollama API error 400 Bad Request: ...". Returns the first such code, if any.
+fn upstream_status_code(msg: &str) -> Option<u16> {
+    const MARKER: &str = "API error ";
+    let start = msg.find(MARKER)? + MARKER.len();
+    let digits: String = msg[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// Handle POST /v1/chat/completions (classic OpenAI-compatible)
@@ -419,5 +445,43 @@ mod tests {
             message,
             "provider 'anthropic' exceeded the 360s operation deadline"
         );
+    }
+
+    #[test]
+    fn upstream_400_maps_to_client_400_not_retryable_500() {
+        // ollama's 400 "prompt too long" must NOT become a retryable 500, or
+        // octolib re-sends the identical oversized request in a loop.
+        let error = Err::<(), _>(anyhow::anyhow!(
+            "ollama API error 400 Bad Request: {{\"error\":\"The prompt is too long: 380813\"}}"
+        ))
+        .context("Provider 'ollama' chat_completion failed")
+        .unwrap_err();
+        let (status, _) = classify_engine_error(&error);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn upstream_429_stays_retryable() {
+        let error = Err::<(), _>(anyhow::anyhow!("anthropic API error 429 Too Many Requests"))
+            .context("Provider 'anthropic' chat_completion failed")
+            .unwrap_err();
+        let (status, _) = classify_engine_error(&error);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn upstream_503_stays_500_retryable() {
+        let error = Err::<(), _>(anyhow::anyhow!("openai API error 503 Service Unavailable"))
+            .context("Provider 'openai' chat_completion failed")
+            .unwrap_err();
+        let (status, _) = classify_engine_error(&error);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn non_provider_error_stays_500() {
+        let error = anyhow::anyhow!("database connection lost");
+        let (status, _) = classify_engine_error(&error);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
