@@ -35,6 +35,9 @@ jobs:
         - target: aarch64-pc-windows-msvc
           os: windows-11-arm
           archive: zip
+        - target: x86_64-apple-darwin
+          os: macos-15-intel
+          archive: tar.gz
         - target: aarch64-apple-darwin
           os: macos-15
           archive: tar.gz
@@ -48,14 +51,10 @@ jobs:
       with:
         targets: ${{ matrix.target }}
 
-    - name: Install protobuf compiler (macOS)
-      if: startsWith(matrix.os, 'macos')
-      run: brew install protobuf
-
-    - name: Install protobuf compiler (Windows)
-      if: startsWith(matrix.os, 'windows')
-      run: |
-        choco install protoc
+    - name: Setup protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Cache dependencies
       uses: actions/cache@v4
@@ -127,3 +126,16 @@ jobs:
       tag: ${{ inputs.tag }}
       artifacts: 'release-*'
       draft: false
+
+  notify-homebrew:
+    name: Notify Homebrew Tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch update to homebrew-tap
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.TAP_GITHUB_TOKEN }}" \
+            https://api.github.com/repos/muvon/homebrew-tap/dispatches \
+            -d "{\"event_type\":\"octohub-release\",\"client_payload\":{\"version\":\"${{ needs.release.outputs.version }}\"}}"
