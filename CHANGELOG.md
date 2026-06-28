@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.1] - 2026-06-28
+
+### 📋 Release Summary
+
+This release expands platform support by adding a target for Intel-based Macs and introducing Homebrew notifications (5d13294b). General system stability and performance have been improved through updated dependencies (43e15126).
+
+
+### 🔧 Improvements & Optimizations
+
+- **release**: add intel mac target and brew notification `5d13294b`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 All notable changes to this project will be documented in this file.
 
 ## [0.1.0] - 2026-06-28
