@@ -76,8 +76,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = metrics::init(&config.metrics)? {
         let bind = config.metrics.bind.clone();
         let limiter_clone = limiter.clone();
-        tokio::spawn(metrics::serve(handle, bind));
-        tokio::spawn(metrics::provider_gauge_loop(limiter_clone));
+        tokio::spawn(metrics::serve(handle.clone(), bind));
+        tokio::spawn(metrics::provider_gauge_loop(limiter_clone, handle));
     }
 
     // Initialize proxy engine
@@ -115,7 +115,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     loop {
-        let (stream, remote_addr) = listener.accept().await?;
+        // A failed accept (EMFILE, ECONNABORTED, ...) must not kill the server —
+        // log, back off briefly, and keep accepting.
+        let (stream, remote_addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let io = TokioIo::new(stream);
         let engine = engine.clone();
         let storage = storage.clone();

@@ -161,10 +161,17 @@ pub async fn serve(handle: metrics_exporter_prometheus::PrometheusHandle, bind: 
     }
 }
 
-pub async fn provider_gauge_loop(limiter: Arc<ProviderLimiter>) {
+pub async fn provider_gauge_loop(
+    limiter: Arc<ProviderLimiter>,
+    handle: metrics_exporter_prometheus::PrometheusHandle,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
+        // Drain accumulated histogram samples into bucketed distributions.
+        // Without this, samples only drain on /metrics scrape — an unscraped
+        // exporter grows memory unboundedly with every recorded request.
+        handle.run_upkeep();
         for (name, available, max) in limiter.snapshot() {
             gauge!("octohub_provider_permits_available", "provider" => name.clone())
                 .set(available as f64);
