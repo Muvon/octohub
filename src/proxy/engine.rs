@@ -63,18 +63,22 @@ pub struct EmbeddingOutcome {
     pub input_tokens: u64,
 }
 
-/// Core proxy engine that processes requests through octolib providers
+/// Core proxy engine that processes requests through octolib providers.
+///
+/// `config` and `limiter` are live handles swapped on SIGHUP reload (see
+/// `main`), so each request reads a fresh snapshot instead of a value frozen
+/// at startup.
 pub struct ProxyEngine {
     storage: Arc<dyn Storage>,
-    config: Arc<Config>,
-    limiter: Arc<ProviderLimiter>,
+    config: crate::Live<Config>,
+    limiter: crate::Live<ProviderLimiter>,
 }
 
 impl ProxyEngine {
     pub fn new(
         storage: Arc<dyn Storage>,
-        config: Arc<Config>,
-        limiter: Arc<ProviderLimiter>,
+        config: crate::Live<Config>,
+        limiter: crate::Live<ProviderLimiter>,
     ) -> Self {
         Self {
             storage,
@@ -83,8 +87,15 @@ impl ProxyEngine {
         }
     }
 
-    pub fn config(&self) -> &Arc<Config> {
-        &self.config
+    /// Current config snapshot. The reload writer only swaps an `Arc` and never
+    /// panics while holding the lock, so it can't be poisoned — unwrap is safe.
+    pub fn config(&self) -> Arc<Config> {
+        self.config.read().unwrap().clone()
+    }
+
+    /// Current limiter snapshot. Same poison-free reasoning as `config`.
+    fn limiter(&self) -> Arc<ProviderLimiter> {
+        self.limiter.read().unwrap().clone()
     }
 
     /// Process a create completion request, attributing usage to the given API key.
@@ -97,6 +108,12 @@ impl ProxyEngine {
         api_key: &ApiKey,
     ) -> Result<(CreateCompletionResponse, std::time::Duration)> {
         ensure_model_allowed(api_key, &req.model)?;
+
+        // Snapshot config + limiter once so this request keeps a consistent view
+        // even if SIGHUP swaps them mid-flight.
+        let config = self.config();
+        let limiter = self.limiter();
+
         // 1. Build conversation history from chain
         let mut messages: Vec<Message> = Vec::new();
 
@@ -175,8 +192,7 @@ impl ProxyEngine {
         }
 
         // 4. Resolve provider and model via config
-        let (provider_name, resolved_model) = self
-            .config
+        let (provider_name, resolved_model) = config
             .resolve_model(&req.model)
             .with_context(|| format!("Failed to resolve model '{}'", req.model))?;
 
@@ -262,8 +278,8 @@ impl ProxyEngine {
         //    `.await` resolves wakes the next queued request.
         let queue_start = std::time::Instant::now();
         let queue_timeout =
-            std::time::Duration::from_secs(self.config.server.provider_queue_timeout_secs);
-        let _permit = tokio::time::timeout(queue_timeout, self.limiter.acquire(&provider_name))
+            std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
+        let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
             .await
             .map_err(|_| {
                 anyhow!(ProxyTimeoutError::ProviderQueue {
@@ -282,7 +298,7 @@ impl ProxyEngine {
 
         let upstream_start = std::time::Instant::now();
         let upstream_timeout =
-            std::time::Duration::from_secs(self.config.server.upstream_timeout_secs);
+            std::time::Duration::from_secs(config.server.upstream_timeout_secs);
         let provider_response =
             tokio::time::timeout(upstream_timeout, provider.chat_completion(params))
                 .await
@@ -436,11 +452,14 @@ impl ProxyEngine {
     ) -> Result<EmbeddingOutcome> {
         ensure_model_allowed(api_key, &req.model)?;
 
+        // Snapshot config + limiter once (see `process`).
+        let config = self.config();
+        let limiter = self.limiter();
+
         let start = std::time::Instant::now();
 
         // 1. Resolve provider and model
-        let (provider_name, resolved_model) = self
-            .config
+        let (provider_name, resolved_model) = config
             .resolve_embedding_model(&req.model)
             .with_context(|| format!("Failed to resolve embedding model '{}'", req.model))?;
 
@@ -462,8 +481,8 @@ impl ProxyEngine {
 
         let queue_start = std::time::Instant::now();
         let queue_timeout =
-            std::time::Duration::from_secs(self.config.server.provider_queue_timeout_secs);
-        let _permit = tokio::time::timeout(queue_timeout, self.limiter.acquire(&provider_name))
+            std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
+        let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
             .await
             .map_err(|_| {
                 anyhow!(ProxyTimeoutError::ProviderQueue {
@@ -482,7 +501,7 @@ impl ProxyEngine {
 
         let upstream_start = std::time::Instant::now();
         let upstream_timeout =
-            std::time::Duration::from_secs(self.config.server.upstream_timeout_secs);
+            std::time::Duration::from_secs(config.server.upstream_timeout_secs);
         let embeddings = tokio::time::timeout(
             upstream_timeout,
             provider.generate_embeddings_batch(texts.clone(), InputType::None),

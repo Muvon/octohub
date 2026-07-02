@@ -8,7 +8,7 @@ mod proxy;
 mod storage;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use anyhow::Context;
@@ -30,6 +30,11 @@ use storage::Storage;
 
 type BoxBody = Full<Bytes>;
 
+/// A config value (or something derived from it) that SIGHUP reload can swap
+/// atomically. Reads clone the inner `Arc` under a brief read lock; reload takes
+/// the write lock to replace it.
+pub type Live<T> = Arc<RwLock<Arc<T>>>;
+
 #[derive(Parser, Debug)]
 #[command(name = "octohub")]
 #[command(about = "High-performance LLM proxy server", long_about = None)]
@@ -42,16 +47,11 @@ struct Args {
     bind: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let mut config = Config::load(args.config)?;
-
-    // Initialize logging (must happen after config load so we have LogFormat)
-    logging::init(&config.logging)?;
-
-    // Override bind address if specified
-    if let Some(bind) = args.bind {
+/// Load config from `path` and apply the CLI `--bind` override. Shared by
+/// startup and every SIGHUP reload so both build the config identically.
+fn load_config(path: Option<String>, bind: Option<&str>) -> anyhow::Result<Config> {
+    let mut config = Config::load(path)?;
+    if let Some(bind) = bind {
         let parts: Vec<&str> = bind.splitn(2, ':').collect();
         if parts.len() != 2 {
             anyhow::bail!("Invalid bind format '{}': expected HOST:PORT", bind);
@@ -59,59 +59,106 @@ async fn main() -> anyhow::Result<()> {
         config.server.host = parts[0].to_string();
         config.server.port = parts[1].parse().context("Invalid port in bind argument")?;
     }
+    Ok(config)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let config = load_config(args.config.clone(), args.bind.as_deref())?;
+
+    // Initialize logging (must happen after config load so we have LogFormat)
+    logging::init(&config.logging)?;
 
     if config.server.api_key.is_empty() {
         tracing::warn!("Master API key is empty (server.api_key). Admin endpoints disabled.");
     }
 
-    let config = Arc::new(config);
+    // Immutable startup snapshot for the parts that can't be hot-reloaded
+    // (bind address, DB, logging/metrics init).
+    let cfg = Arc::new(config);
 
     // Initialize storage from DSN
-    let storage: Arc<dyn Storage> = storage::from_url(&config.server.db_url)?;
+    let storage: Arc<dyn Storage> = storage::from_url(&cfg.server.db_url)?;
 
-    // Per-provider concurrency gate. Unconfigured providers run unthrottled.
-    let limiter = Arc::new(ProviderLimiter::from_config(&config));
+    // Live handles swapped on SIGHUP; requests read a fresh snapshot each time.
+    let config_live: Live<Config> = Arc::new(RwLock::new(cfg.clone()));
+    let limiter_live: Live<ProviderLimiter> =
+        Arc::new(RwLock::new(Arc::new(ProviderLimiter::from_config(&cfg))));
 
     // Initialize metrics
-    if let Some(handle) = metrics::init(&config.metrics)? {
-        let bind = config.metrics.bind.clone();
-        let limiter_clone = limiter.clone();
+    if let Some(handle) = metrics::init(&cfg.metrics)? {
+        let bind = cfg.metrics.bind.clone();
         tokio::spawn(metrics::serve(handle.clone(), bind));
-        tokio::spawn(metrics::provider_gauge_loop(limiter_clone, handle));
+        tokio::spawn(metrics::provider_gauge_loop(limiter_live.clone(), handle));
+    }
+
+    // Reload config + limiter on SIGHUP without dropping the listener. Bind
+    // address, DB, logging and metrics stay fixed at their startup values.
+    #[cfg(unix)]
+    {
+        let config_live = config_live.clone();
+        let limiter_live = limiter_live.clone();
+        let config_path = args.config.clone();
+        let bind = args.bind.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut hup = match signal(SignalKind::hangup()) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to install SIGHUP handler; reload disabled");
+                    return;
+                }
+            };
+            while hup.recv().await.is_some() {
+                match load_config(config_path.clone(), bind.as_deref()) {
+                    Ok(new) => {
+                        let new = Arc::new(new);
+                        *limiter_live.write().unwrap() =
+                            Arc::new(ProviderLimiter::from_config(&new));
+                        *config_live.write().unwrap() = new;
+                        tracing::info!("SIGHUP: reloaded models, providers and server timeouts");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "SIGHUP: reload failed, keeping current config");
+                    }
+                }
+            }
+        });
     }
 
     // Initialize proxy engine
-    let engine = Arc::new(ProxyEngine::new(storage.clone(), config.clone(), limiter));
+    let engine = Arc::new(ProxyEngine::new(storage.clone(), config_live, limiter_live));
 
-    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
+    let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
 
     // Structured startup banner
-    let db_kind = if config.server.db_url.starts_with("mysql://") {
+    let db_kind = if cfg.server.db_url.starts_with("mysql://") {
         "mysql"
-    } else if config.server.db_url.starts_with("postgres://")
-        || config.server.db_url.starts_with("postgresql://")
+    } else if cfg.server.db_url.starts_with("postgres://")
+        || cfg.server.db_url.starts_with("postgresql://")
     {
         "postgres"
     } else {
         "sqlite"
     };
-    let provider_summary = build_provider_summary(&config);
+    let provider_summary = build_provider_summary(&cfg);
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         bind = %addr,
         db = db_kind,
-        admin_auth = !config.server.api_key.is_empty(),
+        admin_auth = !cfg.server.api_key.is_empty(),
         providers = %provider_summary,
-        models = config.models.len(),
-        embed_models = config.embedding_models.len(),
-        metrics = config.metrics.enabled,
-        provider_queue_timeout_secs = config.server.provider_queue_timeout_secs,
-        upstream_timeout_secs = config.server.upstream_timeout_secs,
+        models = cfg.models.len(),
+        embed_models = cfg.embedding_models.len(),
+        metrics = cfg.metrics.enabled,
+        provider_queue_timeout_secs = cfg.server.provider_queue_timeout_secs,
+        upstream_timeout_secs = cfg.server.upstream_timeout_secs,
         "octohub starting"
     );
-    if config.metrics.enabled {
-        tracing::info!(bind = %config.metrics.bind, "metrics endpoint listening");
+    if cfg.metrics.enabled {
+        tracing::info!(bind = %cfg.metrics.bind, "metrics endpoint listening");
     }
 
     loop {
@@ -128,15 +175,13 @@ async fn main() -> anyhow::Result<()> {
         let io = TokioIo::new(stream);
         let engine = engine.clone();
         let storage = storage.clone();
-        let config = config.clone();
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let engine = engine.clone();
                 let storage = storage.clone();
-                let config = config.clone();
                 async move {
-                    Ok::<_, hyper::Error>(route(req, engine, storage, &config, remote_addr).await)
+                    Ok::<_, hyper::Error>(route(req, engine, storage, remote_addr).await)
                 }
             });
 
@@ -222,9 +267,10 @@ async fn route(
     req: Request<hyper::body::Incoming>,
     engine: Arc<ProxyEngine>,
     storage: Arc<dyn Storage>,
-    config: &Arc<Config>,
     remote_addr: SocketAddr,
 ) -> Response<BoxBody> {
+    // Snapshot the live config for this request (picks up SIGHUP reloads).
+    let config = engine.config();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let route_label = classify_route(&path);
