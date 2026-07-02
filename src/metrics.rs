@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -162,7 +161,7 @@ pub async fn serve(handle: metrics_exporter_prometheus::PrometheusHandle, bind: 
 }
 
 pub async fn provider_gauge_loop(
-    limiter: Arc<ProviderLimiter>,
+    limiter: crate::Live<ProviderLimiter>,
     handle: metrics_exporter_prometheus::PrometheusHandle,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -172,7 +171,9 @@ pub async fn provider_gauge_loop(
         // Without this, samples only drain on /metrics scrape — an unscraped
         // exporter grows memory unboundedly with every recorded request.
         handle.run_upkeep();
-        for (name, available, max) in limiter.snapshot() {
+        // Read the current limiter each tick so gauges track post-reload state.
+        let snapshot = limiter.read().unwrap().snapshot();
+        for (name, available, max) in snapshot {
             gauge!("octohub_provider_permits_available", "provider" => name.clone())
                 .set(available as f64);
             gauge!("octohub_provider_in_flight", "provider" => name).set((max - available) as f64);
