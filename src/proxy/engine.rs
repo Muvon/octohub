@@ -4,9 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use octolib::embedding::{create_embedding_provider_from_parts, InputType};
 use octolib::llm::{
-    ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData, Message, OutputFormat,
-    ProviderFactory, ReasoningEffort, ResponseMode, SourceType, StructuredOutputRequest,
-    ThinkingBlock, VideoAttachment, VideoData,
+    chat_completion_enforced, ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData,
+    Message, OutputFormat, ProviderFactory, ReasoningEffort, ResponseMode, SourceType,
+    StructuredOutputRequest, ThinkingBlock, VideoAttachment, VideoData,
 };
 use uuid::Uuid;
 
@@ -297,20 +297,23 @@ impl ProxyEngine {
         crate::metrics::record_queue_wait(&provider_name, queue_wait);
 
         let upstream_start = std::time::Instant::now();
-        let upstream_timeout =
-            std::time::Duration::from_secs(config.server.upstream_timeout_secs);
-        let provider_response =
-            tokio::time::timeout(upstream_timeout, provider.chat_completion(params))
-                .await
-                .map_err(|_| {
-                    anyhow!(ProxyTimeoutError::Upstream {
-                        provider: provider.name().to_string(),
-                        timeout: upstream_timeout,
-                    })
-                })?
-                .with_context(|| {
-                    format!("Provider '{}' chat_completion failed", provider.name())
-                })?;
+        let upstream_timeout = std::time::Duration::from_secs(config.server.upstream_timeout_secs);
+        // Route through the schema-enforcement fallback: a transparent
+        // passthrough unless the client requested a JSON schema that the
+        // resolved provider can't natively guarantee (see
+        // `octolib::llm::chat_completion_enforced`).
+        let provider_response = tokio::time::timeout(
+            upstream_timeout,
+            chat_completion_enforced(provider.as_ref(), params),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(ProxyTimeoutError::Upstream {
+                provider: provider.name().to_string(),
+                timeout: upstream_timeout,
+            })
+        })?
+        .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
         let upstream_duration = upstream_start.elapsed();
         tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
         drop(_permit);
@@ -500,8 +503,7 @@ impl ProxyEngine {
         crate::metrics::record_queue_wait(&provider_name, queue_wait);
 
         let upstream_start = std::time::Instant::now();
-        let upstream_timeout =
-            std::time::Duration::from_secs(config.server.upstream_timeout_secs);
+        let upstream_timeout = std::time::Duration::from_secs(config.server.upstream_timeout_secs);
         let embeddings = tokio::time::timeout(
             upstream_timeout,
             provider.generate_embeddings_batch(texts.clone(), InputType::None),

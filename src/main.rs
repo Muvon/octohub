@@ -180,9 +180,7 @@ async fn main() -> anyhow::Result<()> {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let engine = engine.clone();
                 let storage = storage.clone();
-                async move {
-                    Ok::<_, hyper::Error>(route(req, engine, storage, remote_addr).await)
-                }
+                async move { Ok::<_, hyper::Error>(route(req, engine, storage, remote_addr).await) }
             });
 
             // auto::Builder negotiates HTTP/1 or HTTP/2 from what the client speaks
