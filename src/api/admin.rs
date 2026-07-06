@@ -204,6 +204,60 @@ pub async fn handle_revoke_key(
     }
 }
 
+/// POST /v1/admin/keys/:id/models - Replace a key's allowed-models list in
+/// place. The key value is untouched, so deployed credentials keep working —
+/// this is the plan-change path (upgrade grants models, downgrade removes).
+pub async fn handle_update_key_models(
+    req: Request<hyper::body::Incoming>,
+    storage: Arc<dyn Storage>,
+    master_key: &str,
+    key_id: i64,
+) -> Response<BoxBody> {
+    if let Err(resp) = check_admin(&req, master_key) {
+        return *resp;
+    }
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read request body: {}", e),
+            );
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct UpdateModelsRequest {
+        /// Same semantics as key creation: absent/`null` → unrestricted,
+        /// a list → exact-match allow-list.
+        #[serde(default)]
+        allowed_models: Option<Vec<String>>,
+    }
+
+    let update_req: UpdateModelsRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid request JSON: {}", e),
+            );
+        }
+    };
+
+    match storage.update_api_key_models(key_id, update_req.allowed_models.as_deref()) {
+        Ok(true) => json_response(StatusCode::OK, serde_json::json!({"status": "updated"})),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "API key not found"),
+        Err(e) => {
+            tracing::error!(error = %e, "update key models failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to update API key models",
+            )
+        }
+    }
+}
+
 /// GET /v1/admin/usage?key_id=1,3&bucket=hour&since=...&until=...
 pub async fn handle_usage(
     req: Request<hyper::body::Incoming>,

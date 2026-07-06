@@ -119,6 +119,10 @@ pub trait Storage: Send + Sync {
     fn list_api_keys(&self) -> Result<Vec<ApiKey>>;
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>>;
     fn revoke_api_key(&self, id: i64) -> Result<bool>;
+    /// Replace an active key's allowed-models list in place (`None` =
+    /// unrestricted). The key value stays the same — this is how a plan
+    /// change grants/removes models without breaking deployed credentials.
+    fn update_api_key_models(&self, id: i64, allowed_models: Option<&[String]>) -> Result<bool>;
     /// Look up an active API key by its raw key value (for auth)
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>>;
 
