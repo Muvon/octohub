@@ -251,6 +251,17 @@ impl Storage for PostgresStorage {
         Ok(affected > 0)
     }
 
+    fn update_api_key_models(&self, id: i64, allowed_models: Option<&[String]>) -> Result<bool> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        // Text-encoded + ::jsonb cast, same shape as create_api_key.
+        let allowed_models_json = encode_allowed_models(allowed_models);
+        let affected = client.execute(
+            "UPDATE api_keys SET allowed_models = $1::jsonb WHERE id = $2 AND status = 'active'",
+            &[&allowed_models_json, &id],
+        )?;
+        Ok(affected > 0)
+    }
+
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let rows = client.query(

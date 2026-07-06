@@ -252,6 +252,15 @@ impl Storage for SqliteStorage {
         Ok(affected > 0)
     }
 
+    fn update_api_key_models(&self, id: i64, allowed_models: Option<&[String]>) -> Result<bool> {
+        let conn = lock_conn(&self.conn)?;
+        let affected = conn.execute(
+            "UPDATE api_keys SET allowed_models = ?1 WHERE id = ?2 AND status = 'active'",
+            rusqlite::params![encode_allowed_models(allowed_models), id],
+        )?;
+        Ok(affected > 0)
+    }
+
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let conn = lock_conn(&self.conn)?;
         conn.query_row(

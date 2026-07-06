@@ -257,6 +257,15 @@ impl Storage for MysqlStorage {
         Ok(conn.affected_rows() > 0)
     }
 
+    fn update_api_key_models(&self, id: i64, allowed_models: Option<&[String]>) -> Result<bool> {
+        let mut conn = self.pool.get_conn()?;
+        conn.exec_drop(
+            "UPDATE api_keys SET allowed_models = ? WHERE id = ? AND status = 'active'",
+            (encode_allowed_models(allowed_models), id),
+        )?;
+        Ok(conn.affected_rows() > 0)
+    }
+
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let mut conn = self.pool.get_conn()?;
         let row: Option<mysql::Row> = conn.exec_first(

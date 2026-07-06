@@ -377,6 +377,13 @@ async fn route_admin(
             };
             api::admin::handle_revoke_key(req, storage, master_key, key_id).await
         }
+        // POST /v1/admin/keys/:id/models — replace the allowed-models list
+        (Method::POST, ["keys", id, "models"]) => {
+            let Ok(key_id) = id.parse::<i64>() else {
+                return error_response(hyper::StatusCode::BAD_REQUEST, "Invalid key ID");
+            };
+            api::admin::handle_update_key_models(req, storage, master_key, key_id).await
+        }
         // GET /v1/admin/usage
         (Method::GET, ["usage"]) => api::admin::handle_usage(req, storage, master_key).await,
         // GET /v1/admin/completions
