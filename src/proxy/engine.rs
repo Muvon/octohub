@@ -504,7 +504,7 @@ impl ProxyEngine {
 
         let upstream_start = std::time::Instant::now();
         let upstream_timeout = std::time::Duration::from_secs(config.server.upstream_timeout_secs);
-        let embeddings = tokio::time::timeout(
+        let (embeddings, usage_calc) = tokio::time::timeout(
             upstream_timeout,
             provider.generate_embeddings_batch(texts.clone(), InputType::None),
         )
@@ -535,11 +535,15 @@ impl ProxyEngine {
             EmbeddingInput::Batch(_) => CreateEmbeddingResponse::Batch(embeddings),
         };
 
-        // Approximate token count from input text length (rough: 1 token ≈ 4 chars)
-        let approx_tokens = texts.iter().map(|t| t.len() as u64).sum::<u64>() / 4;
+        // Usage comes straight from octolib's embedding provider: the real
+        // provider-reported token count (or a tiktoken estimate for providers that
+        // report none) plus the reference cost (`None` for local/unpriced models).
+        // Cost rides in the `usage` JSON, exactly as completions carry it
+        // (`usage.cost`), so the billing layer reads it the same way for both.
         let usage = serde_json::json!({
-            "input_tokens": approx_tokens,
-            "total_tokens": approx_tokens,
+            "input_tokens": usage_calc.input_tokens,
+            "total_tokens": usage_calc.input_tokens,
+            "cost": usage_calc.cost,
             "request_time_ms": elapsed_ms,
         });
 
@@ -569,7 +573,7 @@ impl ProxyEngine {
             response,
             provider: provider_name,
             upstream_duration,
-            input_tokens: approx_tokens,
+            input_tokens: usage_calc.input_tokens,
         })
     }
 
