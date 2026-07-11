@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0] - 2026-07-11
+
+### 📋 Release Summary
+
+This release introduces administrative controls for API key model permissions, enforced chat completions, and the ability to reload configurations without restarting the server (3d1846d5, 676098a7, 3723b06d). System stability and accuracy have been improved through updated dependencies and fixes for embedding token counts and server connection handling (8b7cb32d, ed19d639, 25609b28, 19be2aa2).
+
+
+### ✨ New Features & Enhancements
+
+- **admin**: add endpoint to update API key allowed models `3d1846d5`
+- **proxy**: implement enforced chat completions `676098a7`
+- **core**: implement SIGHUP configuration reloading `3723b06d`
+
+### 🐛 Bug Fixes & Stability
+
+- **proxy**: use actual token counts for embeddings `8b7cb32d`
+- **server**: prevent crash on accept errors and leak `ed19d639`
+
+### 🔄 Other Changes
+
+2 maintenance, dependency, and tooling updates not listed individually.
+
 ## [0.1.1] - 2026-06-28
 
 ### 📋 Release Summary
