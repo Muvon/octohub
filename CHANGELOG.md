@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.0] - 2026-07-12
+
+### 📋 Release Summary
+
+This release introduces improved concurrency and scoping for shared owners to enhance request management (dc4ba3e7). Additionally, internal dependencies have been updated to ensure optimal performance and stability (69b692be).
+
+
+### ✨ New Features & Enhancements
+
+- **proxy**: implement shared owner concurrency and scoping `dc4ba3e7`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.2.0] - 2026-07-11
 
 ### 📋 Release Summary
