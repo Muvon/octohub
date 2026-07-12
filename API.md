@@ -557,7 +557,9 @@ Create a new client API key.
 ```json
 {
   "name": "string",
-  "allowed_models": ["string"]
+  "allowed_models": ["string"],
+  "owner": "string",
+  "owner_concurrency": 10
 }
 ```
 
@@ -565,6 +567,8 @@ Create a new client API key.
 |---|---|---|---|
 | `name` | string | ✅ | Human-readable label for this key (e.g. `"mobile-app"`, `"ci-pipeline"`). |
 | `allowed_models` | string[] | — | Whitelist of `model` values this key may request. Match is exact against the `model` field as sent — either an alias from `[models]`/`[embedding_models]` or a raw `provider:model` string. Omit the field for an unrestricted key. Requests to a non-allowed model return `403 Forbidden`. |
+| `owner` | string | — | Opaque grouping label (e.g. the tenant/account id in YOUR system). All keys sharing an owner share one in-flight request budget — see `owner_concurrency`. Omit for an ungrouped key. |
+| `owner_concurrency` | int | — | Max in-flight requests (completions + embeddings together) shared by ALL keys with this `owner`. A saturated budget queues a request up to 30s, then returns `429 Too Many Requests`. Omit or `0` = unlimited. |
 
 #### Response `201 Created`
 
@@ -576,6 +580,8 @@ Create a new client API key.
   "key_hint": "...xyz",
   "status": "active",
   "allowed_models": ["gpt", "openai:gpt-4o"],
+  "owner": "acct-42",
+  "owner_concurrency": 10,
   "created_at": 1700000000
 }
 ```
@@ -590,6 +596,8 @@ Create a new client API key.
 | `key_hint` | Last 4 characters prefixed with `...` for identification. |
 | `status` | `"active"` or `"revoked"`. |
 | `allowed_models` | The model whitelist as configured. `null` means unrestricted. |
+| `owner` | Grouping label for the shared concurrency budget. `null` means ungrouped. |
+| `owner_concurrency` | Shared in-flight budget for all keys of this owner. `null`/`0` means unlimited. |
 | `created_at` | Unix timestamp. |
 
 #### Examples
@@ -694,6 +702,36 @@ Returns `404` if the key does not exist.
 curl -X POST http://127.0.0.1:8080/v1/admin/keys/1/revoke \
   -H "Authorization: Bearer <master-key>"
 ```
+
+---
+
+### POST /v1/admin/keys/:id/models
+
+Replace an active key's `allowed_models` list **in place** — the key value stays valid, so deployed credentials keep working while their model access changes. Absent/`null` = unrestricted.
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/admin/keys/1/models \
+  -H "Authorization: Bearer <master-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"allowed_models": ["gpt", "voyage-4"]}'
+```
+
+Returns `200 {"status": "updated"}`, or `404` if the key does not exist or is not active.
+
+---
+
+### POST /v1/admin/keys/:id/owner
+
+Replace an active key's `owner` grouping and shared `owner_concurrency` budget **in place** (same contract as `/models`). Set this identically on every key of a tenant so all of them drain one budget — minting more keys never widens concurrency.
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/admin/keys/1/owner \
+  -H "Authorization: Bearer <master-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"owner": "acct-42", "owner_concurrency": 10}'
+```
+
+Returns `200 {"status": "updated"}`, or `404` if the key does not exist or is not active. Absent/`null` owner ungroups the key; absent/`null`/`0` concurrency means unlimited. A capacity change applies to new requests immediately (requests already in flight drain on the old budget).
 
 ---
 
@@ -946,4 +984,5 @@ All errors follow this format:
 | `401` | Missing or invalid API key |
 | `403` | The API key is not permitted to use the requested model (see `allowed_models`) |
 | `404` | Unknown endpoint |
+| `429` | The key's shared `owner` concurrency budget stayed saturated for the 30s queue window — reduce parallelism and retry |
 | `500` | Internal error (provider failure, storage error) |

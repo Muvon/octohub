@@ -32,6 +32,8 @@ impl MysqlStorage {
                 key_hint VARCHAR(32) NOT NULL,
                 status VARCHAR(16) NOT NULL DEFAULT 'active',
                 allowed_models JSON,
+                owner VARCHAR(64) NULL,
+                owner_concurrency INT UNSIGNED NULL,
                 created_at BIGINT UNSIGNED NOT NULL,
                 INDEX idx_api_keys_key (`key`),
                 INDEX idx_api_keys_status (status)
@@ -44,6 +46,18 @@ impl MysqlStorage {
             "api_keys",
             "allowed_models",
             "JSON NULL AFTER status",
+        )?;
+        ensure_column(
+            &mut conn,
+            "api_keys",
+            "owner",
+            "VARCHAR(64) NULL AFTER allowed_models",
+        )?;
+        ensure_column(
+            &mut conn,
+            "api_keys",
+            "owner_concurrency",
+            "INT UNSIGNED NULL AFTER owner",
         )?;
         conn.query_drop(
             "CREATE TABLE IF NOT EXISTS completions (
@@ -153,6 +167,8 @@ fn read_api_key_masked(row: mysql::Row) -> ApiKey {
         key_hint: row.get("key_hint").unwrap_or_default(),
         status: row.get("status").unwrap_or_default(),
         allowed_models: decode_allowed_models(row.get("allowed_models")),
+        owner: row.get("owner").unwrap_or_default(),
+        owner_concurrency: row.get("owner_concurrency").unwrap_or_default(),
         created_at: row.get("created_at").unwrap_or_default(),
     }
 }
@@ -203,7 +219,13 @@ fn effective_limit(limit: u32) -> u32 {
 }
 
 impl Storage for MysqlStorage {
-    fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey> {
+    fn create_api_key(
+        &self,
+        name: &str,
+        allowed_models: Option<&[String]>,
+        owner: Option<&str>,
+        owner_concurrency: Option<u32>,
+    ) -> Result<ApiKey> {
         let mut conn = self.pool.get_conn()?;
         let key = generate_api_key();
         let key_hint = make_key_hint(&key);
@@ -211,9 +233,9 @@ impl Storage for MysqlStorage {
         let allowed_models_json = encode_allowed_models(allowed_models);
 
         conn.exec_drop(
-            "INSERT INTO api_keys (name, `key`, key_hint, status, allowed_models, created_at)
-             VALUES (?, ?, ?, 'active', ?, ?)",
-            (name, &key, &key_hint, &allowed_models_json, now),
+            "INSERT INTO api_keys (name, `key`, key_hint, status, allowed_models, owner, owner_concurrency, created_at)
+             VALUES (?, ?, ?, 'active', ?, ?, ?, ?)",
+            (name, &key, &key_hint, &allowed_models_json, owner, owner_concurrency, now),
         )?;
 
         let id: i64 = conn.query_first("SELECT LAST_INSERT_ID()")?.unwrap_or(0);
@@ -225,6 +247,8 @@ impl Storage for MysqlStorage {
             key_hint,
             status: "active".to_string(),
             allowed_models: allowed_models.map(|m| m.to_vec()),
+            owner: owner.map(str::to_string),
+            owner_concurrency,
             created_at: now,
         })
     }
@@ -232,7 +256,7 @@ impl Storage for MysqlStorage {
     fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
         let mut conn = self.pool.get_conn()?;
         let rows: Vec<mysql::Row> = conn.query(
-            "SELECT id, name, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys ORDER BY id",
         )?;
         Ok(rows.into_iter().map(read_api_key_masked).collect())
@@ -241,7 +265,7 @@ impl Storage for MysqlStorage {
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
         let mut conn = self.pool.get_conn()?;
         let row: Option<mysql::Row> = conn.exec_first(
-            "SELECT id, name, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys WHERE id = ?",
             (id,),
         )?;
@@ -266,10 +290,24 @@ impl Storage for MysqlStorage {
         Ok(conn.affected_rows() > 0)
     }
 
+    fn update_api_key_owner(
+        &self,
+        id: i64,
+        owner: Option<&str>,
+        owner_concurrency: Option<u32>,
+    ) -> Result<bool> {
+        let mut conn = self.pool.get_conn()?;
+        conn.exec_drop(
+            "UPDATE api_keys SET owner = ?, owner_concurrency = ? WHERE id = ? AND status = 'active'",
+            (owner, owner_concurrency, id),
+        )?;
+        Ok(conn.affected_rows() > 0)
+    }
+
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let mut conn = self.pool.get_conn()?;
         let row: Option<mysql::Row> = conn.exec_first(
-            "SELECT id, name, `key`, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, `key`, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys WHERE `key` = ?",
             (key,),
         )?;
@@ -280,6 +318,8 @@ impl Storage for MysqlStorage {
             key_hint: r.get("key_hint").unwrap_or_default(),
             status: r.get("status").unwrap_or_default(),
             allowed_models: decode_allowed_models(r.get("allowed_models")),
+            owner: r.get("owner").unwrap_or_default(),
+            owner_concurrency: r.get("owner_concurrency").unwrap_or_default(),
             created_at: r.get("created_at").unwrap_or_default(),
         }))
     }

@@ -8,7 +8,9 @@ use crate::api::types::{
     ChatCompletionRequest, ChatCompletionResponse, CreateCompletionRequest, CreateEmbeddingRequest,
 };
 use crate::auth::{authenticate_client, ClientAuth};
-use crate::proxy::engine::{ProxyEngine, ProxyTimeoutError, MODEL_FORBIDDEN_MARKER};
+use crate::proxy::engine::{
+    ProxyEngine, ProxyTimeoutError, MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
+};
 use crate::storage::Storage;
 
 type BoxBody = Full<Bytes>;
@@ -264,6 +266,15 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
         return (StatusCode::FORBIDDEN, cleaned);
     }
 
+    if top.contains(OWNER_LIMIT_MARKER) {
+        // The tenant's shared in-flight budget stayed saturated for the whole
+        // queue wait — tell the caller THEY are the bottleneck (429), not us.
+        let cleaned = top
+            .replace(&format!("{}: ", OWNER_LIMIT_MARKER), "")
+            .replace(OWNER_LIMIT_MARKER, "");
+        return (StatusCode::TOO_MANY_REQUESTS, cleaned);
+    }
+
     let is_client_error = top.contains("not found in config")
         || top.contains("Failed to resolve model")
         || top.contains("Failed to resolve embedding model")
@@ -444,6 +455,20 @@ mod tests {
         assert_eq!(
             message,
             "provider 'anthropic' exceeded the 360s operation deadline"
+        );
+    }
+
+    #[test]
+    fn owner_limit_marker_maps_to_429() {
+        let error = anyhow::anyhow!(
+            "{}: owner concurrency limit (10) exhausted — retry shortly",
+            OWNER_LIMIT_MARKER
+        );
+        let (status, msg) = classify_engine_error(&error);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            !msg.contains(OWNER_LIMIT_MARKER),
+            "internal marker must be stripped from the client message"
         );
     }
 
