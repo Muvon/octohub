@@ -25,6 +25,14 @@ pub struct ApiKey {
     /// admin omitted the list at creation time. An empty `Some(vec![])`
     /// is an explicit lockout (admin disabled all models).
     pub allowed_models: Option<Vec<String>>,
+    /// Opaque grouping label for shared limits — e.g. the tenant/account that
+    /// owns this key in the operator's own system. OctoHub attaches no
+    /// semantics beyond "keys with the same owner share limits". `None` =
+    /// ungrouped (behaves exactly as before the field existed).
+    pub owner: Option<String>,
+    /// Max in-flight proxy requests (completions + embeddings together)
+    /// shared by ALL keys with the same `owner`. `None` or 0 = unlimited.
+    pub owner_concurrency: Option<u32>,
     pub created_at: u64,
 }
 
@@ -115,7 +123,15 @@ pub trait Storage: Send + Sync {
     // API key management
     /// Create a new API key. `allowed_models` is persisted as-is: `None`
     /// means unrestricted, `Some(list)` restricts to that exact set.
-    fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey>;
+    /// `owner`/`owner_concurrency` group the key into a shared concurrency
+    /// budget (see [`ApiKey::owner`]); both optional.
+    fn create_api_key(
+        &self,
+        name: &str,
+        allowed_models: Option<&[String]>,
+        owner: Option<&str>,
+        owner_concurrency: Option<u32>,
+    ) -> Result<ApiKey>;
     fn list_api_keys(&self) -> Result<Vec<ApiKey>>;
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>>;
     fn revoke_api_key(&self, id: i64) -> Result<bool>;
@@ -123,6 +139,15 @@ pub trait Storage: Send + Sync {
     /// unrestricted). The key value stays the same — this is how a plan
     /// change grants/removes models without breaking deployed credentials.
     fn update_api_key_models(&self, id: i64, allowed_models: Option<&[String]>) -> Result<bool>;
+    /// Replace an active key's owner grouping + shared concurrency budget in
+    /// place (same in-place contract as `update_api_key_models` — deployed
+    /// credentials keep working while their limits follow the plan).
+    fn update_api_key_owner(
+        &self,
+        id: i64,
+        owner: Option<&str>,
+        owner_concurrency: Option<u32>,
+    ) -> Result<bool>;
     /// Look up an active API key by its raw key value (for auth)
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>>;
 

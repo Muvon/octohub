@@ -12,12 +12,14 @@ use uuid::Uuid;
 
 use crate::api::types::*;
 use crate::config::Config;
-use crate::proxy::limiter::ProviderLimiter;
+use crate::proxy::limiter::{OwnerLimiter, ProviderLimiter, OWNER_QUEUE_WAIT};
 use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
 
 /// Marker added to model-restriction errors so the HTTP layer can map them
 /// to `403 Forbidden` instead of the generic 400/500.
 pub const MODEL_FORBIDDEN_MARKER: &str = "model_not_allowed_for_key";
+/// Marker for owner-budget exhaustion — the handler maps it to HTTP 429.
+pub const OWNER_LIMIT_MARKER: &str = "owner_concurrency_exhausted";
 
 #[derive(Debug)]
 pub enum ProxyTimeoutError {
@@ -72,6 +74,10 @@ pub struct ProxyEngine {
     storage: Arc<dyn Storage>,
     config: crate::Live<Config>,
     limiter: crate::Live<ProviderLimiter>,
+    /// Per-owner in-flight budgets (keys sharing `ApiKey::owner`). Plain Arc,
+    /// not `Live`: state comes from the key rows, not config, and must survive
+    /// SIGHUP so in-flight accounting is never reset by a reload.
+    owner_limiter: Arc<OwnerLimiter>,
 }
 
 impl ProxyEngine {
@@ -84,6 +90,34 @@ impl ProxyEngine {
             storage,
             config,
             limiter,
+            owner_limiter: Arc::new(OwnerLimiter::new()),
+        }
+    }
+
+    /// Take a slot in the key's shared owner budget, or fail with the 429
+    /// marker after `OWNER_QUEUE_WAIT`. `None` = key is ungrouped/unlimited —
+    /// hold the returned permit (if any) for the whole upstream call.
+    async fn acquire_owner_slot(
+        &self,
+        api_key: &ApiKey,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let (Some(owner), Some(capacity)) = (&api_key.owner, api_key.owner_concurrency) else {
+            return Ok(None);
+        };
+        if capacity == 0 {
+            return Ok(None); // 0 = unlimited, same contract as absent
+        }
+        match self
+            .owner_limiter
+            .acquire(owner, capacity, OWNER_QUEUE_WAIT)
+            .await
+        {
+            Ok(permit) => Ok(Some(permit)),
+            Err(()) => Err(anyhow!(
+                "{}: owner concurrency limit ({}) exhausted — retry shortly",
+                OWNER_LIMIT_MARKER,
+                capacity
+            )),
         }
     }
 
@@ -108,6 +142,9 @@ impl ProxyEngine {
         api_key: &ApiKey,
     ) -> Result<(CreateCompletionResponse, std::time::Duration)> {
         ensure_model_allowed(api_key, &req.model)?;
+        // Owner budget slot — held for the WHOLE request (queue + upstream +
+        // storage), completions and embeddings drain the same budget.
+        let _owner_slot = self.acquire_owner_slot(api_key).await?;
 
         // Snapshot config + limiter once so this request keeps a consistent view
         // even if SIGHUP swaps them mid-flight.
@@ -454,6 +491,8 @@ impl ProxyEngine {
         api_key: &ApiKey,
     ) -> Result<EmbeddingOutcome> {
         ensure_model_allowed(api_key, &req.model)?;
+        // Same shared owner budget as completions (see `process`).
+        let _owner_slot = self.acquire_owner_slot(api_key).await?;
 
         // Snapshot config + limiter once (see `process`).
         let config = self.config();

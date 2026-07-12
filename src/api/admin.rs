@@ -86,6 +86,13 @@ pub async fn handle_create_key(
         /// `provider:model`).
         #[serde(default)]
         allowed_models: Option<Vec<String>>,
+        /// Opaque grouping label: keys sharing an owner share one in-flight
+        /// budget (`owner_concurrency`). Both optional — absent keeps the key
+        /// ungrouped/unlimited, exactly as before the fields existed.
+        #[serde(default)]
+        owner: Option<String>,
+        #[serde(default)]
+        owner_concurrency: Option<u32>,
     }
 
     let create_req: CreateKeyRequest = match serde_json::from_slice(&body_bytes) {
@@ -103,7 +110,12 @@ pub async fn handle_create_key(
     }
 
     let allowed_models = create_req.allowed_models.as_deref();
-    match storage.create_api_key(create_req.name.trim(), allowed_models) {
+    match storage.create_api_key(
+        create_req.name.trim(),
+        allowed_models,
+        create_req.owner.as_deref(),
+        create_req.owner_concurrency,
+    ) {
         Ok(key) => {
             // On creation, return the full key (only time it's visible)
             json_response(StatusCode::CREATED, api_key_response(&key, true))
@@ -113,6 +125,66 @@ pub async fn handle_create_key(
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("Failed to create API key: {}", e),
+            )
+        }
+    }
+}
+
+/// POST /v1/admin/keys/:id/owner - Replace a key's owner grouping + shared
+/// concurrency budget in place (same contract as the /models endpoint: the
+/// key value keeps working while its limits follow the operator's plan).
+pub async fn handle_update_key_owner(
+    req: Request<hyper::body::Incoming>,
+    storage: Arc<dyn Storage>,
+    master_key: &str,
+    key_id: i64,
+) -> Response<BoxBody> {
+    if let Err(resp) = check_admin(&req, master_key) {
+        return *resp;
+    }
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read request body: {}", e),
+            );
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct UpdateOwnerRequest {
+        /// Absent/`null` owner ungroups the key; absent/`null`/0 concurrency
+        /// means unlimited. Same semantics as key creation.
+        #[serde(default)]
+        owner: Option<String>,
+        #[serde(default)]
+        owner_concurrency: Option<u32>,
+    }
+
+    let update_req: UpdateOwnerRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid request JSON: {}", e),
+            );
+        }
+    };
+
+    match storage.update_api_key_owner(
+        key_id,
+        update_req.owner.as_deref(),
+        update_req.owner_concurrency,
+    ) {
+        Ok(true) => json_response(StatusCode::OK, serde_json::json!({"status": "updated"})),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "API key not found"),
+        Err(e) => {
+            tracing::error!(error = %e, "update key owner failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to update API key owner",
             )
         }
     }
@@ -128,6 +200,8 @@ fn api_key_response(key: &crate::storage::ApiKey, include_full_key: bool) -> ser
         "key_hint": key.key_hint,
         "status": key.status,
         "allowed_models": key.allowed_models,
+        "owner": key.owner,
+        "owner_concurrency": key.owner_concurrency,
         "created_at": key.created_at,
     });
     if include_full_key {

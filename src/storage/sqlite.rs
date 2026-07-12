@@ -33,6 +33,8 @@ impl SqliteStorage {
                 key_hint TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 allowed_models TEXT,
+                owner TEXT,
+                owner_concurrency INTEGER,
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
@@ -75,6 +77,8 @@ impl SqliteStorage {
         // Additive migrations for upgrades from older schemas. SQLite has no
         // `ADD COLUMN IF NOT EXISTS`, so we probe PRAGMA table_info first.
         ensure_column(&conn, "api_keys", "allowed_models", "TEXT")?;
+        ensure_column(&conn, "api_keys", "owner", "TEXT")?;
+        ensure_column(&conn, "api_keys", "owner_concurrency", "INTEGER")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -175,7 +179,13 @@ fn build_time_and_key_filter(
 }
 
 impl Storage for SqliteStorage {
-    fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey> {
+    fn create_api_key(
+        &self,
+        name: &str,
+        allowed_models: Option<&[String]>,
+        owner: Option<&str>,
+        owner_concurrency: Option<u32>,
+    ) -> Result<ApiKey> {
         let conn = lock_conn(&self.conn)?;
         let key = generate_api_key();
         let key_hint = make_key_hint(&key);
@@ -183,9 +193,9 @@ impl Storage for SqliteStorage {
         let allowed_models_json = encode_allowed_models(allowed_models);
 
         conn.execute(
-            "INSERT INTO api_keys (name, key, key_hint, status, allowed_models, created_at)
-             VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
-            rusqlite::params![name, key, key_hint, allowed_models_json, now],
+            "INSERT INTO api_keys (name, key, key_hint, status, allowed_models, owner, owner_concurrency, created_at)
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7)",
+            rusqlite::params![name, key, key_hint, allowed_models_json, owner, owner_concurrency, now],
         )?;
 
         let id = conn.last_insert_rowid();
@@ -197,6 +207,8 @@ impl Storage for SqliteStorage {
             key_hint,
             status: "active".to_string(),
             allowed_models: allowed_models.map(|m| m.to_vec()),
+            owner: owner.map(str::to_string),
+            owner_concurrency,
             created_at: now,
         })
     }
@@ -204,7 +216,7 @@ impl Storage for SqliteStorage {
     fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
         let conn = lock_conn(&self.conn)?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -215,7 +227,9 @@ impl Storage for SqliteStorage {
                 key_hint: row.get(2)?,
                 status: row.get(3)?,
                 allowed_models: decode_allowed_models(row.get(4)?),
-                created_at: row.get(5)?,
+                owner: row.get(5)?,
+                owner_concurrency: row.get(6)?,
+                created_at: row.get(7)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -224,7 +238,7 @@ impl Storage for SqliteStorage {
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
         let conn = lock_conn(&self.conn)?;
         conn.query_row(
-            "SELECT id, name, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys WHERE id = ?1",
             rusqlite::params![id],
             |row| {
@@ -235,7 +249,9 @@ impl Storage for SqliteStorage {
                     key_hint: row.get(2)?,
                     status: row.get(3)?,
                     allowed_models: decode_allowed_models(row.get(4)?),
-                    created_at: row.get(5)?,
+                    owner: row.get(5)?,
+                    owner_concurrency: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             },
         )
@@ -261,10 +277,24 @@ impl Storage for SqliteStorage {
         Ok(affected > 0)
     }
 
+    fn update_api_key_owner(
+        &self,
+        id: i64,
+        owner: Option<&str>,
+        owner_concurrency: Option<u32>,
+    ) -> Result<bool> {
+        let conn = lock_conn(&self.conn)?;
+        let affected = conn.execute(
+            "UPDATE api_keys SET owner = ?1, owner_concurrency = ?2 WHERE id = ?3 AND status = 'active'",
+            rusqlite::params![owner, owner_concurrency, id],
+        )?;
+        Ok(affected > 0)
+    }
+
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let conn = lock_conn(&self.conn)?;
         conn.query_row(
-            "SELECT id, name, key, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, key, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys WHERE key = ?1",
             rusqlite::params![key],
             |row| {
@@ -275,7 +305,9 @@ impl Storage for SqliteStorage {
                     key_hint: row.get(3)?,
                     status: row.get(4)?,
                     allowed_models: decode_allowed_models(row.get(5)?),
-                    created_at: row.get(6)?,
+                    owner: row.get(6)?,
+                    owner_concurrency: row.get(7)?,
+                    created_at: row.get(8)?,
                 })
             },
         )
@@ -600,7 +632,9 @@ mod tests {
     }
 
     fn create_test_key(storage: &SqliteStorage) -> ApiKey {
-        storage.create_api_key("test-key", None).unwrap()
+        storage
+            .create_api_key("test-key", None, None, None)
+            .unwrap()
     }
 
     fn make_stored_completion(
@@ -632,7 +666,7 @@ mod tests {
     #[test]
     fn test_create_api_key() {
         let storage = create_test_storage();
-        let key = storage.create_api_key("my-app", None).unwrap();
+        let key = storage.create_api_key("my-app", None, None, None).unwrap();
         assert_eq!(key.name, "my-app");
         assert_eq!(key.status, "active");
         assert!(!key.key.is_empty());
@@ -644,7 +678,9 @@ mod tests {
     fn test_create_api_key_with_allowed_models() {
         let storage = create_test_storage();
         let allowed = vec!["gpt".to_string(), "openai:gpt-4o".to_string()];
-        let key = storage.create_api_key("scoped", Some(&allowed)).unwrap();
+        let key = storage
+            .create_api_key("scoped", Some(&allowed), None, None)
+            .unwrap();
         assert_eq!(key.allowed_models.as_deref(), Some(allowed.as_slice()));
         assert!(key.is_model_allowed("gpt"));
         assert!(key.is_model_allowed("openai:gpt-4o"));
@@ -654,7 +690,7 @@ mod tests {
     #[test]
     fn test_create_api_key_unrestricted_by_default() {
         let storage = create_test_storage();
-        let key = storage.create_api_key("open", None).unwrap();
+        let key = storage.create_api_key("open", None, None, None).unwrap();
         assert!(key.allowed_models.is_none());
         assert!(key.is_model_allowed("anything"));
     }
@@ -665,7 +701,9 @@ mod tests {
         // (get_api_key_by_key) and confirm the JSON survived the round trip.
         let storage = create_test_storage();
         let allowed = vec!["haiku".to_string(), "sonnet".to_string()];
-        let created = storage.create_api_key("scoped", Some(&allowed)).unwrap();
+        let created = storage
+            .create_api_key("scoped", Some(&allowed), None, None)
+            .unwrap();
         let fetched = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
         assert_eq!(fetched.allowed_models.as_deref(), Some(allowed.as_slice()));
     }
@@ -673,8 +711,8 @@ mod tests {
     #[test]
     fn test_list_api_keys_hides_full_key() {
         let storage = create_test_storage();
-        storage.create_api_key("key-1", None).unwrap();
-        storage.create_api_key("key-2", None).unwrap();
+        storage.create_api_key("key-1", None, None, None).unwrap();
+        storage.create_api_key("key-2", None, None, None).unwrap();
         let keys = storage.list_api_keys().unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys[0].key.is_empty()); // Full key not exposed
@@ -684,7 +722,7 @@ mod tests {
     #[test]
     fn test_get_api_key() {
         let storage = create_test_storage();
-        let created = storage.create_api_key("my-app", None).unwrap();
+        let created = storage.create_api_key("my-app", None, None, None).unwrap();
         let fetched = storage.get_api_key(created.id).unwrap().unwrap();
         assert_eq!(fetched.name, "my-app");
         assert!(fetched.key.is_empty()); // Full key not exposed in get
@@ -693,7 +731,7 @@ mod tests {
     #[test]
     fn test_revoke_api_key() {
         let storage = create_test_storage();
-        let key = storage.create_api_key("my-app", None).unwrap();
+        let key = storage.create_api_key("my-app", None, None, None).unwrap();
         assert!(storage.revoke_api_key(key.id).unwrap());
         // Second revoke returns false (already revoked)
         assert!(!storage.revoke_api_key(key.id).unwrap());
@@ -704,7 +742,7 @@ mod tests {
     #[test]
     fn test_get_api_key_by_key() {
         let storage = create_test_storage();
-        let created = storage.create_api_key("my-app", None).unwrap();
+        let created = storage.create_api_key("my-app", None, None, None).unwrap();
         let found = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
         assert_eq!(found.id, created.id);
         assert_eq!(found.name, "my-app");
@@ -826,8 +864,8 @@ mod tests {
     #[test]
     fn test_list_completions_filtered() {
         let storage = create_test_storage();
-        let key1 = storage.create_api_key("app-1", None).unwrap();
-        let key2 = storage.create_api_key("app-2", None).unwrap();
+        let key1 = storage.create_api_key("app-1", None, None, None).unwrap();
+        let key2 = storage.create_api_key("app-2", None, None, None).unwrap();
 
         storage
             .store_completion(&make_stored_completion("c1", key1.id, None, "a", "b"))

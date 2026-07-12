@@ -36,9 +36,13 @@ impl PostgresStorage {
                 key_hint TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 allowed_models JSONB,
+                owner TEXT,
+                owner_concurrency INTEGER,
                 created_at BIGINT NOT NULL
             );
             ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS allowed_models JSONB;
+            ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS owner TEXT;
+            ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS owner_concurrency INTEGER;
             CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key);
             CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
 
@@ -151,6 +155,10 @@ fn read_api_key_masked(row: &postgres::Row) -> ApiKey {
         key_hint: row.get("key_hint"),
         status: row.get("status"),
         allowed_models: read_allowed_models(row),
+        owner: row.get("owner"),
+        owner_concurrency: row
+            .get::<_, Option<i32>>("owner_concurrency")
+            .map(|v| v as u32),
         created_at: row.get::<_, i64>("created_at") as u64,
     }
 }
@@ -195,7 +203,13 @@ fn effective_limit(limit: u32) -> i64 {
 }
 
 impl Storage for PostgresStorage {
-    fn create_api_key(&self, name: &str, allowed_models: Option<&[String]>) -> Result<ApiKey> {
+    fn create_api_key(
+        &self,
+        name: &str,
+        allowed_models: Option<&[String]>,
+        owner: Option<&str>,
+        owner_concurrency: Option<u32>,
+    ) -> Result<ApiKey> {
         let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let key = generate_api_key();
         let key_hint = make_key_hint(&key);
@@ -203,11 +217,12 @@ impl Storage for PostgresStorage {
         // Encoded as text and cast to jsonb in SQL — keeps the binding type
         // uniform with the other backends instead of two parallel code paths.
         let allowed_models_json = encode_allowed_models(allowed_models);
+        let concurrency_i32 = owner_concurrency.map(|c| c as i32);
 
         let row = client.query_one(
-            "INSERT INTO api_keys (name, key, key_hint, status, allowed_models, created_at)
-             VALUES ($1, $2, $3, 'active', $4::jsonb, $5) RETURNING id",
-            &[&name, &key, &key_hint, &allowed_models_json, &now],
+            "INSERT INTO api_keys (name, key, key_hint, status, allowed_models, owner, owner_concurrency, created_at)
+             VALUES ($1, $2, $3, 'active', $4::jsonb, $5, $6, $7) RETURNING id",
+            &[&name, &key, &key_hint, &allowed_models_json, &owner, &concurrency_i32, &now],
         )?;
         let id: i64 = row.get(0);
 
@@ -218,6 +233,8 @@ impl Storage for PostgresStorage {
             key_hint,
             status: "active".to_string(),
             allowed_models: allowed_models.map(|m| m.to_vec()),
+            owner: owner.map(str::to_string),
+            owner_concurrency,
             created_at: now as u64,
         })
     }
@@ -225,7 +242,7 @@ impl Storage for PostgresStorage {
     fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
         let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let rows = client.query(
-            "SELECT id, name, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys ORDER BY id",
             &[],
         )?;
@@ -235,7 +252,7 @@ impl Storage for PostgresStorage {
     fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
         let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let rows = client.query(
-            "SELECT id, name, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys WHERE id = $1",
             &[&id],
         )?;
@@ -262,10 +279,25 @@ impl Storage for PostgresStorage {
         Ok(affected > 0)
     }
 
+    fn update_api_key_owner(
+        &self,
+        id: i64,
+        owner: Option<&str>,
+        owner_concurrency: Option<u32>,
+    ) -> Result<bool> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        let concurrency_i32 = owner_concurrency.map(|c| c as i32);
+        let affected = client.execute(
+            "UPDATE api_keys SET owner = $1, owner_concurrency = $2 WHERE id = $3 AND status = 'active'",
+            &[&owner, &concurrency_i32, &id],
+        )?;
+        Ok(affected > 0)
+    }
+
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
         let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         let rows = client.query(
-            "SELECT id, name, key, key_hint, status, allowed_models, created_at \
+            "SELECT id, name, key, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys WHERE key = $1",
             &[&key],
         )?;
@@ -276,6 +308,10 @@ impl Storage for PostgresStorage {
             key_hint: row.get("key_hint"),
             status: row.get("status"),
             allowed_models: read_allowed_models(row),
+            owner: row.get("owner"),
+            owner_concurrency: row
+                .get::<_, Option<i32>>("owner_concurrency")
+                .map(|v| v as u32),
             created_at: row.get::<_, i64>("created_at") as u64,
         }))
     }
