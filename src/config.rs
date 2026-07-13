@@ -108,6 +108,17 @@ pub struct ServerConfig {
     /// octolib retries and response parsing.
     #[serde(default = "default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
+    /// Retry the request on the next candidate provider when an upstream
+    /// call fails with a provider-side error (timeout, connect, 429, 5xx).
+    /// Only kicks in when the model alias has another candidate left; the
+    /// request's own errors (4xx) always go straight back to the client.
+    #[serde(default)]
+    pub failover_on_error: bool,
+    /// After 3 consecutive provider-side failures, deprioritize the provider
+    /// for this many seconds — while cooling it is only used when no healthy
+    /// candidate can admit the request. 0 = disabled.
+    #[serde(default)]
+    pub provider_error_cooldown_secs: u64,
 }
 
 /// Per-provider configuration knobs.
@@ -182,6 +193,8 @@ impl Default for ServerConfig {
             trust_forwarded_for: false,
             provider_queue_timeout_secs: default_provider_queue_timeout_secs(),
             upstream_timeout_secs: default_upstream_timeout_secs(),
+            failover_on_error: false,
+            provider_error_cooldown_secs: 0,
         }
     }
 }
@@ -243,6 +256,14 @@ impl Config {
                 config.server.upstream_timeout_secs = seconds;
             }
         }
+        if let Ok(val) = env::var("OCTOHUB_FAILOVER_ON_ERROR") {
+            config.server.failover_on_error = val == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("OCTOHUB_PROVIDER_ERROR_COOLDOWN_SECS") {
+            if let Ok(seconds) = val.parse() {
+                config.server.provider_error_cooldown_secs = seconds;
+            }
+        }
     }
 
     /// Load from environment variables only (fallback)
@@ -259,6 +280,8 @@ impl Config {
                 trust_forwarded_for: false,
                 provider_queue_timeout_secs: default_provider_queue_timeout_secs(),
                 upstream_timeout_secs: default_upstream_timeout_secs(),
+                failover_on_error: false,
+                provider_error_cooldown_secs: 0,
             },
             models: HashMap::new(),
             embedding_models: HashMap::new(),
@@ -346,6 +369,24 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(config.provider_queue_timeout_secs, 60);
         assert_eq!(config.upstream_timeout_secs, 360);
+        assert!(!config.failover_on_error, "failover is opt-in");
+        assert_eq!(config.provider_error_cooldown_secs, 0, "cooldown is opt-in");
+    }
+
+    #[test]
+    fn failover_and_cooldown_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            api_key = ""
+            failover_on_error = true
+            provider_error_cooldown_secs = 120
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.server.failover_on_error);
+        assert_eq!(config.server.provider_error_cooldown_secs, 120);
     }
 
     #[test]

@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::api::types::*;
 use crate::config::Config;
-use crate::proxy::limiter::{OwnerLimiter, ProviderLimiter, ProviderRateTracker, OWNER_QUEUE_WAIT};
+use crate::proxy::limiter::{
+    OwnerLimiter, ProviderHealth, ProviderLimiter, ProviderRateTracker, OWNER_QUEUE_WAIT,
+};
 use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
 
 /// Marker added to model-restriction errors so the HTTP layer can map them
@@ -76,6 +78,36 @@ impl std::fmt::Display for RateLimitedError {
 
 impl std::error::Error for RateLimitedError {}
 
+/// Extract the upstream HTTP status embedded in an octolib provider error.
+/// octolib formats provider failures as "... API error <code> <message>", e.g.
+/// "ollama API error 400 Bad Request: ...". Returns the first such code, if any.
+pub(crate) fn upstream_status_code(msg: &str) -> Option<u16> {
+    const MARKER: &str = "API error ";
+    let start = msg.find(MARKER)? + MARKER.len();
+    let digits: String = msg[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Whether a dispatch failure is the PROVIDER's fault (worth failing over
+/// and counting toward its cooldown) rather than the request's. Provider
+/// faults: upstream deadline, 429/5xx, and errors with no embedded status
+/// (connect/transport/unavailable provider). NOT provider faults: our own
+/// queue timeout (capacity is our problem) and embedded 4xx — every
+/// provider would reject that request the same way.
+fn is_provider_fault(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<ProxyTimeoutError>() {
+        Some(ProxyTimeoutError::Upstream { .. }) => true,
+        Some(ProxyTimeoutError::ProviderQueue { .. }) => false,
+        None => match upstream_status_code(&format!("{:#}", error)) {
+            Some(code) => code == 429 || code >= 500,
+            None => true,
+        },
+    }
+}
+
 /// Result of `process_embedding`. Carries telemetry alongside the response so
 /// the HTTP handler can label `octohub_embedding_*` metrics with the resolved
 /// provider name and the approximate input token count — neither of which is
@@ -104,6 +136,9 @@ pub struct ProxyEngine {
     /// `owner_limiter`: a SIGHUP reload must update the LIMITS (read from the
     /// live config at admission) without zeroing the day's counters.
     rate_tracker: Arc<ProviderRateTracker>,
+    /// Per-provider failure streaks + cooldowns (SIGHUP-safe, like the
+    /// trackers above). Only active when `provider_error_cooldown_secs` > 0.
+    provider_health: Arc<ProviderHealth>,
 }
 
 impl ProxyEngine {
@@ -118,6 +153,7 @@ impl ProxyEngine {
             limiter,
             owner_limiter: Arc::new(OwnerLimiter::new()),
             rate_tracker: Arc::new(ProviderRateTracker::new()),
+            provider_health: Arc::new(ProviderHealth::new()),
         }
     }
 
@@ -264,136 +300,178 @@ impl ProxyEngine {
         //    provider is preferred (provider-side prompt caches are per
         //    provider); candidates whose rate windows are exhausted are
         //    skipped; all exhausted → 429 with Retry-After (`pick_admitted`).
+        //    With `failover_on_error`, a provider-side failure moves to the
+        //    next candidate instead of surfacing to the client.
         let mut candidates = config
             .model_candidates(&req.model)
             .with_context(|| format!("Failed to resolve model '{}'", req.model))?;
         if let Some(ref sticky) = sticky_provider {
             prefer_provider(&mut candidates, sticky);
         }
-        let (provider_name, resolved_model) =
-            pick_admitted(&self.rate_tracker, &config, candidates, &req.model)?;
 
-        // Record provider in request span
-        tracing::Span::current().record("provider", provider_name.as_str());
+        let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
+        let (provider_name, resolved_model, provider, provider_response, upstream_duration) = loop {
+            let (provider_name, resolved_model) = pick_admitted(
+                &self.rate_tracker,
+                &self.provider_health,
+                &config,
+                candidates.clone(),
+                &req.model,
+            )?;
 
-        // 5. Get provider instance
-        let provider = ProviderFactory::create_provider(&provider_name)
-            .with_context(|| format!("Provider '{}' not available", provider_name))?;
+            // Record provider in request span
+            tracing::Span::current().record("provider", provider_name.as_str());
 
-        // 6. Build ChatCompletionParams
-        let tools = req.tools.as_ref().map(|tools| {
-            tools
-                .iter()
-                .map(|t| FunctionDefinition {
-                    name: t.name.clone(),
-                    description: t.description.clone().unwrap_or_default(),
-                    parameters: t.parameters.clone().unwrap_or(serde_json::json!({})),
-                    // Pass-through: octohub is a proxy. Whatever cache marker
-                    // the client attached to this tool goes upstream unchanged.
-                    cache_control: t.cache_control.clone(),
-                })
-                .collect::<Vec<_>>()
-        });
+            let attempt = async {
+                // 5. Get provider instance
+                let provider = ProviderFactory::create_provider(&provider_name)
+                    .with_context(|| format!("Provider '{}' not available", provider_name))?;
 
-        // Sampling: forward temperature + top_p straight from the client.
-        // top_k is not part of the Responses-API wire shape (octolib client
-        // never sends it), so we leave it at a neutral default; upstream
-        // providers that don't honor it ignore it harmlessly.
-        let mut params = ChatCompletionParams::new(
-            &messages,
-            &resolved_model,
-            req.temperature,
-            req.top_p,
-            50,
-            req.max_output_tokens,
-        );
+                // 6. Build ChatCompletionParams
+                let tools = req.tools.as_ref().map(|tools| {
+                    tools
+                        .iter()
+                        .map(|t| FunctionDefinition {
+                            name: t.name.clone(),
+                            description: t.description.clone().unwrap_or_default(),
+                            parameters: t.parameters.clone().unwrap_or(serde_json::json!({})),
+                            // Pass-through: octohub is a proxy. Whatever cache marker
+                            // the client attached to this tool goes upstream unchanged.
+                            cache_control: t.cache_control.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                });
 
-        if let Some(tools) = tools {
-            params.tools = Some(tools);
-        }
+                // Sampling: forward temperature + top_p straight from the client.
+                // top_k is not part of the Responses-API wire shape (octolib client
+                // never sends it), so we leave it at a neutral default; upstream
+                // providers that don't honor it ignore it harmlessly.
+                let mut params = ChatCompletionParams::new(
+                    &messages,
+                    &resolved_model,
+                    req.temperature,
+                    req.top_p,
+                    50,
+                    req.max_output_tokens,
+                );
 
-        // Reasoning effort: parse client string into octolib enum and pass
-        // through. Unknown values silently fall back to provider default —
-        // we never want a malformed effort hint to fail the whole request.
-        if let Some(ref eff) = req.reasoning_effort {
-            params.reasoning_effort = match eff.to_lowercase().as_str() {
-                "low" => Some(ReasoningEffort::Low),
-                "medium" => Some(ReasoningEffort::Medium),
-                "high" => Some(ReasoningEffort::High),
-                "xhigh" => Some(ReasoningEffort::XHigh),
-                "max" => Some(ReasoningEffort::Max),
-                _ => None,
-            };
-        }
+                if let Some(tools) = tools {
+                    params.tools = Some(tools);
+                }
 
-        // Structured output: map the Responses-API `text.format` shape onto
-        // octolib's StructuredOutputRequest so the upstream provider receives
-        // the schema (or json_object request) the client asked for. Without
-        // this, JSON-mode and JSON-Schema requests through the proxy silently
-        // fall back to free-form text.
-        if let Some(ref text) = req.text {
-            params.response_format = Some(match &text.format {
-                TextFormat::JsonObject => StructuredOutputRequest {
-                    format: OutputFormat::Json,
-                    mode: ResponseMode::Auto,
-                    schema: None,
-                },
-                TextFormat::JsonSchema { schema, strict } => StructuredOutputRequest {
-                    format: OutputFormat::JsonSchema,
-                    mode: if *strict {
-                        ResponseMode::Strict
-                    } else {
-                        ResponseMode::Auto
-                    },
-                    schema: Some(schema.clone()),
-                },
-            });
-        }
+                // Reasoning effort: parse client string into octolib enum and pass
+                // through. Unknown values silently fall back to provider default —
+                // we never want a malformed effort hint to fail the whole request.
+                if let Some(ref eff) = req.reasoning_effort {
+                    params.reasoning_effort = match eff.to_lowercase().as_str() {
+                        "low" => Some(ReasoningEffort::Low),
+                        "medium" => Some(ReasoningEffort::Medium),
+                        "high" => Some(ReasoningEffort::High),
+                        "xhigh" => Some(ReasoningEffort::XHigh),
+                        "max" => Some(ReasoningEffort::Max),
+                        _ => None,
+                    };
+                }
 
-        // 7. Call provider — hold a concurrency permit (if configured) for the
-        //    full duration of the upstream call. Dropping `_permit` after the
-        //    `.await` resolves wakes the next queued request.
-        let queue_start = std::time::Instant::now();
-        let queue_timeout =
-            std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
-        let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
-            .await
-            .map_err(|_| {
-                anyhow!(ProxyTimeoutError::ProviderQueue {
-                    provider: provider_name.clone(),
-                    timeout: queue_timeout,
-                })
-            })?;
-        let queue_wait = queue_start.elapsed();
-        if queue_wait.as_millis() > 0 {
-            tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
-        }
-        if queue_wait.as_millis() > 100 {
-            tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
-        }
-        crate::metrics::record_queue_wait(&provider_name, queue_wait);
+                // Structured output: map the Responses-API `text.format` shape onto
+                // octolib's StructuredOutputRequest so the upstream provider receives
+                // the schema (or json_object request) the client asked for. Without
+                // this, JSON-mode and JSON-Schema requests through the proxy silently
+                // fall back to free-form text.
+                if let Some(ref text) = req.text {
+                    params.response_format = Some(match &text.format {
+                        TextFormat::JsonObject => StructuredOutputRequest {
+                            format: OutputFormat::Json,
+                            mode: ResponseMode::Auto,
+                            schema: None,
+                        },
+                        TextFormat::JsonSchema { schema, strict } => StructuredOutputRequest {
+                            format: OutputFormat::JsonSchema,
+                            mode: if *strict {
+                                ResponseMode::Strict
+                            } else {
+                                ResponseMode::Auto
+                            },
+                            schema: Some(schema.clone()),
+                        },
+                    });
+                }
 
-        let upstream_start = std::time::Instant::now();
-        let upstream_timeout = std::time::Duration::from_secs(config.server.upstream_timeout_secs);
-        // Route through the schema-enforcement fallback: a transparent
-        // passthrough unless the client requested a JSON schema that the
-        // resolved provider can't natively guarantee (see
-        // `octolib::llm::chat_completion_enforced`).
-        let provider_response = tokio::time::timeout(
-            upstream_timeout,
-            chat_completion_enforced(provider.as_ref(), params),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(ProxyTimeoutError::Upstream {
-                provider: provider.name().to_string(),
-                timeout: upstream_timeout,
-            })
-        })?
-        .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
-        let upstream_duration = upstream_start.elapsed();
-        tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
-        drop(_permit);
+                // 7. Call provider — hold a concurrency permit (if configured) for the
+                //    full duration of the upstream call. Dropping `_permit` after the
+                //    `.await` resolves wakes the next queued request.
+                let queue_start = std::time::Instant::now();
+                let queue_timeout =
+                    std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
+                let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(ProxyTimeoutError::ProviderQueue {
+                            provider: provider_name.clone(),
+                            timeout: queue_timeout,
+                        })
+                    })?;
+                let queue_wait = queue_start.elapsed();
+                if queue_wait.as_millis() > 0 {
+                    tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
+                }
+                if queue_wait.as_millis() > 100 {
+                    tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
+                }
+                crate::metrics::record_queue_wait(&provider_name, queue_wait);
+
+                let upstream_start = std::time::Instant::now();
+                let upstream_timeout =
+                    std::time::Duration::from_secs(config.server.upstream_timeout_secs);
+                // Route through the schema-enforcement fallback: a transparent
+                // passthrough unless the client requested a JSON schema that the
+                // resolved provider can't natively guarantee (see
+                // `octolib::llm::chat_completion_enforced`).
+                let provider_response = tokio::time::timeout(
+                    upstream_timeout,
+                    chat_completion_enforced(provider.as_ref(), params),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow!(ProxyTimeoutError::Upstream {
+                        provider: provider.name().to_string(),
+                        timeout: upstream_timeout,
+                    })
+                })?
+                .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
+                let upstream_duration = upstream_start.elapsed();
+                tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
+                anyhow::Ok((provider, provider_response, upstream_duration))
+            }
+            .await;
+
+            match attempt {
+                Ok((provider, response, duration)) => {
+                    self.provider_health.record_success(&provider_name);
+                    break (provider_name, resolved_model, provider, response, duration);
+                }
+                Err(err) => {
+                    let provider_fault = is_provider_fault(&err);
+                    if provider_fault {
+                        self.provider_health
+                            .record_failure(&provider_name, cooldown);
+                    }
+                    // The failed provider is out for THIS request either way —
+                    // never re-picked within one failover loop.
+                    candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
+                    if !(config.server.failover_on_error && provider_fault) || candidates.is_empty()
+                    {
+                        return Err(err);
+                    }
+                    crate::metrics::record_failover(&provider_name);
+                    tracing::warn!(
+                        provider = %provider_name,
+                        error = %err,
+                        "provider failed — failing over to next candidate"
+                    );
+                }
+            }
+        };
 
         // 8. Build our response
         let completion_id = format!("cmpl_{}", Uuid::new_v4().simple());
@@ -551,72 +629,118 @@ impl ProxyEngine {
 
         let start = std::time::Instant::now();
 
-        // 1. Resolve provider and model — same rate-window admission as
-        //    completions (both drain the same provider windows).
-        let candidates = config
+        // 1. Resolve provider and model — same rate-window admission and
+        //    failover policy as completions (both drain the same provider
+        //    windows and share the health tracker).
+        let mut candidates = config
             .embedding_model_candidates(&req.model)
             .with_context(|| format!("Failed to resolve embedding model '{}'", req.model))?;
-        let (provider_name, resolved_model) =
-            pick_admitted(&self.rate_tracker, &config, candidates, &req.model)?;
 
-        // Record provider in request span
-        tracing::Span::current().record("provider", provider_name.as_str());
-
-        // 2. Parse provider type and create provider
-        let provider_model = format!("{}:{}", provider_name, resolved_model);
-        let (provider_type, model_name) =
-            octolib::embedding::parse_provider_model(&provider_model)?;
-        let provider = create_embedding_provider_from_parts(&provider_type, &model_name).await?;
-
-        // 3. Generate embeddings — gated by the same per-provider concurrency
-        // limit as completions. Permit released as soon as the call returns.
         let texts: Vec<String> = match &req.input {
             EmbeddingInput::Single(s) => vec![s.clone()],
             EmbeddingInput::Batch(v) => v.clone(),
         };
 
-        let queue_start = std::time::Instant::now();
-        let queue_timeout =
-            std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
-        let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
-            .await
-            .map_err(|_| {
-                anyhow!(ProxyTimeoutError::ProviderQueue {
-                    provider: provider_name.clone(),
-                    timeout: queue_timeout,
-                })
-            })?;
-        let queue_wait = queue_start.elapsed();
-        if queue_wait.as_millis() > 0 {
-            tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
-        }
-        if queue_wait.as_millis() > 100 {
-            tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
-        }
-        crate::metrics::record_queue_wait(&provider_name, queue_wait);
+        let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
+        let (provider_name, resolved_model, embeddings, usage_calc, upstream_duration) = loop {
+            let (provider_name, resolved_model) = pick_admitted(
+                &self.rate_tracker,
+                &self.provider_health,
+                &config,
+                candidates.clone(),
+                &req.model,
+            )?;
 
-        let upstream_start = std::time::Instant::now();
-        let upstream_timeout = std::time::Duration::from_secs(config.server.upstream_timeout_secs);
-        let (embeddings, usage_calc) = tokio::time::timeout(
-            upstream_timeout,
-            provider.generate_embeddings_batch(texts.clone(), InputType::None),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(ProxyTimeoutError::Upstream {
-                provider: provider_name.clone(),
-                timeout: upstream_timeout,
-            })
-        })?
-        .with_context(|| {
-            format!(
-                "Embedding provider '{}' failed for model '{}'",
-                provider_name, resolved_model
-            )
-        })?;
-        let upstream_duration = upstream_start.elapsed();
-        tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
-        drop(_permit);
+            // Record provider in request span
+            tracing::Span::current().record("provider", provider_name.as_str());
+
+            let attempt = async {
+                // 2. Parse provider type and create provider
+                let provider_model = format!("{}:{}", provider_name, resolved_model);
+                let (provider_type, model_name) =
+                    octolib::embedding::parse_provider_model(&provider_model)?;
+                let provider =
+                    create_embedding_provider_from_parts(&provider_type, &model_name).await?;
+
+                // 3. Generate embeddings — gated by the same per-provider concurrency
+                // limit as completions. Permit released as soon as the call returns.
+                let queue_start = std::time::Instant::now();
+                let queue_timeout =
+                    std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
+                let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(ProxyTimeoutError::ProviderQueue {
+                            provider: provider_name.clone(),
+                            timeout: queue_timeout,
+                        })
+                    })?;
+                let queue_wait = queue_start.elapsed();
+                if queue_wait.as_millis() > 0 {
+                    tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
+                }
+                if queue_wait.as_millis() > 100 {
+                    tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
+                }
+                crate::metrics::record_queue_wait(&provider_name, queue_wait);
+
+                let upstream_start = std::time::Instant::now();
+                let upstream_timeout =
+                    std::time::Duration::from_secs(config.server.upstream_timeout_secs);
+                let (embeddings, usage_calc) = tokio::time::timeout(
+                    upstream_timeout,
+                    provider.generate_embeddings_batch(texts.clone(), InputType::None),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow!(ProxyTimeoutError::Upstream {
+                        provider: provider_name.clone(),
+                        timeout: upstream_timeout,
+                    })
+                })?
+                .with_context(|| {
+                    format!(
+                        "Embedding provider '{}' failed for model '{}'",
+                        provider_name, resolved_model
+                    )
+                })?;
+                let upstream_duration = upstream_start.elapsed();
+                tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
+                anyhow::Ok((embeddings, usage_calc, upstream_duration))
+            }
+            .await;
+
+            match attempt {
+                Ok((embeddings, usage_calc, duration)) => {
+                    self.provider_health.record_success(&provider_name);
+                    break (
+                        provider_name,
+                        resolved_model,
+                        embeddings,
+                        usage_calc,
+                        duration,
+                    );
+                }
+                Err(err) => {
+                    let provider_fault = is_provider_fault(&err);
+                    if provider_fault {
+                        self.provider_health
+                            .record_failure(&provider_name, cooldown);
+                    }
+                    candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
+                    if !(config.server.failover_on_error && provider_fault) || candidates.is_empty()
+                    {
+                        return Err(err);
+                    }
+                    crate::metrics::record_failover(&provider_name);
+                    tracing::warn!(
+                        provider = %provider_name,
+                        error = %err,
+                        "embedding provider failed — failing over to next candidate"
+                    );
+                }
+            }
+        };
 
         // Embeddings drain the same provider token windows as completions.
         self.rate_tracker
@@ -1009,15 +1133,21 @@ fn prefer_provider(candidates: &mut [(String, String)], provider: &str) {
 }
 
 /// Pick the first candidate whose provider rate windows admit a request
-/// (counting it against the winner's windows). Exhausted candidates are
-/// skipped; when ALL are exhausted the caller gets [`RateLimitedError`]
-/// carrying the soonest retry among them.
+/// (counting it against the winner's windows). Cooling providers (see
+/// [`ProviderHealth`]) are sorted behind healthy ones — deprioritized, not
+/// blocked. Exhausted candidates are skipped; when ALL are exhausted the
+/// caller gets [`RateLimitedError`] carrying the soonest retry among them.
 fn pick_admitted(
     tracker: &ProviderRateTracker,
+    health: &ProviderHealth,
     config: &Config,
-    candidates: Vec<(String, String)>,
+    mut candidates: Vec<(String, String)>,
     model: &str,
 ) -> Result<(String, String)> {
+    // Stable sort: healthy candidates keep their (sticky + rotation) order
+    // in front, cooling ones follow as a last resort.
+    candidates.sort_by_key(|(provider, _)| health.is_cooling(provider));
+
     let mut soonest_retry: Option<std::time::Duration> = None;
     for (provider, resolved) in candidates {
         // No [providers.<name>] section (or no rate limits in it) — admit.
@@ -1090,6 +1220,16 @@ mod tests {
         (provider.to_string(), model.to_string())
     }
 
+    /// pick_admitted with a fresh (all-healthy) health tracker.
+    fn pick(
+        tracker: &ProviderRateTracker,
+        config: &Config,
+        candidates: Vec<(String, String)>,
+        model: &str,
+    ) -> Result<(String, String)> {
+        pick_admitted(tracker, &ProviderHealth::new(), config, candidates, model)
+    }
+
     #[test]
     fn pick_admitted_skips_exhausted_provider() {
         let tracker = ProviderRateTracker::new();
@@ -1105,7 +1245,7 @@ mod tests {
         let cfg = config.provider_config("moonshot").unwrap();
         tracker.try_admit("moonshot", cfg).unwrap();
 
-        let picked = pick_admitted(
+        let picked = pick(
             &tracker,
             &config,
             vec![
@@ -1131,7 +1271,7 @@ mod tests {
         let cfg = config.provider_config("moonshot").unwrap();
         tracker.try_admit("moonshot", cfg).unwrap();
 
-        let err = pick_admitted(
+        let err = pick(
             &tracker,
             &config,
             vec![candidate("moonshot", "kimi-k2")],
@@ -1157,9 +1297,9 @@ mod tests {
         );
 
         let candidates = vec![candidate("moonshot", "kimi-k2")];
-        assert!(pick_admitted(&tracker, &config, candidates.clone(), "kimi-k2").is_ok());
+        assert!(pick(&tracker, &config, candidates.clone(), "kimi-k2").is_ok());
         assert!(
-            pick_admitted(&tracker, &config, candidates, "kimi-k2").is_err(),
+            pick(&tracker, &config, candidates, "kimi-k2").is_err(),
             "admission must have consumed the rpm=1 budget"
         );
     }
@@ -1198,12 +1338,75 @@ mod tests {
         prefer_provider(&mut candidates, "anthropic");
 
         // Turn 1: session sticks to its previous provider.
-        let picked = pick_admitted(&tracker, &config, candidates.clone(), "m").unwrap();
+        let picked = pick(&tracker, &config, candidates.clone(), "m").unwrap();
         assert_eq!(picked.0, "anthropic");
 
         // Turn 2: sticky provider's window exhausted — fall through, don't fail.
-        let picked = pick_admitted(&tracker, &config, candidates, "m").unwrap();
+        let picked = pick(&tracker, &config, candidates, "m").unwrap();
         assert_eq!(picked.0, "openai");
+    }
+
+    #[test]
+    fn cooling_provider_is_deprioritized_not_blocked() {
+        let tracker = ProviderRateTracker::new();
+        let health = ProviderHealth::new();
+        let config = config_with_provider("moonshot", ProviderConfig::default());
+        let cooldown = std::time::Duration::from_secs(60);
+        for _ in 0..3 {
+            health.record_failure("openai", cooldown);
+        }
+
+        // Healthy candidate wins even though the cooling one is listed first.
+        let candidates = vec![candidate("openai", "m"), candidate("groq", "m")];
+        let picked = pick_admitted(&tracker, &health, &config, candidates, "m").unwrap();
+        assert_eq!(picked.0, "groq", "cooling provider sorted behind healthy");
+
+        // A cooling provider as the ONLY candidate still dispatches.
+        let picked = pick_admitted(
+            &tracker,
+            &health,
+            &config,
+            vec![candidate("openai", "m")],
+            "m",
+        )
+        .unwrap();
+        assert_eq!(picked.0, "openai", "cooldown deprioritizes, never blocks");
+    }
+
+    #[test]
+    fn provider_fault_classification() {
+        let upstream_timeout = anyhow::Error::new(ProxyTimeoutError::Upstream {
+            provider: "openai".to_string(),
+            timeout: std::time::Duration::from_secs(360),
+        });
+        assert!(is_provider_fault(&upstream_timeout));
+
+        let queue_timeout = anyhow::Error::new(ProxyTimeoutError::ProviderQueue {
+            provider: "openai".to_string(),
+            timeout: std::time::Duration::from_secs(60),
+        });
+        assert!(
+            !is_provider_fault(&queue_timeout),
+            "our own queue capacity is not the provider's fault"
+        );
+
+        let upstream_500 = anyhow::anyhow!("openai API error 503 Service Unavailable");
+        assert!(is_provider_fault(&upstream_500));
+
+        let upstream_429 = anyhow::anyhow!("anthropic API error 429 Too Many Requests");
+        assert!(is_provider_fault(&upstream_429));
+
+        let client_400 = anyhow::anyhow!("ollama API error 400 Bad Request: prompt too long");
+        assert!(
+            !is_provider_fault(&client_400),
+            "4xx is the request's fault — every provider rejects it"
+        );
+
+        let connect_error = anyhow::anyhow!("connection refused");
+        assert!(
+            is_provider_fault(&connect_error),
+            "transport errors without a status are provider-side"
+        );
     }
 
     #[test]
@@ -1213,8 +1416,7 @@ mod tests {
 
         // Unlisted provider and listed-but-unlimited provider both admit.
         for provider in ["ollama", "moonshot"] {
-            let picked =
-                pick_admitted(&tracker, &config, vec![candidate(provider, "m")], "m").unwrap();
+            let picked = pick(&tracker, &config, vec![candidate(provider, "m")], "m").unwrap();
             assert_eq!(picked.0, provider);
         }
     }

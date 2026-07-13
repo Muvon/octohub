@@ -68,6 +68,8 @@ Defined in `src/config.rs:83`. All keys optional except as noted.
 | `trust_forwarded_for` | `false` | Honor `Forwarded` / `X-Forwarded-For` for the `remote` log field. **Only enable behind a trusted reverse proxy** — see [08 — Deployment](./08-deployment.md#x-forwarded-for). |
 | `provider_queue_timeout_secs` | `60` | Maximum wait for a provider concurrency permit. Exceeding it returns `503`. |
 | `upstream_timeout_secs` | `360` | Maximum duration of the complete provider operation, including octolib retries. Exceeding it returns `504`. |
+| `failover_on_error` | `false` | Re-route provider-side failures (timeout, connect, 429, 5xx) to the next candidate provider of the model alias. 4xx never fails over. |
+| `provider_error_cooldown_secs` | `0` | After 3 consecutive provider-side failures, deprioritize the provider for this many seconds (used only when no healthy candidate admits). `0` = off. |
 
 The legacy alias `db_path` is also accepted and treated as `db_url`
 (`src/config.rs:98`).
@@ -211,6 +213,8 @@ loaded (`src/config.rs:190`).
 | `OCTOHUB_DB_URL` | `[server].db_url` | Useful in containerized deployments. |
 | `OCTOHUB_PROVIDER_QUEUE_TIMEOUT_SECS` | `[server].provider_queue_timeout_secs` | Overrides the provider queue deadline. |
 | `OCTOHUB_UPSTREAM_TIMEOUT_SECS` | `[server].upstream_timeout_secs` | Overrides the complete upstream operation deadline. |
+| `OCTOHUB_FAILOVER_ON_ERROR` | `[server].failover_on_error` | `true`/`1` enables provider failover. |
+| `OCTOHUB_PROVIDER_ERROR_COOLDOWN_SECS` | `[server].provider_error_cooldown_secs` | Overrides the provider cooldown duration. |
 | `OCTOHUB_HOST` | `[server].host` | Only when no config file is loaded. |
 | `OCTOHUB_PORT` | `[server].port` | Only when no config file is loaded. |
 | `OCTOHUB_LOG_FORMAT` | `[logging].format` | `auto`, `pretty`, or `json`. |
@@ -250,7 +254,8 @@ per_key = false
 # Single-provider
 "minimax-m2.7" = ["minimax:minimax-m2.7"]
 
-# Multi-provider fallback (random pick — OctoHub does not retry on failure)
+# Multi-provider (random pick; enable [server].failover_on_error to retry
+# provider-side failures on the next candidate)
 "my-fast" = ["openai:gpt-5-nano", "groq:llama-3.1-8b-instant"]
 
 # Self-hosted with a local model

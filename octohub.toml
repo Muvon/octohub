@@ -10,6 +10,10 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 # trust_forwarded_for = false   # Only enable behind a trusted reverse proxy
 # provider_queue_timeout_secs = 60  # Max wait for provider capacity
 # upstream_timeout_secs = 360       # Complete provider operation, including retries
+# failover_on_error = false         # Retry the next candidate provider on provider-side
+#                                   # errors (timeout, connect, 429, 5xx); 4xx never fails over
+# provider_error_cooldown_secs = 0  # After 3 consecutive provider-side failures, deprioritize
+#                                   # the provider for this many seconds (0 = off)
 
 # [logging]
 # format = "auto"               # auto (pretty if TTY, else JSON), pretty, or json

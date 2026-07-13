@@ -9,7 +9,8 @@ use crate::api::types::{
 };
 use crate::auth::{authenticate_client, ClientAuth};
 use crate::proxy::engine::{
-    ProxyEngine, ProxyTimeoutError, RateLimitedError, MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
+    upstream_status_code, ProxyEngine, ProxyTimeoutError, RateLimitedError, MODEL_FORBIDDEN_MARKER,
+    OWNER_LIMIT_MARKER,
 };
 use crate::storage::Storage;
 
@@ -330,19 +331,6 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
     // the outer wrap. Without this the client gets a useless top message and has
     // to read server logs to diagnose anything.
     (StatusCode::INTERNAL_SERVER_ERROR, full)
-}
-
-/// Extract the upstream HTTP status embedded in an octolib provider error.
-/// octolib formats provider failures as "... API error <code> <message>", e.g.
-/// "ollama API error 400 Bad Request: ...". Returns the first such code, if any.
-fn upstream_status_code(msg: &str) -> Option<u16> {
-    const MARKER: &str = "API error ";
-    let start = msg.find(MARKER)? + MARKER.len();
-    let digits: String = msg[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
 }
 
 /// Handle POST /v1/chat/completions (classic OpenAI-compatible)
