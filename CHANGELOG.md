@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] - 2026-07-13
+
+### 📋 Release Summary
+
+This release introduces advanced provider management, including automated failover, health tracking, and intelligent rate limiting to ensure higher service availability (34ad5616, d5cae7ef). Additionally, session stability is improved through new provider stickiness for multi-turn conversations (c826a39d).
+
+
+### ✨ New Features & Enhancements
+
+- **proxy**: implement provider failover and health tracking `34ad5616`
+- **proxy**: add provider stickiness for multi-turn sessions `c826a39d`
+- **proxy**: implement provider rate limiting and rotation `d5cae7ef`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.3.0] - 2026-07-12
 
 ### 📋 Release Summary
