@@ -103,7 +103,10 @@ Both are `HashMap<String, Vec<String>>` (`src/config.rs:66`).
 Each value is a list of `provider:model` strings. When a request
 arrives, OctoHub starts from a random entry and takes the first whose
 provider [rate windows](#providersname) admit the request — that's the
-simple load-balancing mechanism.
+simple load-balancing mechanism. Requests continuing a chain
+(`previous_completion_id`) prefer the provider that served the previous
+turn (keeps provider-side prompt caches warm), falling back to the
+others only when its rate windows are exhausted.
 
 If a request's `model` field is *already* in `provider:model` form (it
 contains a colon), the config map is bypassed and that exact upstream is

@@ -191,6 +191,9 @@ impl ProxyEngine {
         let mut resolved_prev_id: Option<String> = None;
         // session_id inherited from the tail of the resolved chain.
         let mut inherited_session_id: Option<String> = None;
+        // Provider that served the previous turn — preferred at resolution so
+        // multi-turn sessions keep hitting the same provider-side prompt cache.
+        let mut sticky_provider: Option<String> = None;
 
         if let Some(ref prev_cmpl_id) = req.previous_completion_id {
             // Unknown IDs are tolerated — the client may be migrating from a stateless
@@ -220,8 +223,10 @@ impl ProxyEngine {
                 }
             };
 
-            // Inherit session_id from the most recent (last) chain entry.
+            // Inherit session_id and the serving provider from the most
+            // recent (last) chain entry.
             inherited_session_id = chain.last().map(|c| c.session_id.clone());
+            sticky_provider = chain.last().map(|c| c.provider.clone());
 
             for stored in &chain {
                 // Fall back to chain-stored instructions only if the request didn't
@@ -255,12 +260,16 @@ impl ProxyEngine {
             }
         }
 
-        // 4. Resolve provider and model via config. Candidates whose rate
-        //    windows are exhausted are skipped; all exhausted → 429 with
-        //    Retry-After (see `pick_admitted`).
-        let candidates = config
+        // 4. Resolve provider and model via config. The chain's previous
+        //    provider is preferred (provider-side prompt caches are per
+        //    provider); candidates whose rate windows are exhausted are
+        //    skipped; all exhausted → 429 with Retry-After (`pick_admitted`).
+        let mut candidates = config
             .model_candidates(&req.model)
             .with_context(|| format!("Failed to resolve model '{}'", req.model))?;
+        if let Some(ref sticky) = sticky_provider {
+            prefer_provider(&mut candidates, sticky);
+        }
         let (provider_name, resolved_model) =
             pick_admitted(&self.rate_tracker, &config, candidates, &req.model)?;
 
@@ -991,6 +1000,14 @@ fn attach_thinking_to_assistant(messages: &mut Vec<Message>, text: String) {
 /// Reject the request if `api_key.allowed_models` is set and `model` isn't
 /// in it. The error message embeds `MODEL_FORBIDDEN_MARKER` so the HTTP
 /// layer can return `403 Forbidden` rather than the default 400/500.
+/// Move `provider`'s candidates to the front (stable — order among the rest
+/// is preserved) so a session sticks to the provider that served its chain
+/// and keeps the provider-side prompt cache warm. `pick_admitted` still
+/// falls through to the others when the preferred windows are exhausted.
+fn prefer_provider(candidates: &mut [(String, String)], provider: &str) {
+    candidates.sort_by_key(|(p, _)| !p.eq_ignore_ascii_case(provider));
+}
+
 /// Pick the first candidate whose provider rate windows admit a request
 /// (counting it against the winner's windows). Exhausted candidates are
 /// skipped; when ALL are exhausted the caller gets [`RateLimitedError`]
@@ -1145,6 +1162,48 @@ mod tests {
             pick_admitted(&tracker, &config, candidates, "kimi-k2").is_err(),
             "admission must have consumed the rpm=1 budget"
         );
+    }
+
+    #[test]
+    fn prefer_provider_moves_sticky_to_front_preserving_rest() {
+        let mut candidates = vec![
+            candidate("openai", "m"),
+            candidate("groq", "m"),
+            candidate("Anthropic", "m"),
+        ];
+        prefer_provider(&mut candidates, "anthropic");
+        assert_eq!(
+            candidates,
+            vec![
+                candidate("Anthropic", "m"),
+                candidate("openai", "m"),
+                candidate("groq", "m"),
+            ],
+            "sticky provider first (case-insensitive), others keep order"
+        );
+    }
+
+    #[test]
+    fn sticky_provider_wins_until_exhausted() {
+        let tracker = ProviderRateTracker::new();
+        let config = config_with_provider(
+            "anthropic",
+            ProviderConfig {
+                requests_per_minute: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let mut candidates = vec![candidate("openai", "m"), candidate("anthropic", "m")];
+        prefer_provider(&mut candidates, "anthropic");
+
+        // Turn 1: session sticks to its previous provider.
+        let picked = pick_admitted(&tracker, &config, candidates.clone(), "m").unwrap();
+        assert_eq!(picked.0, "anthropic");
+
+        // Turn 2: sticky provider's window exhausted — fall through, don't fail.
+        let picked = pick_admitted(&tracker, &config, candidates, "m").unwrap();
+        assert_eq!(picked.0, "openai");
     }
 
     #[test]

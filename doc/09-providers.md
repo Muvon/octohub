@@ -204,8 +204,13 @@ The `[models]` table is just a `HashMap<String, Vec<String>>`
 (`src/config.rs:66`). Each value is a list of `provider:model` strings.
 At request time, OctoHub starts from a random entry and takes the first
 whose provider rate windows admit the request (see
-[rate windows](#rate-windows-requests_per_minute-tokens_per_minute-)) —
-there's no stickiness, no round-robin state, no health-awareness.
+[rate windows](#rate-windows-requests_per_minute-tokens_per_minute-)).
+One exception to the random start: a request continuing a chain
+(`previous_completion_id`) prefers the provider that served the
+previous turn, so provider-side prompt caches survive multi-turn
+sessions — it only moves to another candidate when that provider's
+rate windows are exhausted. There's no other stickiness, no round-robin
+state, no health-awareness.
 
 ```toml
 [models]
