@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::api::types::*;
 use crate::config::Config;
-use crate::proxy::limiter::{OwnerLimiter, ProviderLimiter, OWNER_QUEUE_WAIT};
+use crate::proxy::limiter::{OwnerLimiter, ProviderLimiter, ProviderRateTracker, OWNER_QUEUE_WAIT};
 use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
 
 /// Marker added to model-restriction errors so the HTTP layer can map them
@@ -54,6 +54,28 @@ impl std::fmt::Display for ProxyTimeoutError {
 
 impl std::error::Error for ProxyTimeoutError {}
 
+/// Every candidate provider for the requested model had an exhausted rate
+/// window. The handler maps this to HTTP 429 with a `Retry-After` of
+/// `retry_after` — the soonest any candidate's window frees up.
+#[derive(Debug)]
+pub struct RateLimitedError {
+    pub model: String,
+    pub retry_after: std::time::Duration,
+}
+
+impl std::fmt::Display for RateLimitedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rate limit reached for model '{}' on all providers — retry in {}s",
+            self.model,
+            self.retry_after.as_secs().max(1)
+        )
+    }
+}
+
+impl std::error::Error for RateLimitedError {}
+
 /// Result of `process_embedding`. Carries telemetry alongside the response so
 /// the HTTP handler can label `octohub_embedding_*` metrics with the resolved
 /// provider name and the approximate input token count — neither of which is
@@ -78,6 +100,10 @@ pub struct ProxyEngine {
     /// not `Live`: state comes from the key rows, not config, and must survive
     /// SIGHUP so in-flight accounting is never reset by a reload.
     owner_limiter: Arc<OwnerLimiter>,
+    /// Per-provider request/token windows. Plain Arc for the same reason as
+    /// `owner_limiter`: a SIGHUP reload must update the LIMITS (read from the
+    /// live config at admission) without zeroing the day's counters.
+    rate_tracker: Arc<ProviderRateTracker>,
 }
 
 impl ProxyEngine {
@@ -91,6 +117,7 @@ impl ProxyEngine {
             config,
             limiter,
             owner_limiter: Arc::new(OwnerLimiter::new()),
+            rate_tracker: Arc::new(ProviderRateTracker::new()),
         }
     }
 
@@ -228,10 +255,14 @@ impl ProxyEngine {
             }
         }
 
-        // 4. Resolve provider and model via config
-        let (provider_name, resolved_model) = config
-            .resolve_model(&req.model)
+        // 4. Resolve provider and model via config. Candidates whose rate
+        //    windows are exhausted are skipped; all exhausted → 429 with
+        //    Retry-After (see `pick_admitted`).
+        let candidates = config
+            .model_candidates(&req.model)
             .with_context(|| format!("Failed to resolve model '{}'", req.model))?;
+        let (provider_name, resolved_model) =
+            pick_admitted(&self.rate_tracker, &config, candidates, &req.model)?;
 
         // Record provider in request span
         tracing::Span::current().record("provider", provider_name.as_str());
@@ -434,6 +465,17 @@ impl ProxyEngine {
             request_time_ms: exchange_usage.as_ref().and_then(|u| u.request_time_ms),
         };
 
+        // Feed actual usage back into the provider's rate windows — the
+        // request itself was counted at admission, tokens only now that the
+        // provider reported them. `max` covers providers whose total_tokens
+        // is absent (0) but that still report the split counts.
+        self.rate_tracker.record_tokens(
+            &provider_name,
+            usage
+                .total_tokens
+                .max(usage.input_tokens + usage.output_tokens),
+        );
+
         let response = CreateCompletionResponse {
             id: completion_id.clone(),
             object: "completion",
@@ -500,10 +542,13 @@ impl ProxyEngine {
 
         let start = std::time::Instant::now();
 
-        // 1. Resolve provider and model
-        let (provider_name, resolved_model) = config
-            .resolve_embedding_model(&req.model)
+        // 1. Resolve provider and model — same rate-window admission as
+        //    completions (both drain the same provider windows).
+        let candidates = config
+            .embedding_model_candidates(&req.model)
             .with_context(|| format!("Failed to resolve embedding model '{}'", req.model))?;
+        let (provider_name, resolved_model) =
+            pick_admitted(&self.rate_tracker, &config, candidates, &req.model)?;
 
         // Record provider in request span
         tracing::Span::current().record("provider", provider_name.as_str());
@@ -563,6 +608,10 @@ impl ProxyEngine {
         let upstream_duration = upstream_start.elapsed();
         tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
         drop(_permit);
+
+        // Embeddings drain the same provider token windows as completions.
+        self.rate_tracker
+            .record_tokens(&provider_name, usage_calc.input_tokens);
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -942,6 +991,41 @@ fn attach_thinking_to_assistant(messages: &mut Vec<Message>, text: String) {
 /// Reject the request if `api_key.allowed_models` is set and `model` isn't
 /// in it. The error message embeds `MODEL_FORBIDDEN_MARKER` so the HTTP
 /// layer can return `403 Forbidden` rather than the default 400/500.
+/// Pick the first candidate whose provider rate windows admit a request
+/// (counting it against the winner's windows). Exhausted candidates are
+/// skipped; when ALL are exhausted the caller gets [`RateLimitedError`]
+/// carrying the soonest retry among them.
+fn pick_admitted(
+    tracker: &ProviderRateTracker,
+    config: &Config,
+    candidates: Vec<(String, String)>,
+    model: &str,
+) -> Result<(String, String)> {
+    let mut soonest_retry: Option<std::time::Duration> = None;
+    for (provider, resolved) in candidates {
+        // No [providers.<name>] section (or no rate limits in it) — admit.
+        let Some(provider_cfg) = config.provider_config(&provider) else {
+            return Ok((provider, resolved));
+        };
+        match tracker.try_admit(&provider, provider_cfg) {
+            Ok(()) => return Ok((provider, resolved)),
+            Err(retry) => {
+                tracing::info!(
+                    provider = %provider,
+                    retry_in_s = retry.as_secs(),
+                    "provider rate window exhausted — skipping candidate"
+                );
+                crate::metrics::record_rate_limited(&provider);
+                soonest_retry = Some(soonest_retry.map_or(retry, |s| s.min(retry)));
+            }
+        }
+    }
+    Err(anyhow!(RateLimitedError {
+        model: model.to_string(),
+        retry_after: soonest_retry.unwrap_or_default(),
+    }))
+}
+
 fn ensure_model_allowed(api_key: &ApiKey, model: &str) -> Result<()> {
     if api_key.is_model_allowed(model) {
         return Ok(());
@@ -969,6 +1053,112 @@ impl serde::Serialize for Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderConfig;
+    use std::collections::HashMap;
+
+    fn config_with_provider(name: &str, cfg: ProviderConfig) -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(name.to_string(), cfg);
+        Config {
+            server: Default::default(),
+            models: HashMap::new(),
+            embedding_models: HashMap::new(),
+            providers,
+            logging: Default::default(),
+            metrics: Default::default(),
+        }
+    }
+
+    fn candidate(provider: &str, model: &str) -> (String, String) {
+        (provider.to_string(), model.to_string())
+    }
+
+    #[test]
+    fn pick_admitted_skips_exhausted_provider() {
+        let tracker = ProviderRateTracker::new();
+        let config = config_with_provider(
+            "moonshot",
+            ProviderConfig {
+                requests_per_minute: Some(1),
+                ..Default::default()
+            },
+        );
+
+        // Consume moonshot's single request slot.
+        let cfg = config.provider_config("moonshot").unwrap();
+        tracker.try_admit("moonshot", cfg).unwrap();
+
+        let picked = pick_admitted(
+            &tracker,
+            &config,
+            vec![
+                candidate("moonshot", "kimi-k2"),
+                candidate("ollama", "kimi-k2"),
+            ],
+            "kimi-k2",
+        )
+        .unwrap();
+        assert_eq!(picked.0, "ollama", "exhausted first candidate is skipped");
+    }
+
+    #[test]
+    fn pick_admitted_fails_429_when_all_exhausted() {
+        let tracker = ProviderRateTracker::new();
+        let config = config_with_provider(
+            "moonshot",
+            ProviderConfig {
+                requests_per_minute: Some(1),
+                ..Default::default()
+            },
+        );
+        let cfg = config.provider_config("moonshot").unwrap();
+        tracker.try_admit("moonshot", cfg).unwrap();
+
+        let err = pick_admitted(
+            &tracker,
+            &config,
+            vec![candidate("moonshot", "kimi-k2")],
+            "kimi-k2",
+        )
+        .expect_err("all candidates exhausted");
+        let rate = err
+            .downcast_ref::<RateLimitedError>()
+            .expect("typed error for the 429 mapping");
+        assert_eq!(rate.model, "kimi-k2");
+        assert!(rate.retry_after > std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn pick_admitted_counts_the_winning_request() {
+        let tracker = ProviderRateTracker::new();
+        let config = config_with_provider(
+            "moonshot",
+            ProviderConfig {
+                requests_per_minute: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let candidates = vec![candidate("moonshot", "kimi-k2")];
+        assert!(pick_admitted(&tracker, &config, candidates.clone(), "kimi-k2").is_ok());
+        assert!(
+            pick_admitted(&tracker, &config, candidates, "kimi-k2").is_err(),
+            "admission must have consumed the rpm=1 budget"
+        );
+    }
+
+    #[test]
+    fn pick_admitted_ignores_providers_without_config() {
+        let tracker = ProviderRateTracker::new();
+        let config = config_with_provider("moonshot", ProviderConfig::default());
+
+        // Unlisted provider and listed-but-unlimited provider both admit.
+        for provider in ["ollama", "moonshot"] {
+            let picked =
+                pick_admitted(&tracker, &config, vec![candidate(provider, "m")], "m").unwrap();
+            assert_eq!(picked.0, provider);
+        }
+    }
 
     fn item(json: &str) -> InputItem {
         serde_json::from_str(json).unwrap()

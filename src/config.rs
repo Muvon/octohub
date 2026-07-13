@@ -111,6 +111,8 @@ pub struct ServerConfig {
 }
 
 /// Per-provider configuration knobs.
+///
+/// Every limit shares one contract: absent or `0` = unlimited.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProviderConfig {
     /// Max in-flight requests this process will send to this provider.
@@ -118,6 +120,36 @@ pub struct ProviderConfig {
     /// connection hangs) until a permit is released. `None` = unlimited.
     #[serde(default)]
     pub concurrency: Option<u32>,
+    /// Max requests admitted per fixed 60s window (provider "RPM").
+    #[serde(default)]
+    pub requests_per_minute: Option<u64>,
+    /// Max tokens per fixed 60s window (provider "TPM"). Counted from the
+    /// provider-reported usage (input + output) AFTER each response — a
+    /// request is rejected once the window's budget is already spent, not
+    /// pre-reserved.
+    #[serde(default)]
+    pub tokens_per_minute: Option<u64>,
+    /// Max requests admitted per UTC day (provider "RPD").
+    #[serde(default)]
+    pub requests_per_day: Option<u64>,
+    /// Max tokens per UTC day (provider "TPD").
+    #[serde(default)]
+    pub tokens_per_day: Option<u64>,
+}
+
+impl ProviderConfig {
+    /// True when any request/token window is configured with a positive
+    /// value (0 = unlimited, same contract as absent).
+    pub fn has_rate_limits(&self) -> bool {
+        [
+            self.requests_per_minute,
+            self.tokens_per_minute,
+            self.requests_per_day,
+            self.tokens_per_day,
+        ]
+        .iter()
+        .any(|l| l.is_some_and(|n| n > 0))
+    }
 }
 
 fn default_host() -> String {
@@ -238,32 +270,49 @@ impl Config {
         config
     }
 
-    /// Resolve a model name to (provider, model_name)
-    /// If model is already in "provider:model" format, use directly
-    /// Otherwise look up in config and randomly pick one from the list
-    pub fn resolve_model(&self, model: &str) -> Result<(String, String)> {
-        self.resolve_from_map(model, &self.models, "model")
+    /// All (provider, model_name) candidates for `model`, rotated to a
+    /// random starting point so load still spreads across entries while
+    /// letting the caller fall through to the next candidate when one is
+    /// rate-limited. A direct "provider:model" input yields one candidate.
+    pub fn model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
+        self.candidates_from_map(model, &self.models, "model")
     }
 
-    /// Resolve an embedding model name to (provider, model_name)
-    pub fn resolve_embedding_model(&self, model: &str) -> Result<(String, String)> {
-        self.resolve_from_map(model, &self.embedding_models, "embedding model")
+    /// Embedding counterpart of [`model_candidates`](Self::model_candidates).
+    pub fn embedding_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
+        self.candidates_from_map(model, &self.embedding_models, "embedding model")
     }
 
-    fn resolve_from_map(
+    /// Case-insensitive `[providers.<name>]` lookup — the limiter lowercases
+    /// its keys the same way (`ProviderLimiter::from_config`).
+    pub fn provider_config(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, cfg)| cfg)
+    }
+
+    fn candidates_from_map(
         &self,
         model: &str,
         map: &HashMap<String, Vec<String>>,
         kind: &str,
-    ) -> Result<(String, String)> {
-        // Check if model is already in provider:model format
-        if let Some(pos) = model.find(':') {
-            let provider = model[..pos].to_string();
-            let model_name = model[pos + 1..].to_string();
-            return Ok((provider, model_name));
+    ) -> Result<Vec<(String, String)>> {
+        fn split(entry: &str, kind: &str) -> Result<(String, String)> {
+            let pos = entry.find(':').with_context(|| {
+                format!(
+                    "Invalid {} mapping '{}': expected 'provider:model' format",
+                    kind, entry
+                )
+            })?;
+            Ok((entry[..pos].to_string(), entry[pos + 1..].to_string()))
         }
 
-        // Look up model in config mapping
+        // Model already in provider:model format — single fixed candidate.
+        if model.contains(':') {
+            return Ok(vec![split(model, kind)?]);
+        }
+
         let providers = map.get(model).with_context(|| {
             format!(
                 "{} '{}' not found in config. Available: {}",
@@ -272,25 +321,19 @@ impl Config {
                 map.keys().cloned().collect::<Vec<_>>().join(", ")
             )
         })?;
+        if providers.is_empty() {
+            anyhow::bail!("{} '{}' has an empty provider list in config", kind, model);
+        }
 
-        // Randomly pick one provider from the list
-        let idx = (std::time::SystemTime::now()
+        let start = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as usize)
             % providers.len();
 
-        let selected = &providers[idx];
-
-        let pos = selected.find(':').context(format!(
-            "Invalid {} mapping '{}': expected 'provider:model' format",
-            kind, selected
-        ))?;
-
-        let provider = selected[..pos].to_string();
-        let model_name = selected[pos + 1..].to_string();
-
-        Ok((provider, model_name))
+        (0..providers.len())
+            .map(|i| split(&providers[(start + i) % providers.len()], kind))
+            .collect()
     }
 }
 
@@ -303,6 +346,101 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(config.provider_queue_timeout_secs, 60);
         assert_eq!(config.upstream_timeout_secs, 360);
+    }
+
+    #[test]
+    fn provider_rate_limits_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            api_key = ""
+
+            [providers.moonshot]
+            concurrency = 50
+            requests_per_minute = 200
+            tokens_per_minute = 128000
+            requests_per_day = 5000
+            tokens_per_day = 1500000
+            "#,
+        )
+        .unwrap();
+
+        let cfg = config.provider_config("moonshot").unwrap();
+        assert_eq!(cfg.concurrency, Some(50));
+        assert_eq!(cfg.requests_per_minute, Some(200));
+        assert_eq!(cfg.tokens_per_minute, Some(128000));
+        assert_eq!(cfg.requests_per_day, Some(5000));
+        assert_eq!(cfg.tokens_per_day, Some(1500000));
+        assert!(cfg.has_rate_limits());
+    }
+
+    #[test]
+    fn zero_and_unset_limits_mean_unlimited() {
+        let none = ProviderConfig::default();
+        assert!(!none.has_rate_limits());
+
+        let zeroed = ProviderConfig {
+            requests_per_minute: Some(0),
+            tokens_per_minute: Some(0),
+            requests_per_day: Some(0),
+            tokens_per_day: Some(0),
+            ..Default::default()
+        };
+        assert!(!zeroed.has_rate_limits());
+    }
+
+    #[test]
+    fn provider_config_lookup_is_case_insensitive() {
+        let mut providers = HashMap::new();
+        providers.insert("OpenAI".to_string(), ProviderConfig::default());
+        let config = Config {
+            server: Default::default(),
+            models: HashMap::new(),
+            embedding_models: HashMap::new(),
+            providers,
+            logging: Default::default(),
+            metrics: Default::default(),
+        };
+        assert!(config.provider_config("openai").is_some());
+        assert!(config.provider_config("OPENAI").is_some());
+        assert!(config.provider_config("ollama").is_none());
+    }
+
+    #[test]
+    fn model_candidates_cover_all_entries_and_direct_format() {
+        let mut models = HashMap::new();
+        models.insert(
+            "fast".to_string(),
+            vec!["openai:gpt-5-nano".to_string(), "groq:llama".to_string()],
+        );
+        let config = Config {
+            server: Default::default(),
+            models,
+            embedding_models: HashMap::new(),
+            providers: HashMap::new(),
+            logging: Default::default(),
+            metrics: Default::default(),
+        };
+
+        let mut candidates = config.model_candidates("fast").unwrap();
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![
+                ("groq".to_string(), "llama".to_string()),
+                ("openai".to_string(), "gpt-5-nano".to_string()),
+            ]
+        );
+
+        // Direct provider:model bypasses the mapping — one fixed candidate,
+        // colons after the first stay in the model name (ollama tags).
+        let direct = config.model_candidates("ollama:llama3.3:70b").unwrap();
+        assert_eq!(
+            direct,
+            vec![("ollama".to_string(), "llama3.3:70b".to_string())]
+        );
+
+        assert!(config.model_candidates("unknown").is_err());
     }
 
     #[test]

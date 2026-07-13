@@ -131,15 +131,20 @@ rate limit characteristics.
 
 ## Per-provider tuning
 
-The `[providers.<name>]` table in `octohub.toml` only exposes one knob
-today: `concurrency`. Source: `src/config.rs:107`–`114`.
+The `[providers.<name>]` table in `octohub.toml` exposes `concurrency`
+plus four rate windows. All keys optional; unset or `0` = unlimited.
+Source: `ProviderConfig` in `src/config.rs`.
 
 ```toml
 [providers.ollama]
 concurrency = 4     # max 4 in-flight requests to ollama
 
 [providers.openai]
-concurrency = 30    # cap below your rate limit
+concurrency = 30           # cap below your rate limit
+requests_per_minute = 500  # provider RPM
+tokens_per_minute = 30000  # provider TPM (actual input+output tokens)
+# requests_per_day = 10000 # provider RPD
+# tokens_per_day = 2500000 # provider TPD
 ```
 
 What it does:
@@ -165,12 +170,42 @@ What it does **not** do:
 - It does not retry on upstream failure. A provider returning 5xx
   releases its permit (the request is done) and the client gets a 5xx.
 
+### Rate windows (`requests_per_minute`, `tokens_per_minute`, …)
+
+The four window knobs track provider RPM/TPM/RPD/TPD quotas so the
+proxy stops sending before the provider starts 429ing
+(`ProviderRateTracker` in `src/proxy/limiter.rs`):
+
+- Requests are counted at dispatch; tokens from the provider-reported
+  usage after each response (completions and embeddings drain the same
+  windows).
+- A provider with an exhausted window is **skipped** during model
+  resolution when the alias lists other candidates. When every
+  candidate is exhausted, the client gets `429` with a `Retry-After`
+  header pointing at the soonest window reset — unlike `concurrency`,
+  the request is not queued (a day window may be hours away).
+- Windows are **fixed** (60s / UTC day), while providers meter rolling
+  windows — set values below your real quota for headroom. Counters
+  are in-memory: they survive SIGHUP reloads but reset on restart.
+- The `octohub_provider_rate_limited_total{provider}` counter tracks
+  every skip/rejection.
+
+Grounded baselines for Moonshot/Kimi, Z.ai, MiniMax, OpenAI, and
+Anthropic — with links to each provider's rate-limit docs — ship
+commented-out in [`octohub.toml`](../../octohub.toml). Two provider
+quirks worth knowing: Moonshot meters TPM as
+`input + max_completion_tokens` (pre-charged, so leave extra headroom),
+and Anthropic splits input/output limits (ITPM/OTPM) — set
+`tokens_per_minute` to your ITPM.
+
 ## Picking providers for a model alias
 
 The `[models]` table is just a `HashMap<String, Vec<String>>`
 (`src/config.rs:66`). Each value is a list of `provider:model` strings.
-At request time, OctoHub picks one at random — there's no stickiness,
-no round-robin state, no health-awareness.
+At request time, OctoHub starts from a random entry and takes the first
+whose provider rate windows admit the request (see
+[rate windows](#rate-windows-requests_per_minute-tokens_per_minute-)) —
+there's no stickiness, no round-robin state, no health-awareness.
 
 ```toml
 [models]

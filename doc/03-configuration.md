@@ -53,7 +53,7 @@ The default file ships in the repo root as [`octohub.toml`](../../octohub.toml).
 | `[metrics]` | table | `enabled=true`, `bind="127.0.0.1:9090"`, `per_key=false` | Prometheus endpoint |
 | `[models]` | table | `{}` | Short model name → list of `provider:model` strings |
 | `[embedding_models]` | table | `{}` | Same, for embedding calls |
-| `[providers.<name>]` | table | none | Per-provider tuning (currently: `concurrency`) |
+| `[providers.<name>]` | table | none | Per-provider tuning: `concurrency` + rate windows |
 
 ## `[server]`
 
@@ -101,12 +101,13 @@ The full list of exposed metrics is in
 
 Both are `HashMap<String, Vec<String>>` (`src/config.rs:66`).
 Each value is a list of `provider:model` strings. When a request
-arrives, OctoHub picks one at random — that's the simple load-balancing
-mechanism.
+arrives, OctoHub starts from a random entry and takes the first whose
+provider [rate windows](#providersname) admit the request — that's the
+simple load-balancing mechanism.
 
 If a request's `model` field is *already* in `provider:model` form (it
 contains a colon), the config map is bypassed and that exact upstream is
-used. See `Config::resolve_from_map` at `src/config.rs:224`.
+used. See `Config::model_candidates` in `src/config.rs`.
 
 ### Examples
 
@@ -140,9 +141,25 @@ as octolib returns it (`ollama`, `openai`, `anthropic`, `minimax`,
 `deepseek`, …). Lookup is case-insensitive at runtime
 (`src/proxy/limiter.rs:50`).
 
+All keys are optional; **unset or `0` = unlimited**.
+
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `concurrency` | `u32` (optional) | unlimited | Max in-flight requests to this provider. Beyond the limit, callers queue (the HTTP request blocks) until a permit frees up. |
+| `concurrency` | `u32` | unlimited | Max in-flight requests to this provider. Beyond the limit, callers queue (the HTTP request blocks) until a permit frees up. |
+| `requests_per_minute` | `u64` | unlimited | Max requests per fixed 60s window (provider "RPM"). |
+| `tokens_per_minute` | `u64` | unlimited | Max tokens per fixed 60s window (provider "TPM"). Counted from provider-reported usage (input + output) after each response. |
+| `requests_per_day` | `u64` | unlimited | Max requests per UTC day (provider "RPD"). |
+| `tokens_per_day` | `u64` | unlimited | Max tokens per UTC day (provider "TPD"). |
+
+Unlike `concurrency` (which queues), an exhausted rate window **skips**
+that provider when the model alias has other candidates, and returns
+`429` with a `Retry-After` header when every candidate is exhausted —
+you can't park a request until a day window resets. Windows are fixed,
+not rolling, and counters live in memory (reset on restart; they do
+survive SIGHUP reloads). Configure values below your real account
+limits to leave headroom. Grounded per-provider baselines with doc
+links ship commented-out in [`octohub.toml`](../../octohub.toml) — see
+also [09 — Providers](./09-providers.md#per-provider-tuning).
 
 ### When to set this
 

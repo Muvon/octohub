@@ -9,7 +9,7 @@ use crate::api::types::{
 };
 use crate::auth::{authenticate_client, ClientAuth};
 use crate::proxy::engine::{
-    ProxyEngine, ProxyTimeoutError, MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
+    ProxyEngine, ProxyTimeoutError, RateLimitedError, MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
 };
 use crate::storage::Storage;
 
@@ -34,6 +34,26 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
             }
         }),
     )
+}
+
+/// `error_response` plus a `Retry-After` header when the failure is a
+/// provider rate-window rejection, so well-behaved clients back off for
+/// exactly as long as the window needs.
+fn engine_error_response(
+    error: &anyhow::Error,
+    status: StatusCode,
+    message: &str,
+) -> Response<BoxBody> {
+    let mut response = error_response(status, message);
+    if let Some(rate) = error.downcast_ref::<RateLimitedError>() {
+        let secs = rate.retry_after.as_secs().max(1);
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&secs.to_string()) {
+            response
+                .headers_mut()
+                .insert(hyper::header::RETRY_AFTER, value);
+        }
+    }
+    response
 }
 
 /// Extract Authorization header value from request
@@ -140,7 +160,7 @@ pub async fn handle_create_completion(
                 per_key,
             );
 
-            error_response(status, &msg)
+            engine_error_response(&e, status, &msg)
         }
     }
 }
@@ -235,7 +255,7 @@ pub async fn handle_create_embedding(
                 per_key,
             );
 
-            error_response(status, &msg)
+            engine_error_response(&e, status, &msg)
         }
     }
 }
@@ -264,6 +284,12 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
             .replace(&format!("{}: ", MODEL_FORBIDDEN_MARKER), "")
             .replace(MODEL_FORBIDDEN_MARKER, "");
         return (StatusCode::FORBIDDEN, cleaned);
+    }
+
+    if error.downcast_ref::<RateLimitedError>().is_some() {
+        // Every candidate provider's rate window is exhausted — retryable,
+        // just not yet. `engine_error_response` adds the Retry-After header.
+        return (StatusCode::TOO_MANY_REQUESTS, top);
     }
 
     if top.contains(OWNER_LIMIT_MARKER) {
@@ -419,7 +445,7 @@ pub async fn handle_chat_completion(
                 per_key,
             );
 
-            error_response(status, &msg)
+            engine_error_response(&e, status, &msg)
         }
     }
 }
@@ -470,6 +496,47 @@ mod tests {
             !msg.contains(OWNER_LIMIT_MARKER),
             "internal marker must be stripped from the client message"
         );
+    }
+
+    #[test]
+    fn rate_limited_maps_to_429_with_retry_after_header() {
+        let error = anyhow::anyhow!(RateLimitedError {
+            model: "kimi-k2".to_string(),
+            retry_after: std::time::Duration::from_secs(37),
+        });
+        let (status, msg) = classify_engine_error(&error);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(msg.contains("kimi-k2"));
+
+        let response = engine_error_response(&error, status, &msg);
+        assert_eq!(
+            response.headers().get(hyper::header::RETRY_AFTER).unwrap(),
+            "37"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_at_least_one_second() {
+        // A sub-second window remainder must not round down to "0" — that
+        // tells clients to retry immediately, defeating the backoff.
+        let error = anyhow::anyhow!(RateLimitedError {
+            model: "m".to_string(),
+            retry_after: std::time::Duration::from_millis(200),
+        });
+        let (status, msg) = classify_engine_error(&error);
+        let response = engine_error_response(&error, status, &msg);
+        assert_eq!(
+            response.headers().get(hyper::header::RETRY_AFTER).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn non_rate_limit_errors_get_no_retry_after() {
+        let error = anyhow::anyhow!("database connection lost");
+        let (status, msg) = classify_engine_error(&error);
+        let response = engine_error_response(&error, status, &msg);
+        assert!(response.headers().get(hyper::header::RETRY_AFTER).is_none());
     }
 
     #[test]

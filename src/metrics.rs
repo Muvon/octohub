@@ -101,6 +101,10 @@ pub fn init(cfg: &MetricsConfig) -> Result<Option<metrics_exporter_prometheus::P
         "octohub_provider_in_flight",
         "In-flight requests per provider"
     );
+    describe_counter!(
+        "octohub_provider_rate_limited_total",
+        "Times a provider candidate was skipped because a rate window was exhausted"
+    );
 
     // Build info gauge — constant, identifies the running version.
     gauge!("octohub_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
@@ -190,6 +194,11 @@ pub fn record_request(route: &str, method: &str, status: u16, duration: Duration
     counter!("octohub_requests_total", "route" => route.clone(), "method" => method.clone(), "status" => status_str).increment(1);
     histogram!("octohub_request_duration_seconds", "route" => route, "method" => method)
         .record(duration.as_secs_f64());
+}
+
+pub fn record_rate_limited(provider: &str) {
+    counter!("octohub_provider_rate_limited_total", "provider" => provider.to_string())
+        .increment(1);
 }
 
 pub fn in_flight_guard(route: &'static str) -> InFlightGuard {

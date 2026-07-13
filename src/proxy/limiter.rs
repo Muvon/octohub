@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::Config;
+use crate::config::{Config, ProviderConfig};
 
 /// Per-provider concurrency gate.
 ///
@@ -125,6 +126,162 @@ impl Default for OwnerLimiter {
     }
 }
 
+/// Fixed 60s window backing the `*_per_minute` limits.
+const MINUTE_WINDOW: Duration = Duration::from_secs(60);
+const SECS_PER_DAY: u64 = 86_400;
+
+/// Per-provider request/token accounting over two fixed windows — 60s and
+/// UTC day — backing the `requests_per_minute` / `tokens_per_minute` /
+/// `requests_per_day` / `tokens_per_day` provider limits (absent or 0 =
+/// unlimited, same contract as `concurrency`).
+///
+/// Held as a plain `Arc` (like [`OwnerLimiter`]) so counters survive SIGHUP
+/// config reloads: only the counters live here, the limits are read from the
+/// live config snapshot at admission time. Counters are in-memory only — a
+/// process restart forgets the day's usage.
+///
+/// ponytail: fixed windows can admit ~2x a limit across a window boundary
+/// while providers meter rolling windows — configure limits below the real
+/// quota; sliding windows are the upgrade if that headroom ever hurts.
+pub struct ProviderRateTracker {
+    states: std::sync::Mutex<HashMap<String, RateState>>,
+}
+
+struct RateState {
+    minute_start: Instant,
+    minute_requests: u64,
+    minute_tokens: u64,
+    /// UTC day index (unix seconds / 86400).
+    day: u64,
+    day_requests: u64,
+    day_tokens: u64,
+}
+
+impl RateState {
+    fn new(now: Instant, day: u64) -> Self {
+        Self {
+            minute_start: now,
+            minute_requests: 0,
+            minute_tokens: 0,
+            day,
+            day_requests: 0,
+            day_tokens: 0,
+        }
+    }
+}
+
+/// Effective limit: positive value, or unlimited.
+fn limit(value: Option<u64>) -> Option<u64> {
+    value.filter(|&n| n > 0)
+}
+
+/// Current UTC day index and time remaining until the next UTC midnight.
+fn utc_day() -> (u64, Duration) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (
+        secs / SECS_PER_DAY,
+        Duration::from_secs(SECS_PER_DAY - secs % SECS_PER_DAY),
+    )
+}
+
+impl ProviderRateTracker {
+    pub fn new() -> Self {
+        Self {
+            states: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Admit one request against `provider`'s configured windows, counting
+    /// it on success. `Err(retry_after)` means at least one window is
+    /// exhausted; the duration is when the LAST violated window resets —
+    /// retrying earlier is guaranteed to fail again.
+    ///
+    /// Tokens are never pre-reserved: in-flight requests contribute via
+    /// [`record_tokens`](Self::record_tokens) only once their response
+    /// arrives, so a parallel burst can overshoot a token window.
+    /// ponytail: pre-reserving max_tokens at admission is the upgrade path.
+    pub fn try_admit(&self, provider: &str, cfg: &ProviderConfig) -> Result<(), Duration> {
+        let (day, day_remaining) = utc_day();
+        self.admit_at(provider, cfg, Instant::now(), day, day_remaining)
+    }
+
+    fn admit_at(
+        &self,
+        provider: &str,
+        cfg: &ProviderConfig,
+        now: Instant,
+        day: u64,
+        day_remaining: Duration,
+    ) -> Result<(), Duration> {
+        if !cfg.has_rate_limits() {
+            return Ok(()); // No state tracked — unlimited providers cost nothing.
+        }
+        let mut states = self.states.lock().unwrap();
+        let state = states
+            .entry(provider.to_ascii_lowercase())
+            .or_insert_with(|| RateState::new(now, day));
+
+        // Roll expired windows before checking.
+        if now.duration_since(state.minute_start) >= MINUTE_WINDOW {
+            state.minute_start = now;
+            state.minute_requests = 0;
+            state.minute_tokens = 0;
+        }
+        if state.day != day {
+            state.day = day;
+            state.day_requests = 0;
+            state.day_tokens = 0;
+        }
+
+        let minute_reset = MINUTE_WINDOW - now.duration_since(state.minute_start);
+        let mut retry: Option<Duration> = None;
+        let mut violated = |window_reset: Duration| {
+            retry = Some(retry.map_or(window_reset, |r| r.max(window_reset)));
+        };
+        if limit(cfg.requests_per_minute).is_some_and(|l| state.minute_requests >= l) {
+            violated(minute_reset);
+        }
+        if limit(cfg.tokens_per_minute).is_some_and(|l| state.minute_tokens >= l) {
+            violated(minute_reset);
+        }
+        if limit(cfg.requests_per_day).is_some_and(|l| state.day_requests >= l) {
+            violated(day_remaining);
+        }
+        if limit(cfg.tokens_per_day).is_some_and(|l| state.day_tokens >= l) {
+            violated(day_remaining);
+        }
+        if let Some(retry) = retry {
+            return Err(retry);
+        }
+
+        state.minute_requests += 1;
+        state.day_requests += 1;
+        Ok(())
+    }
+
+    /// Add a finished request's provider-reported token usage to the current
+    /// windows. No-op for providers without configured limits (no state).
+    pub fn record_tokens(&self, provider: &str, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let mut states = self.states.lock().unwrap();
+        if let Some(state) = states.get_mut(&provider.to_ascii_lowercase()) {
+            state.minute_tokens += tokens;
+            state.day_tokens += tokens;
+        }
+    }
+}
+
+impl Default for ProviderRateTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +296,7 @@ mod tests {
             provider.to_string(),
             ProviderConfig {
                 concurrency: Some(concurrency),
+                ..Default::default()
             },
         );
         let config = Config {
@@ -223,6 +381,123 @@ mod tests {
             .acquire("acct-1", 1, Duration::from_millis(50))
             .await;
         assert!(third.is_ok(), "released slot must be reusable");
+    }
+
+    fn rate_cfg(
+        rpm: Option<u64>,
+        tpm: Option<u64>,
+        rpd: Option<u64>,
+        tpd: Option<u64>,
+    ) -> ProviderConfig {
+        ProviderConfig {
+            requests_per_minute: rpm,
+            tokens_per_minute: tpm,
+            requests_per_day: rpd,
+            tokens_per_day: tpd,
+            ..Default::default()
+        }
+    }
+
+    const DAY_LEFT: Duration = Duration::from_secs(1000);
+
+    #[test]
+    fn rpm_exhausts_and_resets_next_window() {
+        let tracker = ProviderRateTracker::new();
+        let cfg = rate_cfg(Some(2), None, None, None);
+        let t0 = Instant::now();
+
+        assert!(tracker.admit_at("moonshot", &cfg, t0, 0, DAY_LEFT).is_ok());
+        assert!(tracker.admit_at("moonshot", &cfg, t0, 0, DAY_LEFT).is_ok());
+        let retry = tracker
+            .admit_at("moonshot", &cfg, t0, 0, DAY_LEFT)
+            .expect_err("third request must exceed rpm=2");
+        assert!(retry <= MINUTE_WINDOW && retry > Duration::ZERO);
+
+        // Next fixed window: counters reset, requests admitted again.
+        let t1 = t0 + MINUTE_WINDOW + Duration::from_secs(1);
+        assert!(tracker.admit_at("moonshot", &cfg, t1, 0, DAY_LEFT).is_ok());
+    }
+
+    #[test]
+    fn recorded_tokens_block_and_expire_with_the_window() {
+        let tracker = ProviderRateTracker::new();
+        let cfg = rate_cfg(None, Some(100), None, None);
+        let t0 = Instant::now();
+
+        assert!(tracker.admit_at("openai", &cfg, t0, 0, DAY_LEFT).is_ok());
+        tracker.record_tokens("openai", 150);
+        assert!(
+            tracker.admit_at("openai", &cfg, t0, 0, DAY_LEFT).is_err(),
+            "tpm budget already spent"
+        );
+
+        let t1 = t0 + MINUTE_WINDOW;
+        assert!(
+            tracker.admit_at("openai", &cfg, t1, 0, DAY_LEFT).is_ok(),
+            "minute tokens reset with the window"
+        );
+    }
+
+    #[test]
+    fn day_limits_block_until_next_utc_day() {
+        let tracker = ProviderRateTracker::new();
+        let cfg = rate_cfg(None, None, Some(1), Some(500));
+        let t0 = Instant::now();
+
+        assert!(tracker.admit_at("minimax", &cfg, t0, 10, DAY_LEFT).is_ok());
+        let retry = tracker
+            .admit_at("minimax", &cfg, t0, 10, DAY_LEFT)
+            .expect_err("rpd=1 exhausted");
+        assert_eq!(retry, DAY_LEFT, "retry points at the UTC day rollover");
+
+        // Same instant, next UTC day: counters reset.
+        assert!(tracker.admit_at("minimax", &cfg, t0, 11, DAY_LEFT).is_ok());
+        tracker.record_tokens("minimax", 600);
+        assert!(
+            tracker.admit_at("minimax", &cfg, t0, 11, DAY_LEFT).is_err(),
+            "tpd=500 exceeded by recorded usage"
+        );
+    }
+
+    #[test]
+    fn retry_after_is_the_latest_violated_window() {
+        // Both rpm and rpd exhausted: retrying at the minute reset would
+        // still hit the day cap, so retry_after must be the day reset.
+        let tracker = ProviderRateTracker::new();
+        let cfg = rate_cfg(Some(1), None, Some(1), None);
+        let t0 = Instant::now();
+
+        assert!(tracker.admit_at("openai", &cfg, t0, 0, DAY_LEFT).is_ok());
+        let retry = tracker
+            .admit_at("openai", &cfg, t0, 0, DAY_LEFT)
+            .expect_err("both windows exhausted");
+        assert_eq!(retry, DAY_LEFT);
+    }
+
+    #[test]
+    fn zero_and_unset_limits_admit_everything() {
+        let tracker = ProviderRateTracker::new();
+        let cfg = rate_cfg(Some(0), Some(0), None, None);
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            assert!(tracker.admit_at("ollama", &cfg, t0, 0, DAY_LEFT).is_ok());
+        }
+        // No state tracked → recording tokens is a harmless no-op.
+        tracker.record_tokens("ollama", 1_000_000);
+        assert!(tracker.admit_at("ollama", &cfg, t0, 0, DAY_LEFT).is_ok());
+    }
+
+    #[test]
+    fn rate_state_is_shared_case_insensitively() {
+        let tracker = ProviderRateTracker::new();
+        let cfg = rate_cfg(Some(1), None, None, None);
+        let t0 = Instant::now();
+
+        assert!(tracker.admit_at("OpenAI", &cfg, t0, 0, DAY_LEFT).is_ok());
+        assert!(
+            tracker.admit_at("openai", &cfg, t0, 0, DAY_LEFT).is_err(),
+            "differently-cased names must share one budget"
+        );
     }
 
     #[tokio::test]

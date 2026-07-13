@@ -34,13 +34,63 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 [embedding_models]
 "voyage-3.5" = ["voyage:voyage-3.5"]
 
-# Per-provider concurrency limits. Keyed by the lowercase provider name
-# (ollama, openai, anthropic, ...). Requests beyond `concurrency` queue
-# inside the process — the client connection blocks until a slot frees up.
-# Omit a provider to leave it unlimited.
+# Per-provider limits. Keyed by the lowercase provider name (ollama, openai,
+# anthropic, ...). Every field is optional; unset or 0 = unlimited.
 #
-# [providers.ollama]
-# concurrency = 4
+#   concurrency          max in-flight requests; excess queues in-process
+#   requests_per_minute  fixed 60s window ("RPM")
+#   tokens_per_minute    fixed 60s window ("TPM"), actual input+output tokens
+#   requests_per_day     UTC-day window ("RPD")
+#   tokens_per_day       UTC-day window ("TPD")
 #
+# Requests are counted at dispatch; tokens from the provider-reported usage
+# after each response. When a [models] alias lists several providers, ones
+# with an exhausted window are skipped; when ALL are exhausted the client
+# gets 429 + Retry-After. Windows are fixed (providers meter rolling ones)
+# and counters reset on process restart — configure values BELOW your real
+# account limits to leave headroom.
+#
+# Baselines from provider docs (entry/typical tiers as of mid-2026 — always
+# check the tier your own account is on):
+#
+# Moonshot / Kimi — limits grow with cumulative recharge; Tier 1 ($10):
+# 50 concurrent, 200 RPM. TPD applies on the free tier T0 (1.5M); T1+ has
+# no TPD. NOTE: Moonshot meters TPM as input + max_completion_tokens, so
+# keep extra headroom. https://www.kimi.com/help/kimi-api/api-rate-limits
+# [providers.moonshot]
+# concurrency = 50
+# requests_per_minute = 200
+#
+# Z.ai / GLM — limits are concurrency-based per plan (Max > Pro > Lite),
+# no public RPM/TPM: set concurrency only.
+# https://docs.z.ai/devpack/usage-policy
+# [providers.zai]
+# concurrency = 5
+#
+# MiniMax — per-model: M2.x 500 RPM / 20M TPM, M3 200 RPM / 10M TPM.
+# https://platform.minimax.io/docs/guides/rate-limits
+# [providers.minimax]
+# requests_per_minute = 500
+# tokens_per_minute = 20000000
+#
+# OpenAI — per-model, per spend tier; e.g. Tier 1 gpt-4o: 500 RPM / 30k TPM,
+# Tier 2: 5000 RPM / 450k TPM. Rolling daily windows exist on some models
+# (requests_per_day / tokens_per_day).
+# https://developers.openai.com/api/docs/guides/rate-limits
 # [providers.openai]
 # concurrency = 32
+# requests_per_minute = 500
+# tokens_per_minute = 30000
+#
+# Anthropic — RPM plus SEPARATE input/output token limits (ITPM/OTPM) per
+# model and tier; set tokens_per_minute to your ITPM (input dominates, and
+# cache reads don't count upstream, so this stays conservative). E.g.
+# standard Tier 4: 4000 RPM / 2M ITPM.
+# https://docs.anthropic.com/en/api/rate-limits
+# [providers.anthropic]
+# requests_per_minute = 4000
+# tokens_per_minute = 2000000
+#
+# Ollama / self-hosted — no rate windows; cap concurrency to the box.
+# [providers.ollama]
+# concurrency = 4
