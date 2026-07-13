@@ -167,8 +167,10 @@ What it does **not** do:
 - It is per-process, not cluster-wide. If you run multiple OctoHub
   instances, you get `concurrency × instances` total — see
   [08 — Deployment](./08-deployment.md#multiple-instances).
-- It does not retry on upstream failure. A provider returning 5xx
-  releases its permit (the request is done) and the client gets a 5xx.
+- It does not retry on upstream failure by itself. A provider returning
+  5xx releases its permit and the client gets the 5xx — unless
+  `[server].failover_on_error` is enabled and the model alias has
+  another candidate (see below).
 
 ### Rate windows (`requests_per_minute`, `tokens_per_minute`, …)
 
@@ -198,6 +200,28 @@ quirks worth knowing: Moonshot meters TPM as
 and Anthropic splits input/output limits (ITPM/OTPM) — set
 `tokens_per_minute` to your ITPM.
 
+### Failover and cooldown (`[server]` knobs, both off by default)
+
+- `failover_on_error = true` — when an upstream call fails with a
+  **provider-side** error (upstream timeout, connect failure, 429, 5xx),
+  the request is re-sent to the next admitted candidate instead of
+  surfacing the error. Embedded 4xx (context overflow, bad request)
+  never fails over — every provider would reject it the same way. Each
+  failover re-sends the full request and is counted in
+  `octohub_provider_failovers_total{provider}` (labeled with the
+  provider that FAILED).
+- `provider_error_cooldown_secs = N` — after **3 consecutive**
+  provider-side failures, the provider is deprioritized for `N`
+  seconds: sorted behind healthy candidates at resolution, used only
+  when nothing healthy can admit. It is never hard-blocked, so a
+  single-provider model keeps dispatching, and the first request after
+  the cooldown lapses is the recovery probe. Any success resets the
+  streak. State is in-memory (survives SIGHUP, reset on restart).
+
+The two are independent: cooldown works without failover (it shapes
+*future* routing) and failover works without cooldown (it saves the
+*current* request).
+
 ## Picking providers for a model alias
 
 The `[models]` table is just a `HashMap<String, Vec<String>>`
@@ -209,8 +233,10 @@ One exception to the random start: a request continuing a chain
 (`previous_completion_id`) prefers the provider that served the
 previous turn, so provider-side prompt caches survive multi-turn
 sessions — it only moves to another candidate when that provider's
-rate windows are exhausted. There's no other stickiness, no round-robin
-state, no health-awareness.
+rate windows are exhausted. Providers on an error cooldown (see
+[failover and cooldown](#failover-and-cooldown-server-knobs-both-off-by-default))
+are sorted behind healthy candidates. There's no other stickiness and
+no round-robin state.
 
 ```toml
 [models]
@@ -224,11 +250,12 @@ state, no health-awareness.
 "best" = ["anthropic:claude-opus-4-1", "openai:gpt-5"]
 ```
 
-The list is sampled once per request. If the chosen provider errors,
-the client gets the error — OctoHub does not retry the next entry.
-If you want retry-with-fallback, you need a client-side retry loop
-**or** a wrapper that uses `provider:model` directly and chooses
-between them.
+By default, if the chosen provider errors, the client gets the error —
+OctoHub does not retry the next entry. Enable
+`[server].failover_on_error` to re-route provider-side failures to the
+remaining candidates, and `provider_error_cooldown_secs` to
+deprioritize repeatedly-failing providers — see
+[failover and cooldown](#failover-and-cooldown-server-knobs-both-off-by-default).
 
 ## Adding a new provider
 

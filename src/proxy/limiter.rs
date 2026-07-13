@@ -282,6 +282,91 @@ impl Default for ProviderRateTracker {
     }
 }
 
+/// Consecutive provider-side failures before a provider is put on cooldown.
+/// octolib already retries transient errors internally, so three surfaced
+/// failures in a row mean the provider is genuinely struggling — one blip
+/// must not sideline it.
+const COOLDOWN_FAILURE_THRESHOLD: u32 = 3;
+
+/// Per-provider failure tracking behind `server.provider_error_cooldown_secs`.
+///
+/// After [`COOLDOWN_FAILURE_THRESHOLD`] consecutive provider-side failures
+/// the provider "cools" for the configured duration. Cooling providers are
+/// DEPRIORITIZED at resolution — sorted behind healthy candidates — never
+/// hard-blocked: a model whose every candidate is cooling still dispatches
+/// rather than failing, and the first request after the cooldown lapses is
+/// the recovery probe. Any success resets the streak. Plain in-memory state
+/// held as `Arc` (like [`ProviderRateTracker`]), so it survives SIGHUP.
+pub struct ProviderHealth {
+    states: std::sync::Mutex<HashMap<String, HealthState>>,
+}
+
+#[derive(Default)]
+struct HealthState {
+    consecutive_failures: u32,
+    cooling_until: Option<Instant>,
+}
+
+impl ProviderHealth {
+    pub fn new() -> Self {
+        Self {
+            states: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Count a provider-side failure; trips the cooldown at the threshold.
+    /// No-op when `cooldown` is zero (feature disabled) — nothing is tracked.
+    pub fn record_failure(&self, provider: &str, cooldown: Duration) {
+        self.record_failure_at(provider, cooldown, Instant::now())
+    }
+
+    fn record_failure_at(&self, provider: &str, cooldown: Duration, now: Instant) {
+        if cooldown.is_zero() {
+            return;
+        }
+        let mut states = self.states.lock().unwrap();
+        let state = states.entry(provider.to_ascii_lowercase()).or_default();
+        state.consecutive_failures += 1;
+        if state.consecutive_failures >= COOLDOWN_FAILURE_THRESHOLD {
+            state.cooling_until = Some(now + cooldown);
+            tracing::warn!(
+                provider = %provider,
+                failures = state.consecutive_failures,
+                cooldown_s = cooldown.as_secs(),
+                "provider cooling down after consecutive failures"
+            );
+        }
+    }
+
+    /// Any success ends the failure streak and lifts an active cooldown.
+    pub fn record_success(&self, provider: &str) {
+        let mut states = self.states.lock().unwrap();
+        if let Some(state) = states.get_mut(&provider.to_ascii_lowercase()) {
+            state.consecutive_failures = 0;
+            state.cooling_until = None;
+        }
+    }
+
+    /// Whether `provider` is currently inside a cooldown window.
+    pub fn is_cooling(&self, provider: &str) -> bool {
+        self.is_cooling_at(provider, Instant::now())
+    }
+
+    fn is_cooling_at(&self, provider: &str, now: Instant) -> bool {
+        let states = self.states.lock().unwrap();
+        states
+            .get(&provider.to_ascii_lowercase())
+            .and_then(|s| s.cooling_until)
+            .is_some_and(|until| now < until)
+    }
+}
+
+impl Default for ProviderHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +583,71 @@ mod tests {
             tracker.admit_at("openai", &cfg, t0, 0, DAY_LEFT).is_err(),
             "differently-cased names must share one budget"
         );
+    }
+
+    #[test]
+    fn cooldown_trips_at_threshold_and_expires() {
+        let health = ProviderHealth::new();
+        let cooldown = Duration::from_secs(120);
+        let t0 = Instant::now();
+
+        health.record_failure_at("zai", cooldown, t0);
+        health.record_failure_at("zai", cooldown, t0);
+        assert!(
+            !health.is_cooling_at("zai", t0),
+            "below threshold — still healthy"
+        );
+
+        health.record_failure_at("zai", cooldown, t0);
+        assert!(health.is_cooling_at("zai", t0), "third failure trips it");
+        assert!(
+            !health.is_cooling_at("zai", t0 + cooldown),
+            "cooldown lapses on its own"
+        );
+    }
+
+    #[test]
+    fn success_resets_streak_and_lifts_cooldown() {
+        let health = ProviderHealth::new();
+        let cooldown = Duration::from_secs(120);
+        let t0 = Instant::now();
+
+        for _ in 0..3 {
+            health.record_failure_at("openai", cooldown, t0);
+        }
+        assert!(health.is_cooling_at("openai", t0));
+
+        health.record_success("openai");
+        assert!(
+            !health.is_cooling_at("openai", t0),
+            "success lifts cooldown"
+        );
+
+        // Streak restarts from zero: two failures don't re-trip it.
+        health.record_failure_at("openai", cooldown, t0);
+        health.record_failure_at("openai", cooldown, t0);
+        assert!(!health.is_cooling_at("openai", t0));
+    }
+
+    #[test]
+    fn zero_cooldown_disables_health_tracking() {
+        let health = ProviderHealth::new();
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            health.record_failure_at("minimax", Duration::ZERO, t0);
+        }
+        assert!(!health.is_cooling_at("minimax", t0));
+    }
+
+    #[test]
+    fn cooldown_is_case_insensitive() {
+        let health = ProviderHealth::new();
+        let cooldown = Duration::from_secs(60);
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            health.record_failure_at("OpenAI", cooldown, t0);
+        }
+        assert!(health.is_cooling_at("openai", t0));
     }
 
     #[tokio::test]
