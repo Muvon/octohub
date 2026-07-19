@@ -236,6 +236,10 @@ pub fn record_completion(
     api_key_id: Option<i64>,
     per_key: bool,
 ) {
+    // Health rides the same funnel as metrics: every completion/embedding path
+    // already reports here, so no call site can forget to report health too.
+    crate::health::record(model, provider, status == "ok", duration, status);
+
     let model = model.to_owned();
     let provider = provider.to_owned();
     let status = status.to_owned();
@@ -277,6 +281,10 @@ pub fn record_embedding(
     api_key_id: Option<i64>,
     per_key: bool,
 ) {
+    // Health rides the same funnel as metrics: every completion/embedding path
+    // already reports here, so no call site can forget to report health too.
+    crate::health::record(model, provider, status == "ok", duration, status);
+
     let model = model.to_owned();
     let provider = provider.to_owned();
     let status = status.to_owned();

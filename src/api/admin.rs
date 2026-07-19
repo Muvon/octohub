@@ -210,6 +210,22 @@ fn api_key_response(key: &crate::storage::ApiKey, include_full_key: bool) -> ser
     body
 }
 
+/// GET /v1/admin/status — per-model health, observed from real traffic.
+///
+/// The gateway sees every call and every failure, so status is measured rather
+/// than probed: no synthetic requests, no probe credential, no spend on models
+/// nobody asked for. Models with no traffic are simply absent from the list, and
+/// the caller reports them as unknown instead of inventing a verdict.
+pub async fn handle_status(
+    req: Request<hyper::body::Incoming>,
+    master_key: &str,
+) -> Response<BoxBody> {
+    if let Err(resp) = check_admin(&req, master_key) {
+        return *resp;
+    }
+    json_response(StatusCode::OK, crate::health::snapshot())
+}
+
 /// GET /v1/admin/keys - List all API keys (key field masked)
 pub async fn handle_list_keys(
     req: Request<hyper::body::Incoming>,
