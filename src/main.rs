@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod config;
+mod health;
 mod http_util;
 mod logging;
 mod metrics;
@@ -392,6 +393,8 @@ async fn route_admin(
             };
             api::admin::handle_update_key_owner(req, storage, master_key, key_id).await
         }
+        // GET /v1/admin/status — per-model health observed from real traffic
+        (Method::GET, ["status"]) => api::admin::handle_status(req, master_key).await,
         // GET /v1/admin/usage
         (Method::GET, ["usage"]) => api::admin::handle_usage(req, storage, master_key).await,
         // GET /v1/admin/completions
