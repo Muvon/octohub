@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0] - 2026-07-19
+
+### 📋 Release Summary
+
+This release introduces a new model health monitoring endpoint to improve administrative oversight of system status (a5db7e11). General code refinements were also implemented to ensure better maintainability and stability (e7dcfc38).
+
+
+### ✨ New Features & Enhancements
+
+- **admin**: add model health monitoring endpoint `a5db7e11`
+
+### 🔧 Improvements & Optimizations
+
+- **health**: reformat test function calls `e7dcfc38`
+
 ## [0.4.0] - 2026-07-13
 
 ### 📋 Release Summary
