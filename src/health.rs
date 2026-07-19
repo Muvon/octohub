@@ -154,8 +154,20 @@ mod tests {
 
     #[test]
     fn success_clears_the_failure_streak() {
-        record("m-recovers", "together", false, Duration::from_millis(10), "boom");
-        record("m-recovers", "together", false, Duration::from_millis(10), "boom");
+        record(
+            "m-recovers",
+            "together",
+            false,
+            Duration::from_millis(10),
+            "boom",
+        );
+        record(
+            "m-recovers",
+            "together",
+            false,
+            Duration::from_millis(10),
+            "boom",
+        );
         let snap = snapshot();
         let down = snap["models"]
             .as_array()
@@ -166,7 +178,13 @@ mod tests {
             .clone();
         assert_eq!(down["status"], "down");
 
-        record("m-recovers", "together", true, Duration::from_millis(50), "");
+        record(
+            "m-recovers",
+            "together",
+            true,
+            Duration::from_millis(50),
+            "",
+        );
         let snap = snapshot();
         let up = snap["models"]
             .as_array()
