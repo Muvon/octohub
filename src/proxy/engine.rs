@@ -199,19 +199,63 @@ impl ProxyEngine {
     /// Returns the response plus the upstream provider call duration — the latter
     /// drives `octohub_completion_duration_seconds` so the histogram reflects
     /// provider latency only, excluding our own auth/parse/storage overhead.
+    ///
+    /// `purpose` is the request's `X-Model-Purpose` header, meaningful only when
+    /// the model is the virtual `auto` — it steers which alias `auto` resolves to.
     pub async fn process(
         &self,
         req: CreateCompletionRequest,
         api_key: &ApiKey,
+        purpose: Option<String>,
     ) -> Result<(CreateCompletionResponse, std::time::Duration)> {
+        // Snapshot config + limiter once so this request keeps a consistent view
+        // even if SIGHUP swaps them mid-flight.
+        let config = self.config();
+
+        // The as-sent model must be allowed — for `auto` that means the key was
+        // explicitly granted "auto". The RESOLVED alias is checked again below,
+        // so `auto` can never smuggle in a model the key's roster bans.
         ensure_model_allowed(api_key, &req.model)?;
+
+        // Virtual `auto`: pick the real alias from the owner's stored map, then
+        // the [auto] config floor (see proxy::auto for the chain). `req.model`
+        // deliberately stays "auto" — it is what the client sent, and it lands
+        // in `input_model` for observability; `routed_model` feeds routing.
+        let routed_model = if config.is_auto(&req.model) {
+            let owner_map = match api_key.owner.clone() {
+                Some(owner) => {
+                    let storage = self.storage.clone();
+                    tokio::task::spawn_blocking(move || storage.get_owner_auto_map(&owner))
+                        .await??
+                }
+                None => None,
+            };
+            let resolved =
+                super::auto::resolve(purpose.as_deref(), owner_map.as_ref(), &config.auto, |m| {
+                    config.models.contains_key(m)
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to resolve model 'auto' (purpose '{}'): no usable [auto] mapping",
+                        purpose.as_deref().unwrap_or("")
+                    )
+                })?;
+            ensure_model_allowed(api_key, &resolved)?;
+            tracing::Span::current().record("model", resolved.as_str());
+            tracing::info!(
+                purpose = purpose.as_deref().unwrap_or(""),
+                resolved = %resolved,
+                "auto model resolved"
+            );
+            resolved
+        } else {
+            req.model.clone()
+        };
+
         // Owner budget slot — held for the WHOLE request (queue + upstream +
         // storage), completions and embeddings drain the same budget.
         let _owner_slot = self.acquire_owner_slot(api_key).await?;
 
-        // Snapshot config + limiter once so this request keeps a consistent view
-        // even if SIGHUP swaps them mid-flight.
-        let config = self.config();
         let limiter = self.limiter();
 
         // 1. Build conversation history from chain
@@ -303,8 +347,8 @@ impl ProxyEngine {
         //    With `failover_on_error`, a provider-side failure moves to the
         //    next candidate instead of surfacing to the client.
         let mut candidates = config
-            .model_candidates(&req.model)
-            .with_context(|| format!("Failed to resolve model '{}'", req.model))?;
+            .model_candidates(&routed_model)
+            .with_context(|| format!("Failed to resolve model '{}'", routed_model))?;
         if let Some(ref sticky) = sticky_provider {
             prefer_provider(&mut candidates, sticky);
         }
@@ -316,7 +360,7 @@ impl ProxyEngine {
                 &self.provider_health,
                 &config,
                 candidates.clone(),
-                &req.model,
+                &routed_model,
             )?;
 
             // Record provider in request span
@@ -1210,6 +1254,7 @@ mod tests {
             server: Default::default(),
             models: HashMap::new(),
             embedding_models: HashMap::new(),
+            auto: HashMap::new(),
             providers,
             logging: Default::default(),
             metrics: Default::default(),

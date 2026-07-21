@@ -1,6 +1,7 @@
 use super::{
-    decode_allowed_models, encode_allowed_models, generate_api_key, make_key_hint, now_unix,
-    ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
+    decode_allowed_models, decode_auto_map, encode_allowed_models, encode_auto_map,
+    generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
+    StoredEmbedding, TimeBucket, UsageRow,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -71,7 +72,13 @@ impl SqliteStorage {
                 created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_embeddings_api_key ON embeddings(api_key_id);
-            CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);",
+            CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);
+
+            CREATE TABLE IF NOT EXISTS owner_auto_models (
+                owner TEXT PRIMARY KEY,
+                map TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );",
         )?;
 
         // Additive migrations for upgrades from older schemas. SQLite has no
@@ -289,6 +296,45 @@ impl Storage for SqliteStorage {
             rusqlite::params![owner, owner_concurrency, id],
         )?;
         Ok(affected > 0)
+    }
+
+    fn get_owner_auto_map(
+        &self,
+        owner: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let conn = lock_conn(&self.conn)?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT map FROM owner_auto_models WHERE owner = ?1",
+                rusqlite::params![owner],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(decode_auto_map(raw))
+    }
+
+    fn set_owner_auto_map(
+        &self,
+        owner: &str,
+        map: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<()> {
+        let conn = lock_conn(&self.conn)?;
+        match map.filter(|m| !m.is_empty()) {
+            Some(m) => {
+                conn.execute(
+                    "INSERT INTO owner_auto_models (owner, map, updated_at) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(owner) DO UPDATE SET map = excluded.map, updated_at = excluded.updated_at",
+                    rusqlite::params![owner, encode_auto_map(m), now_unix()],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "DELETE FROM owner_auto_models WHERE owner = ?1",
+                    rusqlite::params![owner],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
@@ -706,6 +752,35 @@ mod tests {
             .unwrap();
         let fetched = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
         assert_eq!(fetched.allowed_models.as_deref(), Some(allowed.as_slice()));
+    }
+
+    #[test]
+    fn test_owner_auto_map_roundtrip_update_and_clear() {
+        let storage = create_test_storage();
+        // Absent owner → None (config floor applies).
+        assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("default".to_string(), "glm".to_string());
+        map.insert("compression".to_string(), "cheap".to_string());
+        storage.set_owner_auto_map("acct_1", Some(&map)).unwrap();
+        assert_eq!(storage.get_owner_auto_map("acct_1").unwrap(), Some(map));
+
+        // Upsert replaces in place.
+        let mut map2 = std::collections::HashMap::new();
+        map2.insert("default".to_string(), "strong".to_string());
+        storage.set_owner_auto_map("acct_1", Some(&map2)).unwrap();
+        assert_eq!(storage.get_owner_auto_map("acct_1").unwrap(), Some(map2));
+
+        // Owners are independent.
+        assert!(storage.get_owner_auto_map("acct_2").unwrap().is_none());
+
+        // None clears; an EMPTY map clears too (both mean "back to the floor").
+        storage.set_owner_auto_map("acct_1", None).unwrap();
+        assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
+        let empty = std::collections::HashMap::new();
+        storage.set_owner_auto_map("acct_1", Some(&empty)).unwrap();
+        assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
     }
 
     #[test]

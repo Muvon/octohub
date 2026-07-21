@@ -38,6 +38,16 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 [embedding_models]
 "voyage-3.5" = ["voyage:voyage-3.5"]
 
+# Virtual `auto` model (optional). When this section exists, clients may send
+# model = "auto" plus an X-Model-Purpose header; the request is rewritten to
+# the [models] ALIAS picked for that purpose, then routed normally. A key
+# owner's stored override map (PUT /v1/admin/owners/:owner/auto) is consulted
+# first; this section is the deployment floor. `default` is required and
+# terminates the chain; every value must be a [models] alias.
+# [auto]
+# default = "minimax-m2.7"
+# compression = "minimax-m2.7"   # any purpose string clients send
+
 # Per-provider limits. Keyed by the lowercase provider name (ollama, openai,
 # anthropic, ...). Every field is optional; unset or 0 = unlimited.
 #

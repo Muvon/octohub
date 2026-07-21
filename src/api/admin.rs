@@ -348,6 +348,109 @@ pub async fn handle_update_key_models(
     }
 }
 
+/// GET /v1/admin/owners/:owner/auto — the owner's stored purpose→alias map
+/// for the virtual `auto` model. `map: null` = no override, the `[auto]`
+/// config floor applies.
+pub async fn handle_get_owner_auto(
+    req: Request<hyper::body::Incoming>,
+    storage: Arc<dyn Storage>,
+    master_key: &str,
+    owner: &str,
+) -> Response<BoxBody> {
+    if let Err(resp) = check_admin(&req, master_key) {
+        return *resp;
+    }
+
+    match storage.get_owner_auto_map(owner) {
+        Ok(map) => json_response(
+            StatusCode::OK,
+            serde_json::json!({ "owner": owner, "map": map }),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "get owner auto map failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to get owner auto map",
+            )
+        }
+    }
+}
+
+/// PUT /v1/admin/owners/:owner/auto — replace the owner's auto map.
+/// Body `{"map": {"default": "...", "<purpose>": "..."}}`; `map: null` or an
+/// empty object clears the override. Values are NOT validated against the live
+/// `[models]` table here — the operator's control plane owns that roster and
+/// config may change after a write; the resolver skips stale entries at use.
+pub async fn handle_set_owner_auto(
+    req: Request<hyper::body::Incoming>,
+    storage: Arc<dyn Storage>,
+    master_key: &str,
+    owner: &str,
+) -> Response<BoxBody> {
+    if let Err(resp) = check_admin(&req, master_key) {
+        return *resp;
+    }
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read request body: {}", e),
+            );
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct SetAutoRequest {
+        #[serde(default)]
+        map: Option<std::collections::HashMap<String, String>>,
+    }
+
+    let set_req: SetAutoRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid request JSON: {}", e),
+            );
+        }
+    };
+
+    // Shape checks only: a purpose or target that is empty, or a target of
+    // "auto" itself, can never resolve and is certainly a caller bug.
+    if let Some(ref map) = set_req.map {
+        for (purpose, target) in map {
+            if purpose.trim().is_empty() || target.trim().is_empty() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Auto map keys and values must be non-empty",
+                );
+            }
+            if target == crate::config::AUTO_MODEL {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "An auto map entry must not point at 'auto' itself",
+                );
+            }
+        }
+    }
+
+    match storage.set_owner_auto_map(owner, set_req.map.as_ref()) {
+        Ok(()) => json_response(
+            StatusCode::OK,
+            serde_json::json!({ "status": "updated", "owner": owner }),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "set owner auto map failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to set owner auto map",
+            )
+        }
+    }
+}
+
 /// GET /v1/admin/usage?key_id=1,3&bucket=hour&since=...&until=...
 pub async fn handle_usage(
     req: Request<hyper::body::Incoming>,

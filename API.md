@@ -81,13 +81,34 @@ OctoHub's native Responses API. Supports multi-turn conversation chains, reasoni
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `model` | string | ✅ | — | Model identifier. Use `"provider:model"` format (e.g. `"openai:gpt-4o"`) or a mapped name from config. |
+| `model` | string | ✅ | — | Model identifier. Use `"provider:model"` format (e.g. `"openai:gpt-4o"`), a mapped name from config, or `"auto"` when the deployment configures the virtual auto model (see below). |
 | `input` | string \| array | ✅ | — | Input content. A plain string becomes a user message. An array allows typed items (see below). |
 | `instructions` | string | — | `null` | System instructions prepended to the conversation. |
 | `previous_completion_id` | string | — | `null` | Chain to a previous completion for multi-turn conversations. OctoHub reconstructs the full history automatically. |
 | `temperature` | float | — | `1.0` | Sampling temperature (0.0–2.0). |
 | `max_output_tokens` | integer | — | `0` | Maximum tokens in the response. `0` = provider default. |
 | `tools` | array | — | `null` | Function definitions for tool/function calling. |
+
+#### The virtual `auto` model
+
+When the server config has an `[auto]` section, `"model": "auto"` routes by **purpose** instead of naming a model. The client says *where the call comes from* via the `X-Model-Purpose` header (any string; Octomind sends `main` / `supervisor` / `compression`), and the proxy rewrites `auto` to a real `[models]` alias before ordinary routing:
+
+1. the key owner's stored override map for that purpose (`PUT /v1/admin/owners/:owner/auto`)
+2. the owner map's `default`
+3. `[auto].<purpose>` from config
+4. `[auto].default` from config
+
+An owner who stored only `default` gets it for every purpose — their choice beats the config's purpose entry. A missing/unknown purpose header just falls to the defaults. Key `allowed_models` is enforced on **both** the as-sent `"auto"` and the resolved alias, so `auto` never grants access the key's roster doesn't. Stored completions keep `input_model = "auto"` with the real `resolved_model`, and metrics/health record the resolved model — `auto` is invisible downstream of resolution.
+
+```bash
+curl http://127.0.0.1:8080/v1/completions \
+  -H "Authorization: Bearer sk-..." \
+  -H "X-Model-Purpose: compression" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "input": "Summarize: ..."}'
+```
+
+Applies to `/v1/chat/completions` identically. Embeddings do not support `auto`.
 
 #### Input Items
 
@@ -796,6 +817,33 @@ curl -X POST http://127.0.0.1:8080/v1/admin/keys/1/owner \
 ```
 
 Returns `200 {"status": "updated"}`, or `404` if the key does not exist or is not active. Absent/`null` owner ungroups the key; absent/`null`/`0` concurrency means unlimited. A capacity change applies to new requests immediately (requests already in flight drain on the old budget).
+
+---
+
+### GET /v1/admin/owners/:owner/auto
+
+The owner's stored purpose→alias override map for the virtual `auto` model. `"map": null` = no override; the `[auto]` config floor applies.
+
+```bash
+curl http://127.0.0.1:8080/v1/admin/owners/acct-42/auto \
+  -H "Authorization: Bearer <master-key>"
+# {"owner": "acct-42", "map": {"default": "glm", "compression": "cheap"}}
+```
+
+---
+
+### PUT /v1/admin/owners/:owner/auto
+
+Replace the owner's auto map. `"map": null` (or an empty object) clears the override. Values must be non-empty and must not be `"auto"`; they are **not** validated against the live `[models]` table — the operator's control plane owns that roster, and the resolver skips entries that have gone stale, falling through to the config floor.
+
+```bash
+curl -X PUT http://127.0.0.1:8080/v1/admin/owners/acct-42/auto \
+  -H "Authorization: Bearer <master-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"map": {"default": "glm", "compression": "cheap"}}'
+```
+
+Returns `200 {"status": "updated", "owner": "acct-42"}`.
 
 ---
 

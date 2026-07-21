@@ -1,6 +1,6 @@
 use super::{
-    encode_allowed_models, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage,
-    StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
+    decode_auto_map, encode_allowed_models, encode_auto_map, generate_api_key, make_key_hint,
+    now_unix, ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use postgres::NoTls;
@@ -77,7 +77,13 @@ impl PostgresStorage {
                 created_at BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_embeddings_api_key ON embeddings(api_key_id);
-            CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);",
+            CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);
+
+            CREATE TABLE IF NOT EXISTS owner_auto_models (
+                owner TEXT PRIMARY KEY,
+                map JSONB NOT NULL,
+                updated_at BIGINT NOT NULL
+            );",
         )?;
         Ok(())
     }
@@ -292,6 +298,41 @@ impl Storage for PostgresStorage {
             &[&owner, &concurrency_i32, &id],
         )?;
         Ok(affected > 0)
+    }
+
+    fn get_owner_auto_map(
+        &self,
+        owner: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        let rows = client.query(
+            "SELECT map::text FROM owner_auto_models WHERE owner = $1",
+            &[&owner],
+        )?;
+        Ok(decode_auto_map(rows.first().map(|r| r.get::<_, String>(0))))
+    }
+
+    fn set_owner_auto_map(
+        &self,
+        owner: &str,
+        map: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<()> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        match map.filter(|m| !m.is_empty()) {
+            Some(m) => {
+                let json = encode_auto_map(m);
+                let now = now_unix() as i64;
+                client.execute(
+                    "INSERT INTO owner_auto_models (owner, map, updated_at) VALUES ($1, $2::jsonb, $3) \
+                     ON CONFLICT (owner) DO UPDATE SET map = EXCLUDED.map, updated_at = EXCLUDED.updated_at",
+                    &[&owner, &json, &now],
+                )?;
+            }
+            None => {
+                client.execute("DELETE FROM owner_auto_models WHERE owner = $1", &[&owner])?;
+            }
+        }
+        Ok(())
     }
 
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {

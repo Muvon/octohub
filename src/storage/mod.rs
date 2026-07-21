@@ -151,6 +151,21 @@ pub trait Storage: Send + Sync {
     /// Look up an active API key by its raw key value (for auth)
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>>;
 
+    // Owner auto-model maps (virtual `auto` model, see proxy::auto)
+    /// The stored purpose→alias override map for an owner group, or `None`
+    /// when the owner has no override (the `[auto]` config floor applies).
+    fn get_owner_auto_map(
+        &self,
+        owner: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>>;
+    /// Replace an owner's auto map. `None` or an empty map clears the row —
+    /// the owner falls back to the `[auto]` config floor.
+    fn set_owner_auto_map(
+        &self,
+        owner: &str,
+        map: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<()>;
+
     // Completions
     fn store_completion(&self, completion: &StoredCompletion) -> Result<()>;
     #[allow(dead_code)]
@@ -199,6 +214,29 @@ pub(crate) fn make_key_hint(key: &str) -> String {
 /// `None` for the unrestricted case so the column stores SQL NULL.
 pub(crate) fn encode_allowed_models(models: Option<&[String]>) -> Option<String> {
     models.map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".to_string()))
+}
+
+/// Encode an owner auto map for persistence (JSON object). Empty maps are
+/// never stored — callers clear the row instead.
+pub(crate) fn encode_auto_map(map: &std::collections::HashMap<String, String>) -> String {
+    serde_json::to_string(map).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Decode a stored owner auto map. Invalid JSON decodes to `None` (config
+/// floor applies) — same fail-open stance as `decode_allowed_models`: a
+/// hand-edited row must degrade routing, not break it.
+pub(crate) fn decode_auto_map(
+    raw: Option<String>,
+) -> Option<std::collections::HashMap<String, String>> {
+    let raw = raw?;
+    match serde_json::from_str::<std::collections::HashMap<String, String>>(&raw) {
+        Ok(map) if !map.is_empty() => Some(map),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(error = %err, raw = %raw, "Invalid owner auto map JSON — falling back to [auto] config");
+            None
+        }
+    }
 }
 
 /// Decode an `allowed_models` JSON string back into a list. Invalid JSON
