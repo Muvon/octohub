@@ -618,6 +618,70 @@ curl -X POST http://127.0.0.1:8080/v1/admin/keys \
 
 ---
 
+### GET /v1/admin/status
+
+Per-model health, **observed from real traffic**. The gateway sees every call and
+every failure, so status is measured rather than probed — no synthetic requests
+are ever sent, and nothing is billed to produce it.
+
+A model appears only once it has actually been called. Models absent from
+`models` have had no traffic: treat them as unknown rather than assuming health.
+
+Health is held in memory, so a restart correctly resets every model to "no
+observations yet" instead of serving a verdict from before the process (or the
+upstream) changed.
+
+| Status     | Meaning                                                    |
+| ---------- | ---------------------------------------------------------- |
+| `up`       | last call succeeded, within the latency budget              |
+| `degraded` | last call succeeded but took >8s, **or** 1 failure in a row |
+| `down`     | 2+ consecutive failures — one blip is never an outage       |
+
+Any success clears the failure streak immediately.
+
+#### Response `200 OK`
+
+```json
+{
+  "observed_at": 1700002000,
+  "models": [
+    {
+      "model": "deepseek-v4-flash",
+      "provider": "ollama",
+      "status": "up",
+      "consecutive_failures": 0,
+      "last_latency_ms": 412,
+      "last_ok_at": 1700001990,
+      "last_error_at": 0,
+      "last_error": "",
+      "ok_total": 1284,
+      "error_total": 3
+    },
+    {
+      "model": "kimi-k3",
+      "provider": "moonshot",
+      "status": "down",
+      "consecutive_failures": 2,
+      "last_latency_ms": 0,
+      "last_ok_at": 1700000100,
+      "last_error_at": 1700001980,
+      "last_error": "error",
+      "ok_total": 40,
+      "error_total": 2
+    }
+  ]
+}
+```
+
+#### Example
+
+```bash
+curl http://127.0.0.1:8080/v1/admin/status \
+  -H "Authorization: Bearer <master-key>"
+```
+
+---
+
 ### GET /v1/admin/keys
 
 List all API keys. The full key value is never returned — only the hint.
