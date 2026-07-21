@@ -132,14 +132,29 @@ mod tests {
     fn purpose_hierarchy_falls_back_by_dash_segment() {
         // One `supervisor` row covers all mechanics...
         let owner = map(&[("supervisor", "family"), ("default", "mine")]);
-        let got = resolve(Some("supervisor-gate"), Some(&owner), &HashMap::new(), |_| true);
+        let got = resolve(
+            Some("supervisor-gate"),
+            Some(&owner),
+            &HashMap::new(),
+            |_| true,
+        );
         assert_eq!(got.as_deref(), Some("family"));
 
         // ...until a specific mechanic is redefined.
         let owner = map(&[("supervisor-gate", "special"), ("supervisor", "family")]);
-        let got = resolve(Some("supervisor-gate"), Some(&owner), &HashMap::new(), |_| true);
+        let got = resolve(
+            Some("supervisor-gate"),
+            Some(&owner),
+            &HashMap::new(),
+            |_| true,
+        );
         assert_eq!(got.as_deref(), Some("special"));
-        let got = resolve(Some("supervisor-condense"), Some(&owner), &HashMap::new(), |_| true);
+        let got = resolve(
+            Some("supervisor-condense"),
+            Some(&owner),
+            &HashMap::new(),
+            |_| true,
+        );
         assert_eq!(got.as_deref(), Some("family"));
 
         // The owner's family entry still beats the config's exact entry —
