@@ -1,6 +1,7 @@
 use super::{
-    decode_allowed_models, encode_allowed_models, generate_api_key, make_key_hint, now_unix,
-    ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
+    decode_allowed_models, decode_auto_map, encode_allowed_models, encode_auto_map,
+    generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
+    StoredEmbedding, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use mysql::prelude::*;
@@ -92,6 +93,13 @@ impl MysqlStorage {
                 created_at BIGINT UNSIGNED NOT NULL,
                 INDEX idx_embeddings_api_key (api_key_id),
                 INDEX idx_embeddings_created (created_at)
+            )",
+        )?;
+        conn.query_drop(
+            "CREATE TABLE IF NOT EXISTS owner_auto_models (
+                owner VARCHAR(64) PRIMARY KEY,
+                map JSON NOT NULL,
+                updated_at BIGINT UNSIGNED NOT NULL
             )",
         )?;
         Ok(())
@@ -302,6 +310,39 @@ impl Storage for MysqlStorage {
             (owner, owner_concurrency, id),
         )?;
         Ok(conn.affected_rows() > 0)
+    }
+
+    fn get_owner_auto_map(
+        &self,
+        owner: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let mut conn = self.pool.get_conn()?;
+        let raw: Option<String> = conn.exec_first(
+            "SELECT map FROM owner_auto_models WHERE owner = ?",
+            (owner,),
+        )?;
+        Ok(decode_auto_map(raw))
+    }
+
+    fn set_owner_auto_map(
+        &self,
+        owner: &str,
+        map: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<()> {
+        let mut conn = self.pool.get_conn()?;
+        match map.filter(|m| !m.is_empty()) {
+            Some(m) => {
+                conn.exec_drop(
+                    "INSERT INTO owner_auto_models (owner, map, updated_at) VALUES (?, ?, ?) \
+                     ON DUPLICATE KEY UPDATE map = VALUES(map), updated_at = VALUES(updated_at)",
+                    (owner, encode_auto_map(m), now_unix()),
+                )?;
+            }
+            None => {
+                conn.exec_drop("DELETE FROM owner_auto_models WHERE owner = ?", (owner,))?;
+            }
+        }
+        Ok(())
     }
 
     fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {

@@ -65,6 +65,17 @@ fn auth_header(req: &Request<hyper::body::Incoming>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// The client's routing purpose for the virtual `auto` model. Read BEFORE the
+/// body is consumed; absent/blank → `None` (the `[auto]` default applies).
+fn model_purpose(req: &Request<hyper::body::Incoming>) -> Option<String> {
+    req.headers()
+        .get("X-Model-Purpose")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Handle POST /v1/completions
 pub async fn handle_create_completion(
     req: Request<hyper::body::Incoming>,
@@ -89,6 +100,7 @@ pub async fn handle_create_completion(
         }
     };
     tracing::Span::current().record("api_key_id", api_key.id);
+    let purpose = model_purpose(&req);
 
     // Read body
     let body_bytes = match req.collect().await {
@@ -118,7 +130,7 @@ pub async fn handle_create_completion(
 
     // Process
     let model_label = create_req.model.clone();
-    match engine.process(create_req, &api_key).await {
+    match engine.process(create_req, &api_key, purpose).await {
         Ok((response, upstream_duration)) => {
             tracing::Span::current().record("tok_in", response.usage.input_tokens);
             tracing::Span::current().record("tok_out", response.usage.output_tokens);
@@ -357,6 +369,7 @@ pub async fn handle_chat_completion(
         }
     };
     tracing::Span::current().record("api_key_id", api_key.id);
+    let purpose = model_purpose(&req);
 
     // Read body
     let body_bytes = match req.collect().await {
@@ -394,7 +407,7 @@ pub async fn handle_chat_completion(
 
     let per_key = engine.config().metrics.per_key;
 
-    match engine.process(create_req, &api_key).await {
+    match engine.process(create_req, &api_key, purpose).await {
         Ok((response, upstream_duration)) => {
             tracing::Span::current().record("tok_in", response.usage.input_tokens);
             tracing::Span::current().record("tok_out", response.usage.output_tokens);

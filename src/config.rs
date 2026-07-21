@@ -53,6 +53,13 @@ fn default_metrics_bind() -> String {
     "127.0.0.1:9090".to_string()
 }
 
+/// The reserved name that triggers purpose-based routing when `[auto]` is
+/// configured. Clients send `model: "auto"` plus an optional
+/// `X-Model-Purpose` header; the proxy picks the real alias.
+pub const AUTO_MODEL: &str = "auto";
+/// The reserved purpose key that terminates the resolution chain.
+pub const AUTO_DEFAULT_KEY: &str = "default";
+
 /// Server configuration loaded from TOML file (with env fallback)
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -67,6 +74,16 @@ pub struct Config {
     /// Embedding model mappings (same format as models)
     #[serde(default)]
     pub embedding_models: HashMap<String, Vec<String>>,
+    /// The virtual `auto` model: purpose → model-alias map, the deployment's
+    /// floor for purpose-based routing. When non-empty, a request for model
+    /// "auto" is rewritten to the alias this map (or the key owner's stored
+    /// override) picks for the request's `X-Model-Purpose` header, and THEN
+    /// routed through `[models]` like any other request. The reserved
+    /// `default` key is the ultimate fallback and must be present; every
+    /// value must be a `[models]` alias. Absent/empty = `auto` is not a
+    /// virtual model (a literal `[models.auto]` entry keeps working).
+    #[serde(default)]
+    pub auto: HashMap<String, String>,
     /// Per-provider tuning (concurrency, etc.). Keyed by lowercase provider
     /// name as returned by octolib (`ollama`, `openai`, `anthropic`, ...).
     /// Providers not listed have no concurrency limit applied.
@@ -209,6 +226,7 @@ impl Config {
                 .with_context(|| format!("Failed to read config file: {}", path))?;
             let mut config: Config = toml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {}", path))?;
+            config.validate_auto()?;
             // Override with environment variables if set
             if let Ok(master_key) = env::var("OCTOHUB_MASTER_KEY") {
                 config.server.api_key = master_key;
@@ -225,6 +243,50 @@ impl Config {
             tracing::info!("No config file specified, using defaults");
             Ok(Self::from_env())
         }
+    }
+
+    /// True when `model` is the virtual `auto` model on this deployment.
+    /// An empty `[auto]` means the feature is off and "auto" is an ordinary
+    /// (probably unknown) model name — old behavior, untouched.
+    pub fn is_auto(&self, model: &str) -> bool {
+        !self.auto.is_empty() && model == AUTO_MODEL
+    }
+
+    /// Fail loudly at load on an `[auto]` section that cannot work. Every value
+    /// must be a `[models]` alias (ONE indirection — auto resolves to an alias,
+    /// the alias resolves to providers), `default` must exist so resolution
+    /// always terminates, and a literal `[models.auto]` entry alongside the
+    /// virtual model would be ambiguous.
+    fn validate_auto(&self) -> Result<()> {
+        if self.auto.is_empty() {
+            return Ok(());
+        }
+        if self.models.contains_key(AUTO_MODEL) {
+            anyhow::bail!(
+                "[auto] is configured but '{}' is also defined in [models] — remove one",
+                AUTO_MODEL
+            );
+        }
+        if !self.auto.contains_key(AUTO_DEFAULT_KEY) {
+            anyhow::bail!("[auto] must define a '{}' entry", AUTO_DEFAULT_KEY);
+        }
+        for (purpose, target) in &self.auto {
+            if target == AUTO_MODEL {
+                anyhow::bail!(
+                    "[auto].{} must not point at '{}' itself",
+                    purpose,
+                    AUTO_MODEL
+                );
+            }
+            if !self.models.contains_key(target) {
+                anyhow::bail!(
+                    "[auto].{} points at '{}', which is not defined in [models]",
+                    purpose,
+                    target
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Apply environment variable overrides to a loaded config.
@@ -285,6 +347,7 @@ impl Config {
             },
             models: HashMap::new(),
             embedding_models: HashMap::new(),
+            auto: HashMap::new(),
             providers: HashMap::new(),
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
@@ -438,6 +501,7 @@ mod tests {
             server: Default::default(),
             models: HashMap::new(),
             embedding_models: HashMap::new(),
+            auto: HashMap::new(),
             providers,
             logging: Default::default(),
             metrics: Default::default(),
@@ -445,6 +509,63 @@ mod tests {
         assert!(config.provider_config("openai").is_some());
         assert!(config.provider_config("OPENAI").is_some());
         assert!(config.provider_config("ollama").is_none());
+    }
+
+    fn config_with_auto(models: &[(&str, &str)], auto: &[(&str, &str)]) -> Config {
+        Config {
+            server: Default::default(),
+            models: models
+                .iter()
+                .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+                .collect(),
+            embedding_models: HashMap::new(),
+            auto: auto
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            providers: HashMap::new(),
+            logging: Default::default(),
+            metrics: Default::default(),
+        }
+    }
+
+    #[test]
+    fn auto_validation_accepts_a_complete_map_and_stays_off_when_empty() {
+        let ok = config_with_auto(
+            &[("glm", "zai:glm-4.7"), ("cheap", "deepseek:v4")],
+            &[("default", "glm"), ("compression", "cheap")],
+        );
+        assert!(ok.validate_auto().is_ok());
+        assert!(ok.is_auto("auto"));
+        assert!(!ok.is_auto("glm"));
+
+        let off = config_with_auto(&[("glm", "zai:glm-4.7")], &[]);
+        assert!(off.validate_auto().is_ok());
+        // Empty [auto] = feature off: "auto" is an ordinary model name.
+        assert!(!off.is_auto("auto"));
+    }
+
+    #[test]
+    fn auto_validation_fails_loudly_on_broken_maps() {
+        // No default → resolution could dead-end.
+        let c = config_with_auto(&[("glm", "z:g")], &[("compression", "glm")]);
+        assert!(c
+            .validate_auto()
+            .unwrap_err()
+            .to_string()
+            .contains("default"));
+
+        // Target not in [models] → typo caught at load, not at request time.
+        let c = config_with_auto(&[("glm", "z:g")], &[("default", "nope")]);
+        assert!(c.validate_auto().is_err());
+
+        // A literal models.auto alongside [auto] is ambiguous.
+        let c = config_with_auto(&[("auto", "z:g"), ("glm", "z:g")], &[("default", "glm")]);
+        assert!(c.validate_auto().is_err());
+
+        // Self-reference can never resolve.
+        let c = config_with_auto(&[("glm", "z:g")], &[("default", "auto")]);
+        assert!(c.validate_auto().is_err());
     }
 
     #[test]
@@ -458,6 +579,7 @@ mod tests {
             server: Default::default(),
             models,
             embedding_models: HashMap::new(),
+            auto: HashMap::new(),
             providers: HashMap::new(),
             logging: Default::default(),
             metrics: Default::default(),

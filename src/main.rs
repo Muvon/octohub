@@ -393,6 +393,14 @@ async fn route_admin(
             };
             api::admin::handle_update_key_owner(req, storage, master_key, key_id).await
         }
+        // GET/PUT /v1/admin/owners/:owner/auto — the owner's purpose→alias
+        // override map for the virtual `auto` model
+        (Method::GET, ["owners", owner, "auto"]) => {
+            api::admin::handle_get_owner_auto(req, storage, master_key, owner).await
+        }
+        (Method::PUT, ["owners", owner, "auto"]) => {
+            api::admin::handle_set_owner_auto(req, storage, master_key, owner).await
+        }
         // GET /v1/admin/status — per-model health observed from real traffic
         (Method::GET, ["status"]) => api::admin::handle_status(req, master_key).await,
         // GET /v1/admin/usage
