@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.6.0] - 2026-07-21
+
+### 📋 Release Summary
+
+This release introduces purpose-based auto model resolution to optimize how the proxy selects the most appropriate model for a given task (3d56248c, 107812b1). Additionally, the update includes expanded API documentation for the admin status endpoint and general system stability improvements (57391558, c08dbe63).
+
+
+### ✨ New Features & Enhancements
+
+- **proxy**: add hierarchical purpose resolution for auto models `3d56248c`
+- **routing**: implement purpose-based auto model resolution `107812b1`
+
+### 🔧 Improvements & Optimizations
+
+- **proxy**: format resolve calls in tests `dbeacf9a`
+
+### 📚 Documentation & Examples
+
+- **api**: document admin status endpoint `57391558`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.5.0] - 2026-07-19
 
 ### 📋 Release Summary
