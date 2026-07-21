@@ -12,6 +12,10 @@
 //! 3. config `[auto].[purpose]` — the deployment's floor
 //! 4. config `[auto].[default]`
 //!
+//! Within each map, purposes fall back hierarchically by dash segment
+//! (`supervisor-gate` → `supervisor` → `default`), so one `supervisor` entry
+//! covers every supervisor mechanic until a specific one is redefined.
+//!
 //! An owner who set only `default` means "use this for everything" — their
 //! choice beats the config's purpose-specific entry, which is why the owner
 //! chain runs to its own default before the config chain starts. Entries whose
@@ -22,6 +26,31 @@
 use std::collections::HashMap;
 
 use crate::config::AUTO_DEFAULT_KEY;
+
+/// Purposes are hierarchical by dash segments: `supervisor-gate` falls back to
+/// `supervisor` before a map's `default`. One `supervisor` entry covers every
+/// supervisor mechanic; a specific `supervisor-gate` entry overrides just that
+/// one. Returns the match candidates for `purpose` within ONE map, most
+/// specific first.
+fn lookup<'m>(map: &'m HashMap<String, String>, purpose: Option<&str>) -> Vec<&'m String> {
+    let mut out = Vec::new();
+    if let Some(p) = purpose {
+        let mut key = p;
+        loop {
+            if let Some(target) = map.get(key) {
+                out.push(target);
+            }
+            match key.rfind('-') {
+                Some(i) => key = &key[..i],
+                None => break,
+            }
+        }
+    }
+    if let Some(target) = map.get(AUTO_DEFAULT_KEY) {
+        out.push(target);
+    }
+    out
+}
 
 /// Pick the model alias for an `auto` request. `purpose` is the raw
 /// `X-Model-Purpose` header value (unknown/missing purposes just fall to the
@@ -34,13 +63,9 @@ pub fn resolve(
     config_map: &HashMap<String, String>,
     known: impl Fn(&str) -> bool,
 ) -> Option<String> {
-    let chain = [
-        purpose.and_then(|p| owner_map.and_then(|m| m.get(p))),
-        owner_map.and_then(|m| m.get(AUTO_DEFAULT_KEY)),
-        purpose.and_then(|p| config_map.get(p)),
-        config_map.get(AUTO_DEFAULT_KEY),
-    ];
-    for target in chain.into_iter().flatten() {
+    let owner_chain = owner_map.map(|m| lookup(m, purpose)).unwrap_or_default();
+    let config_chain = lookup(config_map, purpose);
+    for target in owner_chain.into_iter().chain(config_chain) {
         if known(target) {
             return Some(target.clone());
         }
@@ -101,6 +126,28 @@ mod tests {
             m == "strong"
         });
         assert_eq!(got.as_deref(), Some("strong"));
+    }
+
+    #[test]
+    fn purpose_hierarchy_falls_back_by_dash_segment() {
+        // One `supervisor` row covers all mechanics...
+        let owner = map(&[("supervisor", "family"), ("default", "mine")]);
+        let got = resolve(Some("supervisor-gate"), Some(&owner), &HashMap::new(), |_| true);
+        assert_eq!(got.as_deref(), Some("family"));
+
+        // ...until a specific mechanic is redefined.
+        let owner = map(&[("supervisor-gate", "special"), ("supervisor", "family")]);
+        let got = resolve(Some("supervisor-gate"), Some(&owner), &HashMap::new(), |_| true);
+        assert_eq!(got.as_deref(), Some("special"));
+        let got = resolve(Some("supervisor-condense"), Some(&owner), &HashMap::new(), |_| true);
+        assert_eq!(got.as_deref(), Some("family"));
+
+        // The owner's family entry still beats the config's exact entry —
+        // owner-first, then specificity within each map.
+        let owner = map(&[("supervisor", "family")]);
+        let config = map(&[("supervisor-gate", "cfg-exact"), ("default", "floor")]);
+        let got = resolve(Some("supervisor-gate"), Some(&owner), &config, |_| true);
+        assert_eq!(got.as_deref(), Some("family"));
     }
 
     #[test]

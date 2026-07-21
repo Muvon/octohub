@@ -91,14 +91,26 @@ OctoHub's native Responses API. Supports multi-turn conversation chains, reasoni
 
 #### The virtual `auto` model
 
-When the server config has an `[auto]` section, `"model": "auto"` routes by **purpose** instead of naming a model. The client says *where the call comes from* via the `X-Model-Purpose` header (any string; Octomind sends `main` / `supervisor` / `compression`), and the proxy rewrites `auto` to a real `[models]` alias before ordinary routing:
+When the server config has an `[auto]` section, `"model": "auto"` routes by **purpose** instead of naming a model. The client says *where the call comes from* via the `X-Model-Purpose` header — any string you like; purposes are yours to invent per deployment (Octomind sends `main`, `compression`, and `supervisor-gate` / `supervisor-condense` / `supervisor-distill` / `supervisor-recall`). The proxy rewrites `auto` to a real `[models]` alias before ordinary routing.
 
-1. the key owner's stored override map for that purpose (`PUT /v1/admin/owners/:owner/auto`)
-2. the owner map's `default`
-3. `[auto].<purpose>` from config
-4. `[auto].default` from config
+**Purposes are hierarchical, split on `-`.** Within a map, `supervisor-gate` is looked up as `supervisor-gate` → `supervisor` → `default`, most specific first. That means one `supervisor` entry covers every `supervisor-*` purpose until you pin a specific one — you define exactly as many rows as you have opinions:
 
-An owner who stored only `default` gets it for every purpose — their choice beats the config's purpose entry. A missing/unknown purpose header just falls to the defaults. Key `allowed_models` is enforced on **both** the as-sent `"auto"` and the resolved alias, so `auto` never grants access the key's roster doesn't. Stored completions keep `input_model = "auto"` with the real `resolved_model`, and metrics/health record the resolved model — `auto` is invisible downstream of resolution.
+```toml
+[auto]
+default = "workhorse"            # everything, unless something below says otherwise
+compression = "cheap"            # exact purpose match
+supervisor = "judge"             # covers supervisor-gate, supervisor-recall, supervisor-anything
+# "supervisor-gate" = "strict"   # uncomment to carve just the gate out of the family
+```
+
+The full resolution order (first usable entry wins; an entry pointing at a model no longer in `[models]` is skipped):
+
+1. the key owner's stored map (`PUT /v1/admin/owners/:owner/auto`), walked `purpose` → dash-stripped prefixes → `default`
+2. the `[auto]` config floor, walked the same way
+
+The owner's whole chain runs before the config's — an owner who stored only `default` gets it for every purpose, beating even an exact-purpose config entry, because "use this for everything" is what storing only a default means. A missing or unknown purpose header just falls to the defaults; a typo degrades, never fails.
+
+Key `allowed_models` is enforced on **both** the as-sent `"auto"` and the resolved alias, so `auto` never grants access the key's roster doesn't. Stored completions keep `input_model = "auto"` with the real `resolved_model`, and metrics/health record the resolved model — `auto` is invisible downstream of resolution.
 
 ```bash
 curl http://127.0.0.1:8080/v1/completions \
