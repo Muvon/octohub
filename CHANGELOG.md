@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.1] - 2026-07-26
+
+### 📋 Release Summary
+
+This release includes routine dependency updates to ensure optimal performance and security (d97304fe).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.6.0] - 2026-07-21
 
 ### 📋 Release Summary
