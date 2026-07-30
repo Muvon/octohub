@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.2] - 2026-07-30
+
+### 📋 Release Summary
+
+This release introduces support for the Google Studio provider, expanding the range of available LLM integrations (c0df0e67).
+
+
+### ✨ New Features & Enhancements
+
+- **octolib**: add Google Studio provider support `c0df0e67`
+
 ## [0.6.1] - 2026-07-26
 
 ### 📋 Release Summary
