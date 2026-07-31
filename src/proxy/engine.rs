@@ -78,6 +78,29 @@ impl std::fmt::Display for RateLimitedError {
 
 impl std::error::Error for RateLimitedError {}
 
+/// A candidate provider does not support a modality required by the request
+/// (e.g. video or image attachments). The caller should skip this candidate
+/// and try the next one — this is NOT a provider fault and must not trigger
+/// health penalties or cooldowns.
+#[derive(Debug)]
+pub struct ModalityNotSupportedError {
+    pub provider: String,
+    pub model: String,
+    pub modality: String,
+}
+
+impl std::fmt::Display for ModalityNotSupportedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Provider '{}' model '{}' does not support {} attachments",
+            self.provider, self.model, self.modality
+        )
+    }
+}
+
+impl std::error::Error for ModalityNotSupportedError {}
+
 /// Extract the upstream HTTP status embedded in an octolib provider error.
 /// octolib formats provider failures as "... API error <code> <message>", e.g.
 /// "ollama API error 400 Bad Request: ...". Returns the first such code, if any.
@@ -371,6 +394,30 @@ impl ProxyEngine {
                 let provider = ProviderFactory::create_provider(&provider_name)
                     .with_context(|| format!("Provider '{}' not available", provider_name))?;
 
+                // Modality compatibility: fail fast so the outer loop can skip
+                // this candidate without counting it as a provider fault.
+                let has_videos = messages.iter().any(|m| {
+                    m.videos.as_ref().is_some_and(|v| !v.is_empty())
+                });
+                if has_videos && !provider.supports_video(&resolved_model) {
+                    return Err(anyhow!(ModalityNotSupportedError {
+                        provider: provider_name.clone(),
+                        model: resolved_model.clone(),
+                        modality: "video".to_string(),
+                    }));
+                }
+
+                let has_images = messages.iter().any(|m| {
+                    m.images.as_ref().is_some_and(|i| !i.is_empty())
+                });
+                if has_images && !provider.supports_vision(&resolved_model) {
+                    return Err(anyhow!(ModalityNotSupportedError {
+                        provider: provider_name.clone(),
+                        model: resolved_model.clone(),
+                        modality: "image".to_string(),
+                    }));
+                }
+
                 // 6. Build ChatCompletionParams
                 let tools = req.tools.as_ref().map(|tools| {
                     tools
@@ -385,8 +432,6 @@ impl ProxyEngine {
                         })
                         .collect::<Vec<_>>()
                 });
-
-                // Sampling: forward temperature + top_p straight from the client.
                 // top_k is not part of the Responses-API wire shape (octolib client
                 // never sends it), so we leave it at a neutral default; upstream
                 // providers that don't honor it ignore it harmlessly.
@@ -495,6 +540,25 @@ impl ProxyEngine {
                     break (provider_name, resolved_model, provider, response, duration);
                 }
                 Err(err) => {
+                    // Modality mismatch is a candidate filter, not a provider fault.
+                    if let Some(modality_err) = err.downcast_ref::<ModalityNotSupportedError>() {
+                        candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&modality_err.provider));
+                        if candidates.is_empty() {
+                            return Err(anyhow!(
+                                "No provider candidate supports {} attachments for model '{}'",
+                                modality_err.modality,
+                                routed_model
+                            ));
+                        }
+                        tracing::info!(
+                            provider = %modality_err.provider,
+                            model = %modality_err.model,
+                            modality = %modality_err.modality,
+                            "provider does not support modality — skipping to next candidate"
+                        );
+                        continue;
+                    }
+
                     let provider_fault = is_provider_fault(&err);
                     if provider_fault {
                         self.provider_health
