@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.3] - 2026-07-31
+
+### 📋 Release Summary
+
+This release includes an update to the core library dependencies to ensure improved stability and performance (9fec4f24).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.6.2] - 2026-07-30
 
 ### 📋 Release Summary
