@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.4] - 2026-08-01
+
+### 📋 Release Summary
+
+This release introduces modality compatibility checks to ensure more reliable interactions between clients and LLMs (0cb6a931). Additionally, various core dependencies have been updated to improve overall system stability and performance (d2aa1b73, 7a697129, 31c5ffc6).
+
+
+### ✨ New Features & Enhancements
+
+- **proxy**: add modality compatibility checks `0cb6a931`
+
+### 🔄 Other Changes
+
+3 maintenance, dependency, and tooling updates not listed individually.
+
 ## [0.6.3] - 2026-07-31
 
 ### 📋 Release Summary
