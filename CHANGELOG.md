@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.5] - 2026-08-04
+
+### 📋 Release Summary
+
+This release includes routine dependency updates to ensure optimal performance and security (ce8ee7e3).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.6.4] - 2026-08-01
 
 ### 📋 Release Summary
