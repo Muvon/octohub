@@ -13,8 +13,6 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// A successful call slower than this means the model is up but struggling.
-const DEGRADED_MS: u128 = 8_000;
 /// Consecutive failures before a model is called down. One blip is not an
 /// outage — a single upstream hiccup must not paint a red light on a pricing page.
 const DOWN_AFTER_FAILURES: u32 = 2;
@@ -44,7 +42,13 @@ fn now_secs() -> u64 {
 /// every completion and embedding path already goes through, so no call site can
 /// silently forget to report.
 pub fn record(model: &str, provider: &str, ok: bool, duration: Duration, error: &str) {
-    if model.is_empty() {
+    // `auto` is a routing instruction, never a servable model. The success path
+    // reports the RESOLVED model while the error path only knows the string the
+    // client sent, so an auto-routed failure lands under "auto" while its successes
+    // land under the real model — an entry that can only ever accumulate failures,
+    // and is therefore guaranteed to reach "down" and stay there. A request that
+    // never resolved to a model is evidence about nothing.
+    if model.is_empty() || model == crate::config::AUTO_MODEL {
         return;
     }
     let Ok(mut guard) = REGISTRY.write() else {
@@ -70,14 +74,19 @@ pub fn record(model: &str, provider: &str, ok: bool, duration: Duration, error: 
 }
 
 /// up | degraded | down for one model's accumulated stats.
+///
+/// FAILURES ONLY. Duration is recorded for display but must never classify: a
+/// completion's total latency is time-to-first-token plus one increment per
+/// generated token, so it scales with output length, context size and the model's
+/// own speed. A reasoning model writing a long answer breaches any fixed bound
+/// while working perfectly — which is exactly what a threshold here did, painting
+/// healthy models "degraded" with zero failures. The length-independent metric is
+/// TTFT; until it is measured separately, latency is not a verdict.
 fn classify(stat: &ModelStat) -> &'static str {
     if stat.consecutive_failures >= DOWN_AFTER_FAILURES {
         return "down";
     }
     if stat.consecutive_failures > 0 {
-        return "degraded";
-    }
-    if stat.last_latency_ms > DEGRADED_MS {
         return "degraded";
     }
     "up"
@@ -135,9 +144,32 @@ mod tests {
     }
 
     #[test]
-    fn healthy_but_slow_call_is_degraded() {
-        assert_eq!(classify(&stat(0, DEGRADED_MS)), "up");
-        assert_eq!(classify(&stat(0, DEGRADED_MS + 1)), "degraded");
+    fn slow_is_not_unhealthy_at_any_duration() {
+        // A long answer is not an outage. Total latency scales with output length,
+        // so no fixed bound can separate "struggling" from "writing a lot".
+        assert_eq!(classify(&stat(0, 8_000)), "up");
+        assert_eq!(classify(&stat(0, 600_000)), "up");
+    }
+
+    #[test]
+    fn auto_is_never_recorded_as_a_model() {
+        // Failures on an auto-routed call would otherwise accrue to a phantom model
+        // that never receives the matching successes.
+        record(
+            crate::config::AUTO_MODEL,
+            "openrouter",
+            false,
+            Duration::from_millis(10),
+            "boom",
+        );
+        let snap = snapshot();
+        let models = snap["models"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !models
+                .iter()
+                .any(|m| m["model"] == crate::config::AUTO_MODEL),
+            "'auto' leaked into the health registry"
+        );
     }
 
     #[test]
