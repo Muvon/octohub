@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.0] - 2026-08-08
+
+### 📋 Release Summary
+
+This release introduces support for emulated SSE streaming in chat completions to enhance real-time response delivery (f255d172). Additionally, internal dependencies have been updated to ensure improved system stability and performance (1081d523).
+
+
+### ✨ New Features & Enhancements
+
+- **api**: implement emulated SSE streaming for chat completions `f255d172`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.6.5] - 2026-08-04
 
 ### 📋 Release Summary
