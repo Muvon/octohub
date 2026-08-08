@@ -393,12 +393,13 @@ pub async fn handle_chat_completion(
         }
     };
 
-    if chat_req.stream {
-        return error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "Streaming is not supported on this endpoint",
-        );
-    }
+    // Streaming is emulated: the upstream call stays buffered (same engine
+    // path as non-streaming), and the finished response is re-framed as
+    // OpenAI `chat.completion.chunk` SSE on the way out. Clients that require
+    // `stream: true` get a fully OpenAI-compatible `text/event-stream`;
+    // time-to-first-token is the same as non-streaming (see
+    // `chat_completion_stream_body`).
+    let stream = chat_req.stream;
 
     // Convert to internal representation — same engine path as /v1/completions
     let model_label = chat_req.model.clone();
@@ -424,8 +425,18 @@ pub async fn handle_chat_completion(
             );
 
             let chat_resp: ChatCompletionResponse = response.into();
-            let body = serde_json::to_value(&chat_resp).unwrap_or_default();
-            json_response(StatusCode::OK, body)
+            if stream {
+                let body = Bytes::from(chat_completion_stream_body(&chat_resp));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "text/event-stream")
+                    .header("Cache-Control", "no-cache")
+                    .body(Full::new(body))
+                    .unwrap()
+            } else {
+                let body = serde_json::to_value(&chat_resp).unwrap_or_default();
+                json_response(StatusCode::OK, body)
+            }
         }
         Err(e) => {
             let (status, msg) = classify_engine_error(&e);
@@ -451,9 +462,103 @@ pub async fn handle_chat_completion(
     }
 }
 
+/// Render a finished classic chat response as OpenAI `chat.completion.chunk`
+/// SSE. The upstream is called buffered (see `handle_chat_completion`), so this
+/// is format-compatibility streaming: content is re-framed into a sequence of
+/// deltas the way a real stream would arrive, then a `[DONE]` sentinel. The
+/// concatenated `delta.content` of every chunk reassembles the exact original
+/// text.
+fn chat_completion_stream_body(resp: &ChatCompletionResponse) -> String {
+    let choice = resp
+        .choices
+        .first()
+        .expect("chat completion has one choice");
+    let id = &resp.id;
+    let created = resp.created;
+    let model = &resp.model;
+    let finish_reason = &choice.finish_reason;
+
+    let base = |delta: serde_json::Value| {
+        serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": serde_json::Value::Null,
+            }],
+        })
+    };
+
+    let mut out = String::new();
+
+    // First delta carries the assistant role, matching a real stream's opening
+    // chunk so clients that await `delta.role` before reading content see it.
+    out.push_str(&sse_chunk(base(serde_json::json!({ "role": "assistant" }))));
+
+    // Split content on whitespace boundaries so token-counting clients see a
+    // sequence of deltas rather than one blob. Each chunk is the *increment*
+    // since the previous boundary, so concatenating all `delta.content` values
+    // reassembles the exact original text (SSE deltas are not running prefixes).
+    if let Some(content) = &choice.message.content {
+        let mut prev = 0;
+        for word_end in split_words(content) {
+            out.push_str(&sse_chunk(base(serde_json::json!({
+                "content": &content[prev..word_end],
+            }))));
+            prev = word_end;
+        }
+    }
+
+    // Terminal chunk: empty delta carrying the finish reason.
+    out.push_str(&sse_chunk(serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": serde_json::json!({}),
+            "finish_reason": finish_reason,
+        }],
+    })));
+
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+/// Offsets of whitespace-delimited word boundaries in `s`, so the full text can
+/// be sliced into per-word SSE deltas. Returns the end index of each word.
+fn split_words(s: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut prev = 0;
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() {
+            if i > prev {
+                ends.push(i);
+            }
+            prev = i + c.len_utf8();
+        }
+    }
+    if prev < s.len() {
+        ends.push(s.len());
+    }
+    ends
+}
+
+fn sse_chunk(value: serde_json::Value) -> String {
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&value).unwrap_or_default()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::types::{ChatChoice, ChatResponseMessage, ChatUsage};
     use anyhow::Context;
 
     #[test]
@@ -576,5 +681,59 @@ mod tests {
         let error = anyhow::anyhow!("database connection lost");
         let (status, _) = classify_engine_error(&error);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn stream_body_concatenated_deltas_reassemble_original_text() {
+        let resp = ChatCompletionResponse {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion",
+            created: 1_700_000_000,
+            model: "gpt-test".to_string(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatResponseMessage {
+                    role: "assistant",
+                    content: Some("Hello, world!  This is a test.".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: "stop".to_string(),
+            }],
+            usage: ChatUsage {
+                prompt_tokens: 3,
+                completion_tokens: 7,
+                total_tokens: 10,
+            },
+        };
+
+        let body = chat_completion_stream_body(&resp);
+
+        // Terminates with the [DONE] sentinel.
+        assert!(body.ends_with("data: [DONE]\n\n"), "body: {body}");
+
+        // Concatenating every chunk's delta.content must reassemble the exact
+        // original text (SSE deltas are increments, not running prefixes).
+        let mut reassembled = String::new();
+        for data_line in body.lines().filter(|l| l.starts_with("data: ")) {
+            if data_line == "data: [DONE]" {
+                continue;
+            }
+            let chunk: serde_json::Value = serde_json::from_str(&data_line[6..]).unwrap();
+            let delta = &chunk["choices"][0]["delta"];
+            // Skip the role-only opening chunk and the empty terminal delta.
+            if let Some(content) = delta["content"].as_str() {
+                reassembled.push_str(content);
+            }
+        }
+        assert_eq!(reassembled, "Hello, world!  This is a test.");
+    }
+
+    #[test]
+    fn split_words_returns_increment_boundaries() {
+        assert_eq!(split_words("Hello world"), vec![5, 11]);
+        assert_eq!(split_words("  leading and  trailing  "), vec![9, 13, 23]);
+        assert_eq!(split_words("single"), vec![6]);
+        assert_eq!(split_words("abc  def"), vec![3, 8]);
+        assert_eq!(split_words(""), Vec::<usize>::new());
     }
 }
