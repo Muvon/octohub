@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.1] - 2026-08-08
+
+### 📋 Release Summary
+
+This release includes a bug fix to improve the reliability of health checks by refining how model thresholds are handled (440b8fec).
+
+
+### 🐛 Bug Fixes & Stability
+
+- **health**: ignore auto-model and latency thresholds `440b8fec`
+
 ## [0.7.0] - 2026-08-08
 
 ### 📋 Release Summary
