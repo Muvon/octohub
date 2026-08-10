@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.2] - 2026-08-10
+
+### 📋 Release Summary
+
+This release includes updated Rust dependencies to ensure improved system stability and performance (fcf09267).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.7.1] - 2026-08-08
 
 ### 📋 Release Summary
