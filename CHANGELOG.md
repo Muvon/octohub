@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.4] - 2026-08-21
+
+### 📋 Release Summary
+
+This release includes dependency updates to improve system stability and performance (9d3385da, fa6adb8b).
+
+
+### 🔄 Other Changes
+
+2 maintenance, dependency, and tooling updates not listed individually.
+
 ## [0.7.3] - 2026-08-17
 
 ### 📋 Release Summary
