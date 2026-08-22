@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.5] - 2026-08-22
+
+### 📋 Release Summary
+
+This release includes a dependency update to octolib v0.34.1 to ensure improved system stability and performance (ad6eee16).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.7.4] - 2026-08-21
 
 ### 📋 Release Summary
