@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.7] - 2026-08-26
+
+### 📋 Release Summary
+
+This release introduces enhanced modality handling and improved content parsing (24def18e).
+
+
+### ✨ New Features & Enhancements
+
+- **api**: enhance modality handling and content parsing `24def18e`
+
 ## [0.7.6] - 2026-08-22
 
 ### 📋 Release Summary
