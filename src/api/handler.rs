@@ -9,8 +9,8 @@ use crate::api::types::{
 };
 use crate::auth::{authenticate_client, ClientAuth};
 use crate::proxy::engine::{
-    upstream_status_code, ProxyEngine, ProxyTimeoutError, RateLimitedError, MODEL_FORBIDDEN_MARKER,
-    OWNER_LIMIT_MARKER,
+    upstream_status_code, ModalityNotSupportedError, ProxyEngine, ProxyTimeoutError,
+    RateLimitedError, MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
 };
 use crate::storage::Storage;
 
@@ -25,27 +25,52 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<BoxBod
         .unwrap()
 }
 
+/// CROSS-REPO CONTRACT: the `error.type` value clients match on to detect that
+/// the selected model cannot accept an attached modality. `octomind` pre-checks
+/// capability locally and relies on this string as the backstop for models its
+/// own capability table does not know, so it must never be reworded — callers
+/// must not have to regex the prose message to identify the condition.
+pub const MODALITY_ERROR_TYPE: &str = "modality_not_supported";
+
+/// The default OpenAI-compatible error discriminator.
+const DEFAULT_ERROR_TYPE: &str = "invalid_request_error";
+
 fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
+    error_response_typed(status, message, DEFAULT_ERROR_TYPE)
+}
+
+fn error_response_typed(status: StatusCode, message: &str, error_type: &str) -> Response<BoxBody> {
     json_response(
         status,
         serde_json::json!({
             "error": {
                 "message": message,
-                "type": "invalid_request_error"
+                "type": error_type
             }
         }),
     )
 }
 
+/// The `error.type` discriminator for an engine failure. Conditions a caller
+/// must BRANCH on get their own string; everything else stays the generic
+/// OpenAI-compatible default.
+fn engine_error_type(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<ModalityNotSupportedError>().is_some() {
+        return MODALITY_ERROR_TYPE;
+    }
+    DEFAULT_ERROR_TYPE
+}
+
 /// `error_response` plus a `Retry-After` header when the failure is a
 /// provider rate-window rejection, so well-behaved clients back off for
-/// exactly as long as the window needs.
+/// exactly as long as the window needs, and a specific `error.type` for
+/// conditions a caller has to branch on rather than merely display.
 fn engine_error_response(
     error: &anyhow::Error,
     status: StatusCode,
     message: &str,
 ) -> Response<BoxBody> {
-    let mut response = error_response(status, message);
+    let mut response = error_response_typed(status, message, engine_error_type(error));
     if let Some(rate) = error.downcast_ref::<RateLimitedError>() {
         let secs = rate.retry_after.as_secs().max(1);
         if let Ok(value) = hyper::header::HeaderValue::from_str(&secs.to_string()) {
@@ -303,6 +328,10 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
         // Every candidate provider's rate window is exhausted — retryable,
         // just not yet. `engine_error_response` adds the Retry-After header.
         return (StatusCode::TOO_MANY_REQUESTS, top);
+    }
+
+    if error.downcast_ref::<ModalityNotSupportedError>().is_some() {
+        return (StatusCode::BAD_REQUEST, top);
     }
 
     if top.contains(OWNER_LIMIT_MARKER) {
@@ -619,6 +648,41 @@ mod tests {
             response.headers().get(hyper::header::RETRY_AFTER).unwrap(),
             "37"
         );
+    }
+
+    #[test]
+    fn modality_exhaustion_maps_to_distinct_client_error() {
+        let error = anyhow::anyhow!(ModalityNotSupportedError {
+            provider: "ollama".to_string(),
+            model: "llama3.2".to_string(),
+            modality: "image".to_string(),
+        });
+
+        let (status, message) = classify_engine_error(&error);
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("llama3.2"));
+        assert!(message.contains("image"));
+        assert!(!message.contains("No provider candidate"));
+    }
+
+    #[test]
+    fn modality_error_carries_the_cross_repo_discriminator() {
+        // octomind branches on `error.type`, never on the prose message.
+        let error = anyhow::anyhow!(ModalityNotSupportedError {
+            provider: "ollama".to_string(),
+            model: "llama3.2".to_string(),
+            modality: "image".to_string(),
+        });
+
+        assert_eq!(engine_error_type(&error), "modality_not_supported");
+    }
+
+    #[test]
+    fn ordinary_engine_errors_keep_the_generic_discriminator() {
+        let error = anyhow::anyhow!("database connection lost");
+
+        assert_eq!(engine_error_type(&error), "invalid_request_error");
     }
 
     #[test]

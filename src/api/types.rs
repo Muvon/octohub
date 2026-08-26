@@ -461,21 +461,60 @@ pub enum ChatMessageContent {
 }
 
 /// A single typed content part in the classic parts array.
+/// Unknown types are rejected rather than becoming empty content.
 #[derive(Debug, Deserialize)]
-pub struct ChatContentPart {
-    #[serde(rename = "type")]
-    pub part_type: String,
-    #[serde(default)]
-    pub text: Option<String>,
-    /// `image_url` object: `{"url": "https://..."}` or data URI.
-    #[serde(default)]
-    pub image_url: Option<ChatImageUrl>,
+#[serde(tag = "type")]
+pub enum ChatContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ChatImageUrl },
+    /// Anthropic-compatible base64 image block.
+    #[serde(rename = "image")]
+    Image { source: ChatImageSource },
 }
 
 /// Classic image_url wrapper.
 #[derive(Debug, Deserialize)]
 pub struct ChatImageUrl {
     pub url: String,
+}
+
+/// Anthropic image source. Only the supported base64 shape is accepted.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatImageSource {
+    Base64 { media_type: String, data: String },
+}
+
+impl From<&ChatContentPart> for ContentPartInput {
+    fn from(part: &ChatContentPart) -> Self {
+        match part {
+            ChatContentPart::Text { text } => Self {
+                part_type: "text".into(),
+                text: Some(text.clone()),
+                image_url: None,
+                video_url: None,
+                cache_control: None,
+            },
+            ChatContentPart::ImageUrl { image_url } => Self {
+                part_type: "input_image".into(),
+                text: None,
+                image_url: Some(image_url.url.clone()),
+                video_url: None,
+                cache_control: None,
+            },
+            ChatContentPart::Image {
+                source: ChatImageSource::Base64 { media_type, data },
+            } => Self {
+                part_type: "input_image".into(),
+                text: None,
+                image_url: Some(format!("data:{};base64,{}", media_type, data)),
+                video_url: None,
+                cache_control: None,
+            },
+        }
+    }
 }
 
 /// Classic tool definition.
@@ -612,8 +651,10 @@ fn content_as_text(content: Option<&ChatMessageContent>) -> Option<String> {
         ChatMessageContent::Parts(parts) => {
             let text: String = parts
                 .iter()
-                .filter(|p| p.part_type == "text")
-                .filter_map(|p| p.text.as_deref())
+                .filter_map(|p| match p {
+                    ChatContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
                 .collect::<Vec<_>>()
                 .join("");
             if text.is_empty() {
@@ -677,22 +718,9 @@ fn content_value_from_chat(content: Option<&ChatMessageContent>, _text: &str) ->
     match content {
         None => ContentValue::Text(String::new()),
         Some(ChatMessageContent::Text(s)) => ContentValue::Text(s.clone()),
-        Some(ChatMessageContent::Parts(parts)) => ContentValue::Parts(
-            parts
-                .iter()
-                .map(|p| ContentPartInput {
-                    part_type: if p.part_type == "image_url" {
-                        "input_image".into()
-                    } else {
-                        p.part_type.clone()
-                    },
-                    text: p.text.clone(),
-                    image_url: p.image_url.as_ref().map(|u| u.url.clone()),
-                    video_url: None,
-                    cache_control: None,
-                })
-                .collect(),
-        ),
+        Some(ChatMessageContent::Parts(parts)) => {
+            ContentValue::Parts(parts.iter().map(ContentPartInput::from).collect())
+        }
     }
 }
 
@@ -700,22 +728,9 @@ fn content_value_from_chat_owned(content: Option<ChatMessageContent>) -> Content
     match content {
         None => ContentValue::Text(String::new()),
         Some(ChatMessageContent::Text(s)) => ContentValue::Text(s),
-        Some(ChatMessageContent::Parts(parts)) => ContentValue::Parts(
-            parts
-                .into_iter()
-                .map(|p| ContentPartInput {
-                    part_type: if p.part_type == "image_url" {
-                        "input_image".into()
-                    } else {
-                        p.part_type
-                    },
-                    text: p.text,
-                    image_url: p.image_url.map(|u| u.url),
-                    video_url: None,
-                    cache_control: None,
-                })
-                .collect(),
-        ),
+        Some(ChatMessageContent::Parts(parts)) => {
+            ContentValue::Parts(parts.iter().map(ContentPartInput::from).collect())
+        }
     }
 }
 
@@ -800,6 +815,21 @@ mod tests {
         assert!(matches!(req.input, Input::Text(ref s) if s == "Hello, world!"));
         assert!(req.previous_completion_id.is_none());
         assert_eq!(req.temperature, 1.0);
+    }
+
+    #[test]
+    fn test_chat_unknown_content_part_is_rejected() {
+        let result = serde_json::from_str::<ChatCompletionRequest>(
+            r#"{
+                "model": "vision-model",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "audio", "data": "silently-lost-before"}]
+                }]
+            }"#,
+        );
+
+        assert!(result.is_err(), "unknown content types must be rejected");
     }
 
     #[test]

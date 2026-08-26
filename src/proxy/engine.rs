@@ -542,13 +542,9 @@ impl ProxyEngine {
                 Err(err) => {
                     // Modality mismatch is a candidate filter, not a provider fault.
                     if let Some(modality_err) = err.downcast_ref::<ModalityNotSupportedError>() {
-                        candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&modality_err.provider));
+                        retain_same_model_failover_candidates(&mut candidates, modality_err);
                         if candidates.is_empty() {
-                            return Err(anyhow!(
-                                "No provider candidate supports {} attachments for model '{}'",
-                                modality_err.modality,
-                                routed_model
-                            ));
+                            return Err(err);
                         }
                         tracing::info!(
                             provider = %modality_err.provider,
@@ -1240,6 +1236,18 @@ fn prefer_provider(candidates: &mut [(String, String)], provider: &str) {
     candidates.sort_by_key(|(p, _)| !p.eq_ignore_ascii_case(provider));
 }
 
+/// After a modality mismatch, only another host for the same resolved model is
+/// a valid failover. A different model under the alias must never receive the
+/// request implicitly.
+fn retain_same_model_failover_candidates(
+    candidates: &mut Vec<(String, String)>,
+    mismatch: &ModalityNotSupportedError,
+) {
+    candidates.retain(|(provider, model)| {
+        !provider.eq_ignore_ascii_case(&mismatch.provider) && model == &mismatch.model
+    });
+}
+
 /// Pick the first candidate whose provider rate windows admit a request
 /// (counting it against the winner's windows). Cooling providers (see
 /// [`ProviderHealth`]) are sorted behind healthy ones — deprioritized, not
@@ -1453,6 +1461,62 @@ mod tests {
         // Turn 2: sticky provider's window exhausted — fall through, don't fail.
         let picked = pick(&tracker, &config, candidates, "m").unwrap();
         assert_eq!(picked.0, "openai");
+    }
+
+    #[test]
+    fn modality_failover_keeps_only_same_model_on_another_host() {
+        let mut candidates = vec![
+            candidate("openai", "vision-model"),
+            candidate("ollama", "vision-model"),
+            candidate("anthropic", "different-model"),
+        ];
+        let mismatch = ModalityNotSupportedError {
+            provider: "openai".to_string(),
+            model: "vision-model".to_string(),
+            modality: "image".to_string(),
+        };
+
+        retain_same_model_failover_candidates(&mut candidates, &mismatch);
+
+        assert_eq!(candidates, vec![candidate("ollama", "vision-model")]);
+    }
+
+    #[test]
+    fn anthropic_image_reaches_provider_message_as_base64_attachment() {
+        let chat: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "model": "vision-model",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aW1hZ2U="
+                        }
+                    }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let request: CreateCompletionRequest = chat.into();
+        let Input::Items(items) = request.input else {
+            panic!("chat request must convert to input items");
+        };
+        let mut messages = Vec::new();
+
+        push_items(&items, &mut messages);
+
+        let images = messages[0]
+            .images
+            .as_ref()
+            .expect("provider message must carry the image");
+        assert_eq!(images[0].media_type, "image/png");
+        assert!(matches!(
+            &images[0].data,
+            ImageData::Base64(data) if data == "aW1hZ2U="
+        ));
     }
 
     #[test]
