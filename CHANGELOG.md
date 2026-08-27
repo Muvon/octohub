@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.8] - 2026-08-27
+
+### 📋 Release Summary
+
+This release includes routine dependency updates to ensure project stability and security (f4867cba).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.7.7] - 2026-08-26
 
 ### 📋 Release Summary
