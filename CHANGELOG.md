@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.9] - 2026-08-29
+
+### 📋 Release Summary
+
+Updated the setup and API documentation to make getting started with octohub and using its interfaces clearer (8b62f233). Refreshed project dependencies for ongoing maintenance and compatibility (b4d8ac3b, 0414b914).
+
+
+### 📚 Documentation & Examples
+
+- **readme**: rework setup and API guide `8b62f233`
+
+### 🔄 Other Changes
+
+2 maintenance, dependency, and tooling updates not listed individually.
+
 ## [0.7.8] - 2026-08-27
 
 ### 📋 Release Summary
