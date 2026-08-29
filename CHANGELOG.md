@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.10] - 2026-08-29
+
+### 📋 Release Summary
+
+Updated the octolib dependency to version 0.34.7, incorporating the latest library improvements for octohub (c3c8cae6).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.7.9] - 2026-08-29
 
 ### 📋 Release Summary
