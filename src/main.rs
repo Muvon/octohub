@@ -68,6 +68,18 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = load_config(args.config.clone(), args.bind.as_deref())?;
 
+    // OpenRouter attribution: octolib defaults X-Title to "octolib" unless
+    // these are set, and upstream calls run in this process (not the client's).
+    if std::env::var("OPENROUTER_APP_TITLE").is_err() {
+        std::env::set_var("OPENROUTER_APP_TITLE", "Octohub");
+    }
+    if std::env::var("OPENROUTER_HTTP_REFERER").is_err() {
+        std::env::set_var(
+            "OPENROUTER_HTTP_REFERER",
+            "https://octomind.run/products/octohub",
+        );
+    }
+
     // Initialize logging (must happen after config load so we have LogFormat)
     logging::init(&config.logging)?;
 
