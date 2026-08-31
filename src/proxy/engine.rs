@@ -225,11 +225,16 @@ impl ProxyEngine {
     ///
     /// `purpose` is the request's `X-Model-Purpose` header, meaningful only when
     /// the model is the virtual `auto` — it steers which alias `auto` resolves to.
+    ///
+    /// `extra_headers` are client attribution headers (X-Title / HTTP-Referer)
+    /// forwarded verbatim to the upstream call — octohub is a proxy, so the
+    /// originating app's identity goes upstream, not ours.
     pub async fn process(
         &self,
         req: CreateCompletionRequest,
         api_key: &ApiKey,
         purpose: Option<String>,
+        extra_headers: Option<std::collections::HashMap<String, String>>,
     ) -> Result<(CreateCompletionResponse, std::time::Duration)> {
         // Snapshot config + limiter once so this request keeps a consistent view
         // even if SIGHUP swaps them mid-flight.
@@ -447,6 +452,10 @@ impl ProxyEngine {
                 if let Some(tools) = tools {
                     params.tools = Some(tools);
                 }
+
+                // Forwarded client attribution; octolib applies these last with
+                // override semantics, beating its own env-based defaults.
+                params.extra_headers = extra_headers.clone();
 
                 // Reasoning effort: parse client string into octolib enum and pass
                 // through. Unknown values silently fall back to provider default —

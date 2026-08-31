@@ -101,6 +101,21 @@ fn model_purpose(req: &Request<hyper::body::Incoming>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// OpenRouter-style attribution headers from the client (X-Title, HTTP-Referer),
+/// forwarded upstream so the originating app — not this proxy — gets credited.
+/// Read BEFORE the body is consumed.
+fn attribution_headers(
+    req: &Request<hyper::body::Incoming>,
+) -> Option<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for name in ["X-Title", "HTTP-Referer"] {
+        if let Some(v) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
+            map.insert(name.to_string(), v.to_string());
+        }
+    }
+    (!map.is_empty()).then_some(map)
+}
+
 /// Handle POST /v1/completions
 pub async fn handle_create_completion(
     req: Request<hyper::body::Incoming>,
@@ -126,6 +141,7 @@ pub async fn handle_create_completion(
     };
     tracing::Span::current().record("api_key_id", api_key.id);
     let purpose = model_purpose(&req);
+    let attribution = attribution_headers(&req);
 
     // Read body
     let body_bytes = match req.collect().await {
@@ -155,7 +171,10 @@ pub async fn handle_create_completion(
 
     // Process
     let model_label = create_req.model.clone();
-    match engine.process(create_req, &api_key, purpose).await {
+    match engine
+        .process(create_req, &api_key, purpose, attribution)
+        .await
+    {
         Ok((response, upstream_duration)) => {
             tracing::Span::current().record("tok_in", response.usage.input_tokens);
             tracing::Span::current().record("tok_out", response.usage.output_tokens);
@@ -399,6 +418,7 @@ pub async fn handle_chat_completion(
     };
     tracing::Span::current().record("api_key_id", api_key.id);
     let purpose = model_purpose(&req);
+    let attribution = attribution_headers(&req);
 
     // Read body
     let body_bytes = match req.collect().await {
@@ -437,7 +457,10 @@ pub async fn handle_chat_completion(
 
     let per_key = engine.config().metrics.per_key;
 
-    match engine.process(create_req, &api_key, purpose).await {
+    match engine
+        .process(create_req, &api_key, purpose, attribution)
+        .await
+    {
         Ok((response, upstream_duration)) => {
             tracing::Span::current().record("tok_in", response.usage.input_tokens);
             tracing::Span::current().record("tok_out", response.usage.output_tokens);
