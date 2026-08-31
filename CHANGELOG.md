@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.11] - 2026-08-31
+
+### 📋 Release Summary
+
+This release updates the octolib dependency to 0.34.8 and refreshes the Rust toolchain used for releases, keeping project and release configuration current (b9c2aeb9, 9b3d89cd).
+
+
+### 🔧 Improvements & Optimizations
+
+- **ci**: update release Rust toolchain version `9b3d89cd`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.7.10] - 2026-08-29
 
 ### 📋 Release Summary
