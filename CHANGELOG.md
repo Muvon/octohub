@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.12] - 2026-09-02
+
+### 📋 Release Summary
+
+The proxy now forwards attribution headers, a breaking behavior change that improves attribution handling across requests (1a919951, 7e6705d2). OpenRouter requests also receive default attribution headers when none are provided.
+
+
+### 🚨 Breaking Changes
+
+⚠️ **Important**: This release contains breaking changes that may require code updates.
+
+- **proxy**: forward attribution headers `1a919951`
+
+### 🐛 Bug Fixes & Stability
+
+- **openrouter**: set default attribution headers `7e6705d2`
+
 ## [0.7.11] - 2026-08-31
 
 ### 📋 Release Summary
