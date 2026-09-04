@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.13] - 2026-09-04
+
+### 📋 Release Summary
+
+This release improves project maintenance by canceling superseded CI runs and updating Rust dependencies, including `tinyvec` (97f09f17, e68028dc, 48cb6b59).
+
+
+### 🔧 Improvements & Optimizations
+
+- **workflow**: cancel superseded CI runs `97f09f17`
+
+### 🔄 Other Changes
+
+2 maintenance, dependency, and tooling updates not listed individually.
+
 ## [0.7.12] - 2026-09-02
 
 ### 📋 Release Summary
