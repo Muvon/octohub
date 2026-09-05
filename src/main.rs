@@ -79,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
             "https://octomind.run/products/octohub",
         );
     }
+    // Same idea for the User-Agent octolib sends upstream: name this proxy
+    // rather than the generic library default.
+    octolib::set_user_agent(concat!("Octohub/", env!("CARGO_PKG_VERSION")));
 
     // Initialize logging (must happen after config load so we have LogFormat)
     logging::init(&config.logging)?;
