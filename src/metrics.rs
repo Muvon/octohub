@@ -118,9 +118,9 @@ pub fn init(cfg: &MetricsConfig) -> Result<Option<metrics_exporter_prometheus::P
         "octohub_media_duration_seconds",
         "Upstream media call duration in seconds"
     );
-    describe_gauge!(
-        "octohub_media_cost_usd",
-        "Cumulative media spend in USD, split by whether the provider reported the amount or octolib estimated it"
+    describe_counter!(
+        "octohub_media_cost_microusd_total",
+        "Media spend in millionths of a USD (counter, so restarts are handled), split by whether the provider reported the amount or octolib estimated it"
     );
     describe_counter!(
         "octohub_media_cost_unknown_total",
@@ -405,17 +405,19 @@ pub fn record_media(call: MediaCall<'_>) {
                 crate::api::media_types::CostSource::Estimate => "estimate",
                 crate::api::media_types::CostSource::Unavailable => "unavailable",
             };
-            // A gauge, not a counter: `metrics` counters are u64 and a dollar
-            // amount is fractional. Only ever incremented, so it reads like a
-            // counter in USD without inventing a sub-unit.
-            gauge!(
-                "octohub_media_cost_usd",
+            // A real counter, so Prometheus detects the reset when this process
+            // restarts — a cumulative gauge would make rate()/increase() lie
+            // across every deploy. `metrics` counters are u64, hence micro-USD:
+            // divide by 1e6 for dollars. At observed prices (~$0.04/image ≈
+            // 40_000 units) the resolution is ample.
+            counter!(
+                "octohub_media_cost_microusd_total",
                 "task" => task,
                 "model" => model,
                 "provider" => provider,
                 "source" => source
             )
-            .increment(cost.max(0.0));
+            .increment((cost.max(0.0) * 1_000_000.0).round() as u64);
         }
         None => {
             // An unpriced request is tracked separately rather than counted as

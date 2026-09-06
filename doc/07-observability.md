@@ -270,7 +270,7 @@ the join key between them.
 ```
 octohub_media_requests_total{task,model,provider,status}
 octohub_media_duration_seconds{task,model,provider}
-octohub_media_cost_usd{task,model,provider,source}
+octohub_media_cost_microusd_total{task,model,provider,source}
 octohub_media_cost_unknown_total{task,model,provider}
 ```
 
@@ -279,6 +279,12 @@ octohub_media_cost_unknown_total{task,model,provider}
 counter is `provider` (the upstream reported a dollar amount) or `estimate`
 (computed from octolib's reference rates); requests nothing could price are
 counted in `octohub_media_cost_unknown_total` instead, never as $0.
+
+Spend is counted in millionths of a USD — divide by 1e6 for dollars. It is a
+counter rather than a gauge so Prometheus detects the reset on restart;
+`metrics` counters are `u64`, which is why the unit is a sub-unit rather than
+plain USD. The database remains the ledger: `GET /v1/admin/usage` is the
+authoritative spend figure.
 
 The `/v1/media/{id}` route label is collapsed so per-record ids cannot explode
 metric cardinality.
