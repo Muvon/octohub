@@ -427,7 +427,7 @@ impl ProxyEngine {
         };
 
         if record.handle.is_none() || terminal_name(&record.status) {
-            return Ok(Some(self.from_record(record)));
+            return Ok(Some(self.stored_outcome(record)));
         }
 
         let handle: JobHandle = serde_json::from_value(
@@ -460,7 +460,7 @@ impl ProxyEngine {
             return Ok(None);
         };
         if terminal_name(&record.status) {
-            return Ok(Some(self.from_record(record)));
+            return Ok(Some(self.stored_outcome(record)));
         }
         let handle: JobHandle = serde_json::from_value(
             record
@@ -478,7 +478,7 @@ impl ProxyEngine {
         let storage = self.storage.clone();
         let to_update = record.clone();
         tokio::task::spawn_blocking(move || storage.update_media(&to_update)).await??;
-        Ok(Some(self.from_record(record)))
+        Ok(Some(self.stored_outcome(record)))
     }
 
     /// Capability descriptors for every configured media candidate, plus the
@@ -547,7 +547,7 @@ impl ProxyEngine {
     }
 
     /// Rebuild the wire envelope from a stored row without touching upstream.
-    fn from_record(&self, record: StoredMedia) -> MediaOutcome {
+    fn stored_outcome(&self, record: StoredMedia) -> MediaOutcome {
         let artifacts = record
             .result
             .as_ref()

@@ -118,9 +118,9 @@ pub fn init(cfg: &MetricsConfig) -> Result<Option<metrics_exporter_prometheus::P
         "octohub_media_duration_seconds",
         "Upstream media call duration in seconds"
     );
-    describe_counter!(
-        "octohub_media_cost_usd_total",
-        "Media spend in USD, split by whether the provider reported it or octolib estimated it"
+    describe_gauge!(
+        "octohub_media_cost_usd",
+        "Cumulative media spend in USD, split by whether the provider reported the amount or octolib estimated it"
     );
     describe_counter!(
         "octohub_media_cost_unknown_total",
@@ -241,7 +241,7 @@ impl Drop for InFlightGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "label set is flat by design")]
 pub fn record_completion(
     model: &str,
     provider: &str,
@@ -405,8 +405,11 @@ pub fn record_media(call: MediaCall<'_>) {
                 crate::api::media_types::CostSource::Estimate => "estimate",
                 crate::api::media_types::CostSource::Unavailable => "unavailable",
             };
-            counter!(
-                "octohub_media_cost_usd_total",
+            // A gauge, not a counter: `metrics` counters are u64 and a dollar
+            // amount is fractional. Only ever incremented, so it reads like a
+            // counter in USD without inventing a sub-unit.
+            gauge!(
+                "octohub_media_cost_usd",
                 "task" => task,
                 "model" => model,
                 "provider" => provider,

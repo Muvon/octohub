@@ -427,7 +427,7 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<ChatTool>>,
     /// Accepted and ignored — tool selection is left to the upstream provider.
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "accepted from the wire and deliberately ignored")]
     pub tool_choice: Option<serde_json::Value>,
 }
 
@@ -448,7 +448,7 @@ pub struct ChatMessage {
     /// For `role=tool` messages: the function name (informational, not required
     /// by all providers).
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "informational on the wire; no provider needs it")]
     pub name: Option<String>,
 }
 

@@ -607,6 +607,344 @@ fn sse_chunk(value: serde_json::Value) -> String {
     )
 }
 
+// ── Media ──
+
+/// Authenticate a media request, returning the key or the ready-made 401.
+async fn media_auth(
+    req: &Request<hyper::body::Incoming>,
+    storage: Arc<dyn Storage>,
+) -> Result<crate::storage::ApiKey, Box<Response<BoxBody>>> {
+    let header = auth_header(req);
+    let auth_result =
+        tokio::task::spawn_blocking(move || authenticate_client(header.as_deref(), &storage))
+            .await
+            .unwrap_or(ClientAuth::Invalid);
+    match auth_result {
+        ClientAuth::Ok(key) => {
+            tracing::Span::current().record("api_key_id", key.id);
+            Ok(key)
+        }
+        ClientAuth::Missing => {
+            tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
+            Err(Box::new(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Missing API key",
+            )))
+        }
+        ClientAuth::Invalid => {
+            tracing::warn!(kind = "client", reason = "invalid_token", "auth failed");
+            Err(Box::new(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Invalid or revoked API key",
+            )))
+        }
+    }
+}
+
+/// Map an octolib `MediaError` onto its HTTP status and error discriminator.
+///
+/// `WaitTimeout` and `LocalWaitCancelled` are absent on purpose: they are not
+/// failures. The engine converts them into a 202 with a resumable job id so a
+/// paid job is never lost to a slow client.
+fn classify_media_error(error: &anyhow::Error) -> (StatusCode, String, &'static str) {
+    use octolib::media::{FailureCategory, MediaError};
+
+    if let Some(unsupported) = error.downcast_ref::<crate::proxy::media::MediaTaskUnsupported>() {
+        return (
+            StatusCode::BAD_REQUEST,
+            unsupported.to_string(),
+            "media_task_not_supported",
+        );
+    }
+
+    let Some(media) = error.downcast_ref::<MediaError>() else {
+        // Not an octolib media failure — reuse the shared engine classifier so
+        // model-restriction, owner-budget and queue-timeout paths behave
+        // identically across every endpoint.
+        let (status, message) = classify_engine_error(error);
+        return (status, message, engine_error_type(error));
+    };
+
+    let message = media.to_string();
+    match media {
+        MediaError::InvalidModelFormat(_)
+        | MediaError::InvalidRequest(_)
+        | MediaError::SourceTooLarge { .. } => {
+            (StatusCode::BAD_REQUEST, message, DEFAULT_ERROR_TYPE)
+        }
+        MediaError::UnsupportedParameter { .. } => {
+            (StatusCode::BAD_REQUEST, message, "unsupported_parameter")
+        }
+        MediaError::UnsupportedProvider(_) | MediaError::UnsupportedTask { .. } => {
+            (StatusCode::BAD_REQUEST, message, "media_task_not_supported")
+        }
+        MediaError::MissingApiKey(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            "configuration_error",
+        ),
+        MediaError::Authentication { .. } | MediaError::Permission { .. } => {
+            (StatusCode::BAD_GATEWAY, message, "upstream_auth_error")
+        }
+        MediaError::InsufficientCredits { .. } => (
+            StatusCode::BAD_GATEWAY,
+            message,
+            "upstream_insufficient_credits",
+        ),
+        MediaError::RateLimit { .. } => {
+            (StatusCode::TOO_MANY_REQUESTS, message, "rate_limit_error")
+        }
+        MediaError::Api { status, .. } => {
+            // An upstream 4xx is permanent for this request; passing the code
+            // through stops a client retrying something that can never succeed.
+            let status = if (400..500).contains(status) {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (status, message, "upstream_error")
+        }
+        MediaError::RemoteFailure(failure) => {
+            // A content-policy rejection is the request's fault; retrying it
+            // upstream is pointless, so it reads as 400 rather than 502.
+            let status = match failure.category {
+                FailureCategory::ContentPolicy | FailureCategory::InvalidInput => {
+                    StatusCode::BAD_REQUEST
+                }
+                FailureCategory::RateLimit => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, message, "media_generation_failed")
+        }
+        MediaError::WrongJobHandle { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, message, "internal_error")
+        }
+        _ => (StatusCode::BAD_GATEWAY, message, "upstream_error"),
+    }
+}
+
+fn media_error_response(error: &anyhow::Error) -> Response<BoxBody> {
+    let (status, message, error_type) = classify_media_error(error);
+    if status.is_server_error() {
+        tracing::error!(error = ?error, "media request failed");
+    } else {
+        tracing::warn!(reason = %message, "media request rejected");
+    }
+    let mut response = error_response_typed(status, &message, error_type);
+    if let Some(octolib::media::MediaError::RateLimit {
+        retry_after_secs: Some(secs),
+        ..
+    }) = error.downcast_ref::<octolib::media::MediaError>()
+    {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&secs.to_string()) {
+            response
+                .headers_mut()
+                .insert(hyper::header::RETRY_AFTER, value);
+        }
+    }
+    response
+}
+
+/// The metric label for a finished call. `terminal` is not the same as
+/// `succeeded` — a job that came back Failed or Expired must not land in the
+/// success bucket and drag its cost along with it.
+fn media_status_label(status: octolib::media::OperationStatus) -> &'static str {
+    use octolib::media::OperationStatus;
+    match status {
+        OperationStatus::Succeeded => "ok",
+        OperationStatus::Failed => "failed",
+        OperationStatus::Expired => "expired",
+        OperationStatus::Cancelled => "cancelled",
+        // Queued, Running, CancellationRequested — the caller got a 202.
+        _ => "accepted",
+    }
+}
+
+/// Render a media outcome: 200 when terminal, 202 while the job is still live.
+fn media_outcome_response(outcome: crate::proxy::media::MediaOutcome) -> Response<BoxBody> {
+    let status = if outcome.accepted {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    let body = serde_json::to_value(&outcome.response).unwrap_or_default();
+    json_response(status, body)
+}
+
+/// Shared body for the four create endpoints: parse, dispatch, record metrics.
+async fn handle_media_create(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+    build: fn(&[u8]) -> Result<crate::proxy::media::MediaRequest, String>,
+) -> Response<BoxBody> {
+    let api_key = match media_auth(&req, storage).await {
+        Ok(key) => key,
+        Err(response) => return *response,
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read request body: {}", e),
+            )
+        }
+    };
+
+    let media_request = match build(&body_bytes) {
+        Ok(request) => request,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+
+    let model_label = media_request.model_label().to_string();
+    let task_label = media_request.task_label();
+    let per_key = engine.config().metrics.per_key;
+
+    tracing::Span::current().record("model", model_label.as_str());
+
+    match engine.process_media(media_request, &api_key).await {
+        Ok(outcome) => {
+            crate::metrics::record_media(crate::metrics::MediaCall {
+                task: task_label,
+                model: &model_label,
+                provider: &outcome.response.provider,
+                status: media_status_label(outcome.response.status),
+                duration: outcome.upstream_duration,
+                usage: outcome.response.usage.as_ref(),
+                api_key_id: Some(api_key.id),
+                per_key,
+            });
+            media_outcome_response(outcome)
+        }
+        Err(e) => {
+            crate::metrics::record_media(crate::metrics::MediaCall {
+                task: task_label,
+                model: &model_label,
+                // The call never reached an upstream, so there is no provider
+                // to attribute the failure to.
+                provider: "unknown",
+                status: "error",
+                duration: std::time::Duration::ZERO,
+                usage: None,
+                api_key_id: Some(api_key.id),
+                per_key,
+            });
+            media_error_response(&e)
+        }
+    }
+}
+
+pub async fn handle_image_generation(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    handle_media_create(req, engine, storage, |bytes| {
+        serde_json::from_slice(bytes)
+            .map(|r| crate::proxy::media::MediaRequest::Image(Box::new(r)))
+            .map_err(|e| format!("Invalid request JSON: {e}"))
+    })
+    .await
+}
+
+pub async fn handle_video_generation(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    handle_media_create(req, engine, storage, |bytes| {
+        serde_json::from_slice(bytes)
+            .map(|r| crate::proxy::media::MediaRequest::Video(Box::new(r)))
+            .map_err(|e| format!("Invalid request JSON: {e}"))
+    })
+    .await
+}
+
+pub async fn handle_speech(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    handle_media_create(req, engine, storage, |bytes| {
+        serde_json::from_slice(bytes)
+            .map(|r| crate::proxy::media::MediaRequest::Speech(Box::new(r)))
+            .map_err(|e| format!("Invalid request JSON: {e}"))
+    })
+    .await
+}
+
+pub async fn handle_transcription(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    handle_media_create(req, engine, storage, |bytes| {
+        serde_json::from_slice(bytes)
+            .map(|r| crate::proxy::media::MediaRequest::Transcription(Box::new(r)))
+            .map_err(|e| format!("Invalid request JSON: {e}"))
+    })
+    .await
+}
+
+/// GET /v1/media/{id} — advance and return a job.
+pub async fn handle_media_get(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+    id: &str,
+) -> Response<BoxBody> {
+    let api_key = match media_auth(&req, storage).await {
+        Ok(key) => key,
+        Err(response) => return *response,
+    };
+    match engine.poll_media(id, &api_key).await {
+        // Absent OR owned by another key: both read as 404 so record ids
+        // cannot be probed across tenants.
+        Ok(None) => {
+            error_response_typed(StatusCode::NOT_FOUND, "Media record not found", "not_found")
+        }
+        Ok(Some(outcome)) => media_outcome_response(outcome),
+        Err(e) => media_error_response(&e),
+    }
+}
+
+/// POST /v1/media/{id}/cancel — best-effort remote cancellation.
+pub async fn handle_media_cancel(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+    id: &str,
+) -> Response<BoxBody> {
+    let api_key = match media_auth(&req, storage).await {
+        Ok(key) => key,
+        Err(response) => return *response,
+    };
+    match engine.cancel_media(id, &api_key).await {
+        Ok(None) => {
+            error_response_typed(StatusCode::NOT_FOUND, "Media record not found", "not_found")
+        }
+        Ok(Some(outcome)) => json_response(
+            StatusCode::OK,
+            serde_json::to_value(&outcome.response).unwrap_or_default(),
+        ),
+        Err(e) => media_error_response(&e),
+    }
+}
+
+/// GET /v1/media/models — capability and pricing discovery.
+pub async fn handle_media_models(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    if let Err(response) = media_auth(&req, storage).await {
+        return *response;
+    }
+    json_response(StatusCode::OK, engine.media_models())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,339 +1161,4 @@ mod tests {
         assert_eq!(split_words("abc  def"), vec![3, 8]);
         assert_eq!(split_words(""), Vec::<usize>::new());
     }
-}
-
-// ── Media ──
-
-/// Authenticate a media request, returning the key or the ready-made 401.
-async fn media_auth(
-    req: &Request<hyper::body::Incoming>,
-    storage: Arc<dyn Storage>,
-) -> Result<crate::storage::ApiKey, Response<BoxBody>> {
-    let header = auth_header(req);
-    let auth_result =
-        tokio::task::spawn_blocking(move || authenticate_client(header.as_deref(), &storage))
-            .await
-            .unwrap_or(ClientAuth::Invalid);
-    match auth_result {
-        ClientAuth::Ok(key) => {
-            tracing::Span::current().record("api_key_id", key.id);
-            Ok(key)
-        }
-        ClientAuth::Missing => {
-            tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
-            Err(error_response(StatusCode::UNAUTHORIZED, "Missing API key"))
-        }
-        ClientAuth::Invalid => {
-            tracing::warn!(kind = "client", reason = "invalid_token", "auth failed");
-            Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Invalid or revoked API key",
-            ))
-        }
-    }
-}
-
-/// Map an octolib `MediaError` onto its HTTP status and error discriminator.
-///
-/// `WaitTimeout` and `LocalWaitCancelled` are absent on purpose: they are not
-/// failures. The engine converts them into a 202 with a resumable job id so a
-/// paid job is never lost to a slow client.
-fn classify_media_error(error: &anyhow::Error) -> (StatusCode, String, &'static str) {
-    use octolib::media::{FailureCategory, MediaError};
-
-    if let Some(unsupported) = error.downcast_ref::<crate::proxy::media::MediaTaskUnsupported>() {
-        return (
-            StatusCode::BAD_REQUEST,
-            unsupported.to_string(),
-            "media_task_not_supported",
-        );
-    }
-
-    let Some(media) = error.downcast_ref::<MediaError>() else {
-        // Not an octolib media failure — reuse the shared engine classifier so
-        // model-restriction, owner-budget and queue-timeout paths behave
-        // identically across every endpoint.
-        let (status, message) = classify_engine_error(error);
-        return (status, message, engine_error_type(error));
-    };
-
-    let message = media.to_string();
-    match media {
-        MediaError::InvalidModelFormat(_)
-        | MediaError::InvalidRequest(_)
-        | MediaError::SourceTooLarge { .. } => {
-            (StatusCode::BAD_REQUEST, message, DEFAULT_ERROR_TYPE)
-        }
-        MediaError::UnsupportedParameter { .. } => {
-            (StatusCode::BAD_REQUEST, message, "unsupported_parameter")
-        }
-        MediaError::UnsupportedProvider(_) | MediaError::UnsupportedTask { .. } => {
-            (StatusCode::BAD_REQUEST, message, "media_task_not_supported")
-        }
-        MediaError::MissingApiKey(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            message,
-            "configuration_error",
-        ),
-        MediaError::Authentication { .. } | MediaError::Permission { .. } => {
-            (StatusCode::BAD_GATEWAY, message, "upstream_auth_error")
-        }
-        MediaError::InsufficientCredits { .. } => (
-            StatusCode::BAD_GATEWAY,
-            message,
-            "upstream_insufficient_credits",
-        ),
-        MediaError::RateLimit { .. } => {
-            (StatusCode::TOO_MANY_REQUESTS, message, "rate_limit_error")
-        }
-        MediaError::Api { status, .. } => {
-            // An upstream 4xx is permanent for this request; passing the code
-            // through stops a client retrying something that can never succeed.
-            let status = if (400..500).contains(status) {
-                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST)
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            (status, message, "upstream_error")
-        }
-        MediaError::RemoteFailure(failure) => {
-            // A content-policy rejection is the request's fault; retrying it
-            // upstream is pointless, so it reads as 400 rather than 502.
-            let status = match failure.category {
-                FailureCategory::ContentPolicy | FailureCategory::InvalidInput => {
-                    StatusCode::BAD_REQUEST
-                }
-                FailureCategory::RateLimit => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::BAD_GATEWAY,
-            };
-            (status, message, "media_generation_failed")
-        }
-        MediaError::WrongJobHandle { .. } => {
-            (StatusCode::INTERNAL_SERVER_ERROR, message, "internal_error")
-        }
-        _ => (StatusCode::BAD_GATEWAY, message, "upstream_error"),
-    }
-}
-
-fn media_error_response(error: &anyhow::Error) -> Response<BoxBody> {
-    let (status, message, error_type) = classify_media_error(error);
-    if status.is_server_error() {
-        tracing::error!(error = ?error, "media request failed");
-    } else {
-        tracing::warn!(reason = %message, "media request rejected");
-    }
-    let mut response = error_response_typed(status, &message, error_type);
-    if let Some(octolib::media::MediaError::RateLimit {
-        retry_after_secs: Some(secs),
-        ..
-    }) = error.downcast_ref::<octolib::media::MediaError>()
-    {
-        if let Ok(value) = hyper::header::HeaderValue::from_str(&secs.to_string()) {
-            response
-                .headers_mut()
-                .insert(hyper::header::RETRY_AFTER, value);
-        }
-    }
-    response
-}
-
-/// The metric label for a finished call. `terminal` is not the same as
-/// `succeeded` — a job that came back Failed or Expired must not land in the
-/// success bucket and drag its cost along with it.
-fn media_status_label(status: octolib::media::OperationStatus) -> &'static str {
-    use octolib::media::OperationStatus;
-    match status {
-        OperationStatus::Succeeded => "ok",
-        OperationStatus::Failed => "failed",
-        OperationStatus::Expired => "expired",
-        OperationStatus::Cancelled => "cancelled",
-        // Queued, Running, CancellationRequested — the caller got a 202.
-        _ => "accepted",
-    }
-}
-
-/// Render a media outcome: 200 when terminal, 202 while the job is still live.
-fn media_outcome_response(outcome: crate::proxy::media::MediaOutcome) -> Response<BoxBody> {
-    let status = if outcome.accepted {
-        StatusCode::ACCEPTED
-    } else {
-        StatusCode::OK
-    };
-    let body = serde_json::to_value(&outcome.response).unwrap_or_default();
-    json_response(status, body)
-}
-
-/// Shared body for the four create endpoints: parse, dispatch, record metrics.
-async fn handle_media_create(
-    req: Request<hyper::body::Incoming>,
-    engine: Arc<ProxyEngine>,
-    storage: Arc<dyn Storage>,
-    build: fn(&[u8]) -> Result<crate::proxy::media::MediaRequest, String>,
-) -> Response<BoxBody> {
-    let api_key = match media_auth(&req, storage).await {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-
-    let body_bytes = match req.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("Failed to read request body: {}", e),
-            )
-        }
-    };
-
-    let media_request = match build(&body_bytes) {
-        Ok(request) => request,
-        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
-    };
-
-    let model_label = media_request.model_label().to_string();
-    let task_label = media_request.task_label();
-    let per_key = engine.config().metrics.per_key;
-
-    tracing::Span::current().record("model", model_label.as_str());
-
-    match engine.process_media(media_request, &api_key).await {
-        Ok(outcome) => {
-            crate::metrics::record_media(crate::metrics::MediaCall {
-                task: task_label,
-                model: &model_label,
-                provider: &outcome.response.provider,
-                status: media_status_label(outcome.response.status),
-                duration: outcome.upstream_duration,
-                usage: outcome.response.usage.as_ref(),
-                api_key_id: Some(api_key.id),
-                per_key,
-            });
-            media_outcome_response(outcome)
-        }
-        Err(e) => {
-            crate::metrics::record_media(crate::metrics::MediaCall {
-                task: task_label,
-                model: &model_label,
-                // The call never reached an upstream, so there is no provider
-                // to attribute the failure to.
-                provider: "unknown",
-                status: "error",
-                duration: std::time::Duration::ZERO,
-                usage: None,
-                api_key_id: Some(api_key.id),
-                per_key,
-            });
-            media_error_response(&e)
-        }
-    }
-}
-
-pub async fn handle_image_generation(
-    req: Request<hyper::body::Incoming>,
-    engine: Arc<ProxyEngine>,
-    storage: Arc<dyn Storage>,
-) -> Response<BoxBody> {
-    handle_media_create(req, engine, storage, |bytes| {
-        serde_json::from_slice(bytes)
-            .map(|r| crate::proxy::media::MediaRequest::Image(Box::new(r)))
-            .map_err(|e| format!("Invalid request JSON: {e}"))
-    })
-    .await
-}
-
-pub async fn handle_video_generation(
-    req: Request<hyper::body::Incoming>,
-    engine: Arc<ProxyEngine>,
-    storage: Arc<dyn Storage>,
-) -> Response<BoxBody> {
-    handle_media_create(req, engine, storage, |bytes| {
-        serde_json::from_slice(bytes)
-            .map(|r| crate::proxy::media::MediaRequest::Video(Box::new(r)))
-            .map_err(|e| format!("Invalid request JSON: {e}"))
-    })
-    .await
-}
-
-pub async fn handle_speech(
-    req: Request<hyper::body::Incoming>,
-    engine: Arc<ProxyEngine>,
-    storage: Arc<dyn Storage>,
-) -> Response<BoxBody> {
-    handle_media_create(req, engine, storage, |bytes| {
-        serde_json::from_slice(bytes)
-            .map(|r| crate::proxy::media::MediaRequest::Speech(Box::new(r)))
-            .map_err(|e| format!("Invalid request JSON: {e}"))
-    })
-    .await
-}
-
-pub async fn handle_transcription(
-    req: Request<hyper::body::Incoming>,
-    engine: Arc<ProxyEngine>,
-    storage: Arc<dyn Storage>,
-) -> Response<BoxBody> {
-    handle_media_create(req, engine, storage, |bytes| {
-        serde_json::from_slice(bytes)
-            .map(|r| crate::proxy::media::MediaRequest::Transcription(Box::new(r)))
-            .map_err(|e| format!("Invalid request JSON: {e}"))
-    })
-    .await
-}
-
-/// GET /v1/media/{id} — advance and return a job.
-pub async fn handle_media_get(
-    req: Request<hyper::body::Incoming>,
-    engine: Arc<ProxyEngine>,
-    storage: Arc<dyn Storage>,
-    id: &str,
-) -> Response<BoxBody> {
-    let api_key = match media_auth(&req, storage).await {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-    match engine.poll_media(id, &api_key).await {
-        // Absent OR owned by another key: both read as 404 so record ids
-        // cannot be probed across tenants.
-        Ok(None) => {
-            error_response_typed(StatusCode::NOT_FOUND, "Media record not found", "not_found")
-        }
-        Ok(Some(outcome)) => media_outcome_response(outcome),
-        Err(e) => media_error_response(&e),
-    }
-}
-
-/// POST /v1/media/{id}/cancel — best-effort remote cancellation.
-pub async fn handle_media_cancel(
-    req: Request<hyper::body::Incoming>,
-    engine: Arc<ProxyEngine>,
-    storage: Arc<dyn Storage>,
-    id: &str,
-) -> Response<BoxBody> {
-    let api_key = match media_auth(&req, storage).await {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-    match engine.cancel_media(id, &api_key).await {
-        Ok(None) => {
-            error_response_typed(StatusCode::NOT_FOUND, "Media record not found", "not_found")
-        }
-        Ok(Some(outcome)) => json_response(
-            StatusCode::OK,
-            serde_json::to_value(&outcome.response).unwrap_or_default(),
-        ),
-        Err(e) => media_error_response(&e),
-    }
-}
-
-/// GET /v1/media/models — capability and pricing discovery.
-pub async fn handle_media_models(
-    req: Request<hyper::body::Incoming>,
-    engine: Arc<ProxyEngine>,
-    storage: Arc<dyn Storage>,
-) -> Response<BoxBody> {
-    if let Err(response) = media_auth(&req, storage).await {
-        return response;
-    }
-    json_response(StatusCode::OK, engine.media_models())
 }

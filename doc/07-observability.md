@@ -270,7 +270,7 @@ the join key between them.
 ```
 octohub_media_requests_total{task,model,provider,status}
 octohub_media_duration_seconds{task,model,provider}
-octohub_media_cost_usd_total{task,model,provider,source}
+octohub_media_cost_usd{task,model,provider,source}
 octohub_media_cost_unknown_total{task,model,provider}
 ```
 
