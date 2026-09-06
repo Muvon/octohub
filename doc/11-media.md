@@ -295,7 +295,7 @@ counts. `total_cost` sums completions, embeddings and media. Individual records
 ```
 octohub_media_requests_total{task,model,provider,status}
 octohub_media_duration_seconds{task,model,provider}
-octohub_media_cost_usd{task,model,provider,source}
+octohub_media_cost_microusd_total{task,model,provider,source}
 octohub_media_cost_unknown_total{task,model,provider}
 ```
 

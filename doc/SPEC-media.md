@@ -553,7 +553,7 @@ already store `usage.cost` and never aggregate it — this closes that gap too.
 ```
 octohub_media_requests_total{task,model,provider,status}
 octohub_media_duration_seconds{task,model,provider}       # histogram, upstream only
-octohub_media_cost_usd{task,model,provider,source}         # gauge, cumulative; source=provider|estimate
+octohub_media_cost_microusd_total{task,model,provider,source}  # micro-USD; source=provider|estimate
 octohub_media_cost_unknown_total{task,model,provider}
 ```
 

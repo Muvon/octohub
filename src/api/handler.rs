@@ -365,6 +365,7 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
     let is_client_error = top.contains("not found in config")
         || top.contains("Failed to resolve model")
         || top.contains("Failed to resolve embedding model")
+        || top.contains("Failed to resolve media model")
         || top.contains("not available")
         || top.contains("Invalid request");
 
