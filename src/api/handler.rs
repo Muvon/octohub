@@ -1021,31 +1021,31 @@ async fn handle_media_create(
 
     match engine.process_media(media_request, &api_key).await {
         Ok(outcome) => {
-            crate::metrics::record_media(
-                task_label,
-                &model_label,
-                &outcome.response.provider,
-                media_status_label(outcome.response.status),
-                outcome.upstream_duration,
-                outcome.response.usage.as_ref().and_then(|u| u.cost),
-                outcome.response.usage.as_ref().map(|u| u.cost_source),
-                Some(api_key.id),
+            crate::metrics::record_media(crate::metrics::MediaCall {
+                task: task_label,
+                model: &model_label,
+                provider: &outcome.response.provider,
+                status: media_status_label(outcome.response.status),
+                duration: outcome.upstream_duration,
+                usage: outcome.response.usage.as_ref(),
+                api_key_id: Some(api_key.id),
                 per_key,
-            );
+            });
             media_outcome_response(outcome)
         }
         Err(e) => {
-            crate::metrics::record_media(
-                task_label,
-                &model_label,
-                "unknown",
-                "error",
-                std::time::Duration::ZERO,
-                None,
-                None,
-                Some(api_key.id),
+            crate::metrics::record_media(crate::metrics::MediaCall {
+                task: task_label,
+                model: &model_label,
+                // The call never reached an upstream, so there is no provider
+                // to attribute the failure to.
+                provider: "unknown",
+                status: "error",
+                duration: std::time::Duration::ZERO,
+                usage: None,
+                api_key_id: Some(api_key.id),
                 per_key,
-            );
+            });
             media_error_response(&e)
         }
     }

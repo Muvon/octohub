@@ -284,6 +284,42 @@ or your HTTP client of choice — the wire protocol is plain JSON.
 
 ---
 
+## `GET /v1/admin/media`
+
+Raw media records, same query parameters and envelope as
+`/v1/admin/completions` and `/v1/admin/embeddings`:
+`key_id=1,3`, `since`, `until`, `limit`, `offset`.
+
+```bash
+curl -s "http://127.0.0.1:8080/v1/admin/media?key_id=2&limit=50" \
+  -H "Authorization: Bearer your-master-secret"
+```
+
+```jsonc
+{ "data": [ {
+    "id": "med_01J…",
+    "api_key_id": 2,
+    "task": "text_to_image",
+    "status": "succeeded",
+    "input_model": "flux",
+    "resolved_model": "fal-ai/flux/dev",
+    "provider": "fal",
+    "usage": { "cost": 0.08, "cost_source": "provider", … },
+    "request": { … },        // binary payloads already redacted at write time
+    "result": { "artifacts": [ … ] },
+    "warnings": [],
+    "error": null,
+    "created_at": 1767225000,
+    "completed_at": 1767225042
+} ] }
+```
+
+Rows are returned newest first. In-flight jobs appear with a non-terminal
+`status` and a `null` `completed_at` — a job *is* its record at an earlier
+status, so there is no separate queue to inspect.
+
+---
+
 ## Usage: media and cost fields
 
 `GET /v1/admin/usage` rows carry two fields beyond the token counts:

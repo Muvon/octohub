@@ -227,7 +227,6 @@ pub trait Storage: Send + Sync {
     /// reads as absent — the caller turns that into a 404, never a 403, so
     /// record ids cannot be probed across tenants.
     fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>>;
-    #[allow(dead_code)]
     fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>>;
 
     // Usage

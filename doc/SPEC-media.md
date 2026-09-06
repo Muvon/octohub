@@ -607,7 +607,7 @@ Trait additions on `Storage` (all three backends):
 fn store_media(&self, record: &StoredMedia) -> Result<()>;
 fn update_media(&self, record: &StoredMedia) -> Result<()>;
 fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>>;
-fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>>;
+fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>>;   // GET /v1/admin/media
 ```
 
 Table creation follows the existing `CREATE TABLE IF NOT EXISTS` + `ensure_column`

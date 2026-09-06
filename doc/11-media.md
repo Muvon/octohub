@@ -285,7 +285,8 @@ input-audio duration, which is not reported back), and OpenRouter's streamed
 speech produces no usage at all.
 
 `GET /v1/admin/usage` gains `media_count` and `total_cost` alongside the token
-counts. `total_cost` sums completions, embeddings and media.
+counts. `total_cost` sums completions, embeddings and media. Individual records
+— including in-flight jobs — are readable at `GET /v1/admin/media`.
 
 ---
 

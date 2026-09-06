@@ -1159,6 +1159,134 @@ mod tests {
 
     // ── Usage tests ──
 
+    fn make_stored_media(id: &str, api_key_id: i64, status: &str) -> StoredMedia {
+        StoredMedia {
+            id: id.to_string(),
+            api_key_id,
+            task: "text_to_image".to_string(),
+            status: status.to_string(),
+            input_model: "flux".to_string(),
+            resolved_model: "fal-ai/flux/dev".to_string(),
+            provider: "fal".to_string(),
+            request: serde_json::json!({"prompt": "a red panda"}),
+            handle: Some(serde_json::json!({"remote_id": "job-1"})),
+            result: None,
+            usage: None,
+            warnings: None,
+            error: None,
+            created_at: 1700000000,
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn media_round_trips_through_submit_and_completion() {
+        let storage = create_test_storage();
+        let key = create_test_key(&storage);
+
+        let queued = make_stored_media("med_1", key.id, "queued");
+        storage.store_media(&queued).unwrap();
+
+        let stored = storage.get_media("med_1", key.id).unwrap().unwrap();
+        assert_eq!(stored.status, "queued");
+        assert_eq!(stored.provider, "fal");
+        assert_eq!(stored.request["prompt"], serde_json::json!("a red panda"));
+        // The handle is what makes a paid job resumable after a restart.
+        assert!(stored.handle.is_some());
+        assert!(stored.completed_at.is_none());
+
+        let mut done = stored;
+        done.status = "succeeded".to_string();
+        done.handle = None;
+        done.usage = Some(serde_json::json!({"cost": 0.08, "cost_source": "provider"}));
+        done.completed_at = Some(1700000042);
+        storage.update_media(&done).unwrap();
+
+        let reread = storage.get_media("med_1", key.id).unwrap().unwrap();
+        assert_eq!(reread.status, "succeeded");
+        assert!(reread.handle.is_none(), "a terminal job keeps no handle");
+        assert_eq!(reread.usage.unwrap()["cost"], serde_json::json!(0.08));
+        assert_eq!(reread.completed_at, Some(1700000042));
+        // Identity and the original request are immutable after submit.
+        assert_eq!(reread.input_model, "flux");
+        assert_eq!(reread.request["prompt"], serde_json::json!("a red panda"));
+    }
+
+    /// Record ids must not be probeable across tenants: another key's id has to
+    /// read as absent so the handler can answer 404 rather than 403.
+    #[test]
+    fn media_is_scoped_to_its_owning_key() {
+        let storage = create_test_storage();
+        let owner = create_test_key(&storage);
+        let other = storage
+            .create_api_key("other-key", None, None, None)
+            .unwrap();
+
+        storage
+            .store_media(&make_stored_media("med_1", owner.id, "queued"))
+            .unwrap();
+
+        assert!(storage.get_media("med_1", owner.id).unwrap().is_some());
+        assert!(storage.get_media("med_1", other.id).unwrap().is_none());
+        assert!(storage
+            .get_media("med_missing", owner.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn list_media_filters_by_key_and_orders_newest_first() {
+        let storage = create_test_storage();
+        let key = create_test_key(&storage);
+        let other = storage
+            .create_api_key("other-key", None, None, None)
+            .unwrap();
+
+        let mut older = make_stored_media("med_old", key.id, "succeeded");
+        older.created_at = 1700000000;
+        let mut newer = make_stored_media("med_new", key.id, "queued");
+        newer.created_at = 1700000100;
+        storage.store_media(&older).unwrap();
+        storage.store_media(&newer).unwrap();
+        storage
+            .store_media(&make_stored_media("med_other", other.id, "queued"))
+            .unwrap();
+
+        let all = storage.list_media(&ListFilter::default()).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, "med_new", "newest first");
+
+        let mine = storage
+            .list_media(&ListFilter {
+                key_ids: vec![key.id],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(mine.len(), 2);
+        assert!(mine.iter().all(|m| m.api_key_id == key.id));
+        assert_eq!(mine[0].id, "med_new");
+    }
+
+    /// An unpriced media row must contribute nothing to the spend total rather
+    /// than pulling it toward zero.
+    #[test]
+    fn usage_counts_media_rows_and_sums_only_priced_cost() {
+        let storage = create_test_storage();
+        let key = create_test_key(&storage);
+
+        let mut priced = make_stored_media("med_1", key.id, "succeeded");
+        priced.usage = Some(serde_json::json!({"cost": 0.08, "cost_source": "provider"}));
+        let mut unpriced = make_stored_media("med_2", key.id, "succeeded");
+        unpriced.usage = Some(serde_json::json!({"cost": null, "cost_source": "unavailable"}));
+        storage.store_media(&priced).unwrap();
+        storage.store_media(&unpriced).unwrap();
+
+        let usage = storage.get_usage(&[], None, None, None).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].media_count, 2);
+        assert!((usage[0].total_cost - 0.08).abs() < 1e-9);
+    }
+
     #[test]
     fn test_get_usage_total() {
         let storage = create_test_storage();
