@@ -205,7 +205,10 @@ pub trait Storage: Send + Sync {
 
     // Completions
     fn store_completion(&self, completion: &StoredCompletion) -> Result<()>;
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "exercised only by the sqlite backend tests")
+    )]
     fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>>;
     /// Walk the chain of previous_completion_id links, returning completions oldest-first.
     /// Only populates the fields needed for chain replay: id, session_id,
