@@ -261,3 +261,24 @@ metrics don't carry it as a label (that would explode cardinality).
 Use the `X-Request-Id` response header as the join key from a client
 error into logs, and use route/model/status from logs and metrics as
 the join key between them.
+
+
+---
+
+## Media metrics
+
+```
+octohub_media_requests_total{task,model,provider,status}
+octohub_media_duration_seconds{task,model,provider}
+octohub_media_cost_usd_total{task,model,provider,source}
+octohub_media_cost_unknown_total{task,model,provider}
+```
+
+`task` is `image`, `video`, `speech` or `transcription`. `status` is `ok`,
+`accepted` (202 — the job is still running) or `error`. `source` on the cost
+counter is `provider` (the upstream reported a dollar amount) or `estimate`
+(computed from octolib's reference rates); requests nothing could price are
+counted in `octohub_media_cost_unknown_total` instead, never as $0.
+
+The `/v1/media/{id}` route label is collapsed so per-record ids cannot explode
+metric cardinality.

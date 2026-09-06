@@ -49,6 +49,66 @@ fn default_true() -> bool {
     true
 }
 
+/// Server-side media knobs. Every field maps onto an octolib
+/// `RequestOptions` field; wait deadlines deliberately reuse
+/// `server.upstream_timeout_secs` rather than growing a second timeout.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaConfig {
+    #[serde(default = "default_max_source_bytes")]
+    pub max_source_bytes: usize,
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default = "default_polling_interval_secs")]
+    pub polling_interval_secs: u64,
+    #[serde(default = "default_submit_timeout_secs")]
+    pub submit_timeout_secs: u64,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: default_max_source_bytes(),
+            max_response_bytes: default_max_response_bytes(),
+            polling_interval_secs: default_polling_interval_secs(),
+            submit_timeout_secs: default_submit_timeout_secs(),
+        }
+    }
+}
+
+fn default_max_source_bytes() -> usize {
+    20 * 1024 * 1024
+}
+
+fn default_max_response_bytes() -> usize {
+    100 * 1024 * 1024
+}
+
+fn default_polling_interval_secs() -> u64 {
+    2
+}
+
+fn default_submit_timeout_secs() -> u64 {
+    120
+}
+
+/// Per-adapter endpoint override, keyed by octolib's provider name. Applied by
+/// exporting the adapter's own base-URL environment variable at startup — the
+/// adapters read it from the process environment, so there is exactly one
+/// custom endpoint per adapter per deployment.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MediaProviderConfig {
+    pub api_base: Option<String>,
+}
+
+/// The base-URL environment variable each octolib media adapter reads.
+pub const MEDIA_API_BASE_ENVS: &[(&str, &str)] = &[
+    ("elevenlabs", "ELEVENLABS_API_URL"),
+    ("fal", "FAL_API_URL"),
+    ("openrouter", "OPENROUTER_MEDIA_API_URL"),
+    ("replicate", "REPLICATE_API_URL"),
+    ("runway", "RUNWAY_API_URL"),
+];
+
 fn default_metrics_bind() -> String {
     "127.0.0.1:9090".to_string()
 }
@@ -74,6 +134,11 @@ pub struct Config {
     /// Embedding model mappings (same format as models)
     #[serde(default)]
     pub embedding_models: HashMap<String, Vec<String>>,
+    /// Media model mappings — identical shape and resolution to `models`:
+    /// alias -> list of `provider:model` mirrors, tried in rotation. Pricing
+    /// is octolib's (`media::reference_pricing`), so nothing else lives here.
+    #[serde(default)]
+    pub media_models: HashMap<String, Vec<String>>,
     /// The virtual `auto` model: purpose → model-alias map, the deployment's
     /// floor for purpose-based routing. When non-empty, a request for model
     /// "auto" is rewritten to the alias this map (or the key owner's stored
@@ -95,6 +160,12 @@ pub struct Config {
     /// Metrics configuration
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Media transport knobs.
+    #[serde(default)]
+    pub media: MediaConfig,
+    /// Per-adapter media endpoint overrides, keyed by octolib provider name.
+    #[serde(default)]
+    pub media_providers: HashMap<String, MediaProviderConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +298,7 @@ impl Config {
             let mut config: Config = toml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {}", path))?;
             config.validate_auto()?;
+            config.validate_media()?;
             // Override with environment variables if set
             if let Ok(master_key) = env::var("OCTOHUB_MASTER_KEY") {
                 config.server.api_key = master_key;
@@ -347,10 +419,13 @@ impl Config {
             },
             models: HashMap::new(),
             embedding_models: HashMap::new(),
+            media_models: HashMap::new(),
             auto: HashMap::new(),
             providers: HashMap::new(),
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
+            media: MediaConfig::default(),
+            media_providers: HashMap::new(),
         };
         Self::apply_env_overrides(&mut config);
         config
@@ -367,6 +442,97 @@ impl Config {
     /// Embedding counterpart of [`model_candidates`](Self::model_candidates).
     pub fn embedding_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
         self.candidates_from_map(model, &self.embedding_models, "embedding model")
+    }
+
+    /// Media counterpart of [`model_candidates`](Self::model_candidates).
+    pub fn media_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
+        self.candidates_from_map(model, &self.media_models, "media model")
+    }
+
+    /// Fail loudly at load on a `[media_models]` section that cannot work.
+    /// An unknown provider or a malformed entry is a typo the operator should
+    /// learn about at boot, not on the first paid request. There is no pricing
+    /// validation: rates live in octolib, and an unpriced model degrades to a
+    /// `cost_unavailable` warning on the response, not a config error.
+    fn validate_media(&self) -> Result<()> {
+        let supported = octolib::MediaProviderFactory::supported_providers();
+        for (alias, entries) in &self.media_models {
+            if self.models.contains_key(alias) || self.embedding_models.contains_key(alias) {
+                anyhow::bail!(
+                    "[media_models].{} collides with an alias already defined in [models] or [embedding_models]",
+                    alias
+                );
+            }
+            if entries.is_empty() {
+                anyhow::bail!("[media_models].{} has an empty provider list", alias);
+            }
+            for entry in entries {
+                let (provider, model) = entry.split_once(':').with_context(|| {
+                    format!(
+                        "[media_models].{} entry '{}' is not in 'provider:model' format",
+                        alias, entry
+                    )
+                })?;
+                if model.trim().is_empty() {
+                    anyhow::bail!(
+                        "[media_models].{} entry '{}' has an empty model",
+                        alias,
+                        entry
+                    );
+                }
+                if !supported.iter().any(|s| s.eq_ignore_ascii_case(provider)) {
+                    anyhow::bail!(
+                        "[media_models].{} entry '{}' names unknown media provider '{}'. Available: {}",
+                        alias,
+                        entry,
+                        provider,
+                        supported.join(", ")
+                    );
+                }
+            }
+        }
+        for name in self.media_providers.keys() {
+            if !MEDIA_API_BASE_ENVS
+                .iter()
+                .any(|(provider, _)| provider.eq_ignore_ascii_case(name))
+            {
+                anyhow::bail!(
+                    "[media_providers].{} is not an octolib media adapter. Available: {}",
+                    name,
+                    supported.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Export the configured media endpoint overrides into the process
+    /// environment, where the octolib adapters read them. Called once at
+    /// startup; an already-set variable wins so an operator can still override
+    /// the config from the environment.
+    pub fn export_media_provider_endpoints(&self) {
+        for (name, cfg) in &self.media_providers {
+            let Some(api_base) = cfg
+                .api_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let Some((_, variable)) = MEDIA_API_BASE_ENVS
+                .iter()
+                .find(|(provider, _)| provider.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            if std::env::var(variable).is_ok() {
+                tracing::info!(provider = %name, variable, "media endpoint override skipped; environment already set");
+                continue;
+            }
+            std::env::set_var(variable, api_base);
+            tracing::info!(provider = %name, api_base, "media endpoint override applied");
+        }
     }
 
     /// Case-insensitive `[providers.<name>]` lookup — the limiter lowercases
@@ -501,10 +667,13 @@ mod tests {
             server: Default::default(),
             models: HashMap::new(),
             embedding_models: HashMap::new(),
+            media_models: HashMap::new(),
             auto: HashMap::new(),
             providers,
             logging: Default::default(),
             metrics: Default::default(),
+            media: Default::default(),
+            media_providers: HashMap::new(),
         };
         assert!(config.provider_config("openai").is_some());
         assert!(config.provider_config("OPENAI").is_some());
@@ -519,6 +688,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
                 .collect(),
             embedding_models: HashMap::new(),
+            media_models: HashMap::new(),
             auto: auto
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -526,6 +696,8 @@ mod tests {
             providers: HashMap::new(),
             logging: Default::default(),
             metrics: Default::default(),
+            media: Default::default(),
+            media_providers: HashMap::new(),
         }
     }
 
@@ -579,10 +751,13 @@ mod tests {
             server: Default::default(),
             models,
             embedding_models: HashMap::new(),
+            media_models: HashMap::new(),
             auto: HashMap::new(),
             providers: HashMap::new(),
             logging: Default::default(),
             metrics: Default::default(),
+            media: Default::default(),
+            media_providers: HashMap::new(),
         };
 
         let mut candidates = config.model_candidates("fast").unwrap();
@@ -604,6 +779,136 @@ mod tests {
         );
 
         assert!(config.model_candidates("unknown").is_err());
+    }
+
+    #[test]
+    fn media_models_deserialize_and_resolve_like_models() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            api_key = ""
+
+            [media_models]
+            flux = ["fal:fal-ai/flux/dev", "replicate:black-forest-labs/flux-1.1-pro"]
+
+            [media]
+            max_source_bytes = 1024
+            polling_interval_secs = 5
+
+            [media_providers.fal]
+            api_base = "https://fal.internal.example"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.validate_media().is_ok());
+        assert_eq!(config.media.max_source_bytes, 1024);
+        assert_eq!(config.media.polling_interval_secs, 5);
+        // Unset media knobs keep their defaults rather than zeroing out.
+        assert_eq!(config.media.submit_timeout_secs, 120);
+
+        let mut candidates = config.media_model_candidates("flux").unwrap();
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![
+                ("fal".to_string(), "fal-ai/flux/dev".to_string()),
+                (
+                    "replicate".to_string(),
+                    "black-forest-labs/flux-1.1-pro".to_string()
+                ),
+            ]
+        );
+
+        // A literal provider:model bypasses the map, same as [models].
+        assert_eq!(
+            config.media_model_candidates("runway:gen4_turbo").unwrap(),
+            vec![("runway".to_string(), "gen4_turbo".to_string())]
+        );
+        assert!(config.media_model_candidates("unknown").is_err());
+    }
+
+    fn media_config(media: &[(&str, &[&str])], models: &[(&str, &str)]) -> Config {
+        Config {
+            media_models: media
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        v.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
+                    )
+                })
+                .collect(),
+            models: models
+                .iter()
+                .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+                .collect(),
+            server: Default::default(),
+            embedding_models: HashMap::new(),
+            auto: HashMap::new(),
+            providers: HashMap::new(),
+            logging: Default::default(),
+            metrics: Default::default(),
+            media: Default::default(),
+            media_providers: HashMap::new(),
+        }
+    }
+
+    /// A typo here costs real money on the first request, so it has to fail at
+    /// boot instead.
+    #[test]
+    fn media_validation_fails_loudly_on_broken_maps() {
+        // Unknown provider.
+        let c = media_config(&[("flux", &["nope:some-model"])], &[]);
+        assert!(c
+            .validate_media()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown media provider"));
+
+        // Not provider:model.
+        assert!(media_config(&[("flux", &["fal-ai/flux/dev"])], &[])
+            .validate_media()
+            .is_err());
+
+        // Empty model half.
+        assert!(media_config(&[("flux", &["fal:"])], &[])
+            .validate_media()
+            .is_err());
+
+        // Empty mirror list resolves to nothing.
+        assert!(media_config(&[("flux", &[])], &[])
+            .validate_media()
+            .is_err());
+
+        // An alias shared with [models] makes routing ambiguous.
+        let c = media_config(
+            &[("flux", &["fal:fal-ai/flux/dev"])],
+            &[("flux", "openai:gpt-5")],
+        );
+        assert!(c
+            .validate_media()
+            .unwrap_err()
+            .to_string()
+            .contains("collides"));
+
+        // An override for something that is not an adapter is a typo.
+        let mut c = media_config(&[], &[]);
+        c.media_providers
+            .insert("openai".to_string(), MediaProviderConfig::default());
+        assert!(c.validate_media().is_err());
+    }
+
+    #[test]
+    fn media_validation_accepts_every_supported_adapter() {
+        for provider in octolib::MediaProviderFactory::supported_providers() {
+            let entry = format!("{provider}:some/model");
+            let config = media_config(&[("alias", &[entry.as_str()])], &[]);
+            assert!(
+                config.validate_media().is_ok(),
+                "{provider} should be accepted"
+            );
+        }
     }
 
     #[test]

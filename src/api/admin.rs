@@ -482,6 +482,8 @@ pub async fn handle_usage(
                         "embeddings_count": r.embeddings_count,
                         "total_input_tokens": r.total_input_tokens,
                         "total_output_tokens": r.total_output_tokens,
+                        "media_count": r.media_count,
+                        "total_cost": r.total_cost,
                     })
                 })
                 .collect();

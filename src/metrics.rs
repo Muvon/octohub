@@ -110,6 +110,22 @@ pub fn init(cfg: &MetricsConfig) -> Result<Option<metrics_exporter_prometheus::P
         "Requests re-routed to another candidate after a provider-side failure"
     );
 
+    describe_counter!(
+        "octohub_media_requests_total",
+        "Media generation requests by task, model, provider and outcome"
+    );
+    describe_histogram!(
+        "octohub_media_duration_seconds",
+        "Upstream media call duration in seconds"
+    );
+    describe_counter!(
+        "octohub_media_cost_usd_total",
+        "Media spend in USD, split by whether the provider reported it or octolib estimated it"
+    );
+    describe_counter!(
+        "octohub_media_cost_unknown_total",
+        "Media requests nothing could price — tracked separately so they are never read as free"
+    );
     // Build info gauge — constant, identifies the running version.
     gauge!("octohub_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
 
@@ -315,4 +331,84 @@ pub fn record_queue_wait(provider: &str, duration: Duration) {
     let provider = provider.to_owned();
     histogram!("octohub_provider_queue_wait_seconds", "provider" => provider)
         .record(duration.as_secs_f64());
+}
+
+/// Record a media request. `cost` is the billed amount (`None` when nothing
+/// could price it) and `cost_source` says whether it came from the provider or
+/// from octolib's reference table — the two are different claims and are
+/// counted separately.
+#[allow(clippy::too_many_arguments)]
+pub fn record_media(
+    task: &str,
+    model: &str,
+    provider: &str,
+    status: &str,
+    duration: Duration,
+    cost: Option<f64>,
+    cost_source: Option<crate::api::media_types::CostSource>,
+    api_key_id: Option<i64>,
+    per_key: bool,
+) {
+    // Same funnel as completions and embeddings, so `/v1/admin/status` sees
+    // media traffic too. A 202 is not a failure — the job is live.
+    crate::health::record(
+        model,
+        provider,
+        matches!(status, "ok" | "accepted"),
+        duration,
+        status,
+    );
+
+    let task = task.to_owned();
+    let model = model.to_owned();
+    let provider = provider.to_owned();
+    let mut labels: Vec<(&str, String)> = vec![
+        ("task", task.clone()),
+        ("model", model.clone()),
+        ("provider", provider.clone()),
+        ("status", status.to_owned()),
+    ];
+    if per_key {
+        if let Some(id) = api_key_id {
+            labels.push(("api_key_id", id.to_string()));
+        }
+    }
+    counter!("octohub_media_requests_total", &labels).increment(1);
+
+    histogram!(
+        "octohub_media_duration_seconds",
+        "task" => task.clone(),
+        "model" => model.clone(),
+        "provider" => provider.clone()
+    )
+    .record(duration.as_secs_f64());
+
+    match (cost, cost_source) {
+        (Some(cost), Some(source)) => {
+            let source = match source {
+                crate::api::media_types::CostSource::Provider => "provider",
+                crate::api::media_types::CostSource::Estimate => "estimate",
+                crate::api::media_types::CostSource::Unavailable => "unavailable",
+            };
+            counter!(
+                "octohub_media_cost_usd_total",
+                "task" => task,
+                "model" => model,
+                "provider" => provider,
+                "source" => source
+            )
+            .increment(cost.max(0.0));
+        }
+        _ => {
+            // An unpriced request is tracked separately rather than counted as
+            // $0 — a free generation and an unknown one are different facts.
+            counter!(
+                "octohub_media_cost_unknown_total",
+                "task" => task,
+                "model" => model,
+                "provider" => provider
+            )
+            .increment(1);
+        }
+    }
 }

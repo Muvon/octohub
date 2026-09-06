@@ -86,6 +86,39 @@ pub struct StoredEmbedding {
     pub created_at: u64,
 }
 
+/// Stored media record. A job *is* the record at an earlier status, so
+/// in-flight and finished work share one row: `handle` carries the resumable
+/// octolib `JobHandle` until the operation reaches a terminal state.
+#[derive(Debug, Clone)]
+pub struct StoredMedia {
+    /// "med_<uuid>"
+    pub id: String,
+    pub api_key_id: i64,
+    /// octolib `MediaTask`, snake_case.
+    pub task: String,
+    /// octolib `OperationStatus`, snake_case.
+    pub status: String,
+    /// Model name as sent by the client (alias or `provider:model`).
+    pub input_model: String,
+    /// Provider-native model actually submitted.
+    pub resolved_model: String,
+    pub provider: String,
+    /// The client request with binary payloads redacted — base64 blobs must
+    /// never reach the database.
+    pub request: serde_json::Value,
+    /// Serialized `JobHandle`; `None` once the operation is terminal.
+    pub handle: Option<serde_json::Value>,
+    /// Artifacts plus any task-specific result payload.
+    pub result: Option<serde_json::Value>,
+    /// `MediaUsage` plus the derived `cost` / `cost_source` fields.
+    pub usage: Option<serde_json::Value>,
+    pub warnings: Option<serde_json::Value>,
+    /// `GenerationFailure` when the operation failed.
+    pub error: Option<serde_json::Value>,
+    pub created_at: u64,
+    pub completed_at: Option<u64>,
+}
+
 /// Aggregated usage row for reporting
 #[derive(Debug, Clone)]
 pub struct UsageRow {
@@ -97,6 +130,10 @@ pub struct UsageRow {
     pub embeddings_count: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub media_count: u64,
+    /// Summed `usage.cost` across completions, embeddings and media. Rows the
+    /// provider never priced contribute nothing rather than zero-filling.
+    pub total_cost: f64,
 }
 
 /// Query filters for listing completions/embeddings
@@ -180,6 +217,19 @@ pub trait Storage: Send + Sync {
     fn store_embedding(&self, embedding: &StoredEmbedding) -> Result<()>;
     fn list_embeddings(&self, filter: &ListFilter) -> Result<Vec<StoredEmbedding>>;
 
+    // Media
+    /// Insert a submitted media job. Called BEFORE any waiting, so a restart
+    /// can still find and resume work that has already been paid for upstream.
+    fn store_media(&self, record: &StoredMedia) -> Result<()>;
+    /// Overwrite the mutable half of a media row after a status change.
+    fn update_media(&self, record: &StoredMedia) -> Result<()>;
+    /// Fetch a media record scoped to its owning key. A different key's id
+    /// reads as absent — the caller turns that into a 404, never a 403, so
+    /// record ids cannot be probed across tenants.
+    fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>>;
+    #[allow(dead_code)]
+    fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>>;
+
     // Usage
     fn get_usage(
         &self,
@@ -248,6 +298,29 @@ pub(crate) fn decode_allowed_models(raw: Option<String>) -> Option<Vec<String>> 
         Ok(list) => Some(list),
         Err(err) => {
             tracing::warn!(error = %err, raw = %raw, "Invalid allowed_models JSON — treating key as unrestricted");
+            None
+        }
+    }
+}
+
+/// Encode an optional JSON column. `None` and JSON `null` both store SQL NULL
+/// so an absent value reads back identically however it was written.
+pub(crate) fn encode_json_column(value: Option<&serde_json::Value>) -> Option<String> {
+    match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => serde_json::to_string(value).ok(),
+    }
+}
+
+/// Decode an optional JSON column. A hand-edited unparseable row degrades to
+/// `None` rather than failing the read — same fail-open stance as
+/// `decode_allowed_models`.
+pub(crate) fn decode_json_column(raw: Option<String>) -> Option<serde_json::Value> {
+    let raw = raw?;
+    match serde_json::from_str(&raw) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(error = %err, "Invalid JSON in media column — treating as absent");
             None
         }
     }

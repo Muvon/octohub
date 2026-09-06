@@ -571,6 +571,32 @@ curl http://127.0.0.1:8080/health
 
 ---
 
+### Media
+
+`POST /v1/images/generations`, `POST /v1/videos`, `POST /v1/audio/speech`,
+`POST /v1/audio/transcriptions`, `GET /v1/media/{id}`,
+`POST /v1/media/{id}/cancel`, `GET /v1/media/models`.
+
+Client-key auth, `[media_models]` aliases, and the same `allowed_models`
+allow-list and owner budget as the endpoints above. All bodies are JSON — never
+`multipart/form-data`; binary inputs are `{"type":"url"|"base64", …}` objects.
+
+```bash
+curl -sX POST http://127.0.0.1:8080/v1/images/generations \
+  -H "Authorization: Bearer <client-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"flux","prompt":"a red panda astronaut","count":2,"size":"1024x1024"}'
+```
+
+Long jobs answer `202 Accepted` with a job id; poll `GET /v1/media/{id}` until
+`status` is terminal. A `202` is not an error — the work is live and resumable.
+
+Every response carries `usage.cost` and `usage.cost_source`
+(`provider` | `estimate` | `unavailable`). Unpriced requests record `null`,
+never `0`.
+
+Full contract: [doc/11-media.md](doc/11-media.md).
+
 ## Admin Endpoints
 
 All admin endpoints require the master key from `octohub.toml`:

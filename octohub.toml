@@ -108,3 +108,36 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 # Ollama / self-hosted — no rate windows; cap concurrency to the box.
 # [providers.ollama]
 # concurrency = 4
+
+# ── Media ────────────────────────────────────────────────────────────────────
+# Media aliases work exactly like [models]: alias -> list of "provider:model"
+# mirrors, picked in rotation. Providers: elevenlabs, fal, openrouter,
+# replicate, runway. Pricing is not configured here — octolib resolves a rate
+# from its own reference table and reports it on the response.
+#
+# [media_models]
+# "flux" = ["fal:fal-ai/flux/dev", "replicate:black-forest-labs/flux-1.1-pro"]
+# "veo"  = ["openrouter:google/veo-3.1"]
+# "tts"  = ["elevenlabs:eleven_flash_v2_5"]
+
+# Rate limits and concurrency reuse [providers.<name>] unchanged — the media
+# adapters are keyed by the same provider names:
+#
+# [providers.fal]
+# concurrency = 8
+# requests_per_minute = 60
+
+# Transport knobs. Wait deadlines reuse server.upstream_timeout_secs.
+#
+# [media]
+# max_source_bytes = 20971520       # 20 MiB cap on decoded inline uploads
+# max_response_bytes = 104857600    # 100 MiB
+# polling_interval_secs = 2
+# submit_timeout_secs = 120
+
+# Point an adapter at a self-hosted or gateway-fronted endpoint. Exported into
+# the adapter's own env var at startup, so there is one custom endpoint per
+# adapter per deployment.
+#
+# [media_providers.fal]
+# api_base = "https://fal.internal.example"

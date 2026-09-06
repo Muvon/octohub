@@ -92,6 +92,10 @@ cargo build --release
 
 - **One endpoint, many providers** — OpenAI-style `POST /v1/completions`,
   `/v1/chat/completions`, and `/v1/embeddings` routed to 20+ upstream providers
+- **Media generation** — `/v1/images/generations`, `/v1/videos`,
+  `/v1/audio/speech` and `/v1/audio/transcriptions` across ElevenLabs, fal,
+  OpenRouter, Replicate and Runway, with durable resumable jobs and per-request
+  cost ([docs](doc/11-media.md))
 - **Completion chaining** — pass `previous_completion_id` and prior turns are
   replayed automatically, including reasoning/thinking blocks (DeepSeek-compatible)
 - **Model mapping & load balancing** — map short names to `provider:model`
@@ -144,7 +148,7 @@ Two independent layers:
 
 | Layer | Endpoints | Key source |
 |---|---|---|
-| **Client** | `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings` | Keys from the `api_keys` DB table |
+| **Client** | `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/images/generations`, `/v1/videos`, `/v1/audio/*`, `/v1/media/*` | Keys from the `api_keys` DB table |
 | **Admin** | `/v1/admin/*` | Master key from `octohub.toml` |
 
 Details: [doc/04 — Authentication](doc/04-authentication.md).
@@ -154,6 +158,7 @@ Details: [doc/04 — Authentication](doc/04-authentication.md).
 - **[User docs](doc/README.md)** — installation, configuration, auth, deployment, troubleshooting
 - **[API reference](API.md)** — full endpoint reference
 - **[Providers](doc/09-providers.md)** — supported `provider:model` prefixes
+- **[Media](doc/11-media.md)** — image, video, speech and transcription endpoints
 - **[Changelog](CHANGELOG.md)**
 
 ## License

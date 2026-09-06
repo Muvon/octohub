@@ -420,3 +420,18 @@ client request
   ├─ persist completion row (input, output, usage, provider, ...)
   └─ response: provider output verbatim + X-Request-Id
 ```
+
+
+---
+
+## Media endpoints
+
+`POST /v1/images/generations`, `POST /v1/videos`, `POST /v1/audio/speech`,
+`POST /v1/audio/transcriptions`, plus `GET /v1/media/{id}`,
+`POST /v1/media/{id}/cancel` and `GET /v1/media/models`.
+
+They authenticate with the same client keys and honour the same `allowed_models`
+allow-list and owner concurrency budget as the endpoints above. Long jobs answer
+`202 Accepted` with a job id you poll.
+
+See [11 — Media](./11-media.md) for the full contract.

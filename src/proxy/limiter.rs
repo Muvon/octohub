@@ -388,10 +388,13 @@ mod tests {
             server: Default::default(),
             models: HashMap::new(),
             embedding_models: HashMap::new(),
+            media_models: HashMap::new(),
             auto: HashMap::new(),
             providers,
             logging: Default::default(),
             metrics: Default::default(),
+            media: Default::default(),
+            media_providers: HashMap::new(),
         };
         ProviderLimiter::from_config(&config)
     }
