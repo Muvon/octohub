@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.1] - 2026-09-06
+
+### 📋 Release Summary
+
+This release updates core dependencies, including `dirs` and `octolib`, improving compatibility and maintenance of the existing octohub functionality (b041e535).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.8.0] - 2026-09-06
 
 ### 📋 Release Summary
