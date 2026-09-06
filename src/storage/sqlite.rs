@@ -1,7 +1,7 @@
 use super::{
-    decode_allowed_models, decode_auto_map, encode_allowed_models, encode_auto_map,
-    generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-    StoredEmbedding, TimeBucket, UsageRow,
+    decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models,
+    encode_auto_map, encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey,
+    ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredMedia, TimeBucket, UsageRow,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -74,6 +74,27 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_embeddings_api_key ON embeddings(api_key_id);
             CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);
 
+            CREATE TABLE IF NOT EXISTS media (
+                id TEXT PRIMARY KEY,
+                api_key_id INTEGER NOT NULL REFERENCES api_keys(id),
+                task TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_model TEXT NOT NULL,
+                resolved_model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                request TEXT NOT NULL,
+                handle TEXT,
+                result TEXT,
+                usage TEXT,
+                warnings TEXT,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_api_key ON media(api_key_id);
+            CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at);
+            CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
+
             CREATE TABLE IF NOT EXISTS owner_auto_models (
                 owner TEXT PRIMARY KEY,
                 map TEXT NOT NULL,
@@ -119,6 +140,26 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
 fn lock_conn(conn: &Mutex<Connection>) -> Result<std::sync::MutexGuard<'_, Connection>> {
     conn.lock()
         .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))
+}
+
+fn read_media(row: &rusqlite::Row) -> rusqlite::Result<StoredMedia> {
+    Ok(StoredMedia {
+        id: row.get(0)?,
+        api_key_id: row.get(1)?,
+        task: row.get(2)?,
+        status: row.get(3)?,
+        input_model: row.get(4)?,
+        resolved_model: row.get(5)?,
+        provider: row.get(6)?,
+        request: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+        handle: decode_json_column(row.get(8)?),
+        result: decode_json_column(row.get(9)?),
+        usage: decode_json_column(row.get(10)?),
+        warnings: decode_json_column(row.get(11)?),
+        error: decode_json_column(row.get(12)?),
+        created_at: row.get(13)?,
+        completed_at: row.get(14)?,
+    })
 }
 
 fn read_completion(row: &rusqlite::Row) -> rusqlite::Result<StoredCompletion> {
@@ -536,6 +577,98 @@ impl Storage for SqliteStorage {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    fn store_media(&self, record: &StoredMedia) -> Result<()> {
+        let conn = lock_conn(&self.conn)?;
+        conn.execute(
+            "INSERT INTO media (id, api_key_id, task, status, input_model, resolved_model, \
+             provider, request, handle, result, usage, warnings, error, created_at, completed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                record.id,
+                record.api_key_id,
+                record.task,
+                record.status,
+                record.input_model,
+                record.resolved_model,
+                record.provider,
+                serde_json::to_string(&record.request)?,
+                encode_json_column(record.handle.as_ref()),
+                encode_json_column(record.result.as_ref()),
+                encode_json_column(record.usage.as_ref()),
+                encode_json_column(record.warnings.as_ref()),
+                encode_json_column(record.error.as_ref()),
+                record.created_at,
+                record.completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn update_media(&self, record: &StoredMedia) -> Result<()> {
+        let conn = lock_conn(&self.conn)?;
+        // Only the mutable half is written: identity, ownership and the
+        // original request are immutable once the job has been submitted.
+        conn.execute(
+            "UPDATE media SET status = ?1, handle = ?2, result = ?3, usage = ?4, \
+             warnings = ?5, error = ?6, completed_at = ?7 WHERE id = ?8",
+            rusqlite::params![
+                record.status,
+                encode_json_column(record.handle.as_ref()),
+                encode_json_column(record.result.as_ref()),
+                encode_json_column(record.usage.as_ref()),
+                encode_json_column(record.warnings.as_ref()),
+                encode_json_column(record.error.as_ref()),
+                record.completed_at,
+                record.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {
+        let conn = lock_conn(&self.conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, api_key_id, task, status, input_model, resolved_model, provider, \
+             request, handle, result, usage, warnings, error, created_at, completed_at \
+             FROM media WHERE id = ?1 AND api_key_id = ?2",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![id, api_key_id], read_media)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>> {
+        let conn = lock_conn(&self.conn)?;
+        let (where_clause, filter_params) =
+            build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
+
+        let limit_idx = filter_params.len() + 1;
+        let offset_idx = filter_params.len() + 2;
+        let sql = format!(
+            "SELECT id, api_key_id, task, status, input_model, resolved_model, provider, \
+             request, handle, result, usage, warnings, error, created_at, completed_at \
+             FROM media{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+            where_clause, limit_idx, offset_idx
+        );
+
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
+        let limit = if filter.limit == 0 {
+            50
+        } else {
+            filter.limit.min(1000)
+        };
+        all_params.push(Box::new(limit));
+        all_params.push(Box::new(filter.offset));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), read_media)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     fn get_usage(
         &self,
         key_ids: &[i64],
@@ -561,7 +694,8 @@ impl Storage for SqliteStorage {
             "SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
              COALESCE(SUM(json_extract(usage, '$.input_tokens')), 0) AS inp, \
-             COALESCE(SUM(json_extract(usage, '$.output_tokens')), 0) AS outp \
+             COALESCE(SUM(json_extract(usage, '$.output_tokens')), 0) AS outp, \
+             COALESCE(SUM(json_extract(usage, '$.cost')), 0.0) AS cost \
              FROM completions{where_clause} \
              GROUP BY api_key_id, period",
             bucket = bucket_expr,
@@ -571,8 +705,21 @@ impl Storage for SqliteStorage {
         let emb_sql = format!(
             "SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
-             COALESCE(SUM(json_extract(usage, '$.input_tokens')), 0) AS inp \
+             COALESCE(SUM(json_extract(usage, '$.input_tokens')), 0) AS inp, \
+             COALESCE(SUM(json_extract(usage, '$.cost')), 0.0) AS cost \
              FROM embeddings{where_clause} \
+             GROUP BY api_key_id, period",
+            bucket = bucket_expr,
+            where_clause = where_clause,
+        );
+
+        // Media rows carry cost but no tokens; an unpriced row contributes
+        // nothing rather than zero-filling the total.
+        let media_sql = format!(
+            "SELECT api_key_id, {bucket} AS period, \
+             COUNT(*) AS cnt, \
+             COALESCE(SUM(json_extract(usage, '$.cost')), 0.0) AS cost \
+             FROM media{where_clause} \
              GROUP BY api_key_id, period",
             bucket = bucket_expr,
             where_clause = where_clause,
@@ -595,10 +742,11 @@ impl Storage for SqliteStorage {
                     row.get::<_, u64>(2)?,
                     row.get::<_, u64>(3)?,
                     row.get::<_, u64>(4)?,
+                    row.get::<_, f64>(5)?,
                 ))
             })?;
             for row in rows {
-                let (key_id, period, cnt, inp, outp) = row?;
+                let (key_id, period, cnt, inp, outp, cost) = row?;
                 let entry = usage_map
                     .entry((key_id, period))
                     .or_insert_with(|| UsageRow {
@@ -609,10 +757,13 @@ impl Storage for SqliteStorage {
                         embeddings_count: 0,
                         total_input_tokens: 0,
                         total_output_tokens: 0,
+                        media_count: 0,
+                        total_cost: 0.0,
                     });
                 entry.completions_count = cnt;
                 entry.total_input_tokens += inp;
                 entry.total_output_tokens += outp;
+                entry.total_cost += cost;
             }
         }
 
@@ -625,10 +776,11 @@ impl Storage for SqliteStorage {
                     row.get::<_, u64>(1)?,
                     row.get::<_, u64>(2)?,
                     row.get::<_, u64>(3)?,
+                    row.get::<_, f64>(4)?,
                 ))
             })?;
             for row in rows {
-                let (key_id, period, cnt, inp) = row?;
+                let (key_id, period, cnt, inp, cost) = row?;
                 let entry = usage_map
                     .entry((key_id, period))
                     .or_insert_with(|| UsageRow {
@@ -639,9 +791,43 @@ impl Storage for SqliteStorage {
                         embeddings_count: 0,
                         total_input_tokens: 0,
                         total_output_tokens: 0,
+                        media_count: 0,
+                        total_cost: 0.0,
                     });
                 entry.embeddings_count = cnt;
                 entry.total_input_tokens += inp;
+                entry.total_cost += cost;
+            }
+        }
+
+        // Collect media stats
+        {
+            let mut stmt = conn.prepare(&media_sql)?;
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (key_id, period, cnt, cost) = row?;
+                let entry = usage_map
+                    .entry((key_id, period))
+                    .or_insert_with(|| UsageRow {
+                        period: if bucket.is_some() { Some(period) } else { None },
+                        key_id,
+                        key_name: String::new(),
+                        completions_count: 0,
+                        embeddings_count: 0,
+                        total_input_tokens: 0,
+                        total_output_tokens: 0,
+                        media_count: 0,
+                        total_cost: 0.0,
+                    });
+                entry.media_count = cnt;
+                entry.total_cost += cost;
             }
         }
 

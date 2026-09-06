@@ -5,7 +5,8 @@ your applications and a fleet of upstream LLM providers, adding four things
 that raw provider APIs don't give you on their own:
 
 1. **A single OpenAI-style endpoint** that routes to many providers
-   (OpenAI, Anthropic, Google, Ollama, Modal-hosted vLLM, OpenRouter, …).
+   (OpenAI, Anthropic, Google, Ollama, Modal-hosted vLLM, OpenRouter, …) — for
+   chat, embeddings, and media generation (images, video, speech, transcription).
 2. **Multi-tenant API keys** issued and revoked from an admin API, with
    per-key usage attribution and rate-limiting by model allow-list.
 3. **Full request/response logging** in your own database (SQLite, MySQL,
@@ -34,6 +35,7 @@ Under the hood OctoHub is built on [octolib](https://crates.io/crates/octolib)
 | [08 — Deployment](./08-deployment.md) | Reverse proxies, `X-Forwarded-For`, security |
 | [09 — Providers](./09-providers.md) | Supported `provider:model` prefixes |
 | [10 — Troubleshooting](./10-troubleshooting.md) | Common errors and fixes |
+| [11 — Media](./11-media.md) | Image, video, speech and transcription endpoints |
 
 ---
 

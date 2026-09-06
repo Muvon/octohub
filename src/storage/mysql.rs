@@ -1,7 +1,7 @@
 use super::{
-    decode_allowed_models, decode_auto_map, encode_allowed_models, encode_auto_map,
-    generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-    StoredEmbedding, TimeBucket, UsageRow,
+    decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models,
+    encode_auto_map, encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey,
+    ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredMedia, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use mysql::prelude::*;
@@ -93,6 +93,28 @@ impl MysqlStorage {
                 created_at BIGINT UNSIGNED NOT NULL,
                 INDEX idx_embeddings_api_key (api_key_id),
                 INDEX idx_embeddings_created (created_at)
+            )",
+        )?;
+        conn.query_drop(
+            "CREATE TABLE IF NOT EXISTS media (
+                id VARCHAR(255) PRIMARY KEY,
+                api_key_id BIGINT NOT NULL,
+                task VARCHAR(32) NOT NULL,
+                status VARCHAR(32) NOT NULL,
+                input_model VARCHAR(255) NOT NULL,
+                resolved_model VARCHAR(255) NOT NULL,
+                provider VARCHAR(255) NOT NULL,
+                request JSON NOT NULL,
+                handle JSON,
+                result JSON,
+                `usage` JSON,
+                warnings JSON,
+                error JSON,
+                created_at BIGINT UNSIGNED NOT NULL,
+                completed_at BIGINT UNSIGNED NULL,
+                INDEX idx_media_api_key (api_key_id),
+                INDEX idx_media_created (created_at),
+                INDEX idx_media_status (status)
             )",
         )?;
         conn.query_drop(
@@ -215,6 +237,34 @@ fn read_embedding(row: mysql::Row) -> Result<StoredEmbedding> {
         usage: serde_json::from_str(&row.get::<String, _>("usage").unwrap_or_default())
             .unwrap_or_default(),
         created_at: row.get("created_at").unwrap_or_default(),
+    })
+}
+
+/// Read a nullable JSON text column. `Row::get` panics when SQL NULL is
+/// converted straight to `String`, so the value has to be fetched as
+/// `Option<String>` first.
+fn json_column(row: &mysql::Row, name: &str) -> Option<serde_json::Value> {
+    decode_json_column(row.get::<Option<String>, _>(name).unwrap_or_default())
+}
+
+fn read_media(row: mysql::Row) -> Result<StoredMedia> {
+    Ok(StoredMedia {
+        id: row.get("id").unwrap_or_default(),
+        api_key_id: row.get("api_key_id").unwrap_or_default(),
+        task: row.get("task").unwrap_or_default(),
+        status: row.get("status").unwrap_or_default(),
+        input_model: row.get("input_model").unwrap_or_default(),
+        resolved_model: row.get("resolved_model").unwrap_or_default(),
+        provider: row.get("provider").unwrap_or_default(),
+        request: serde_json::from_str(&row.get::<String, _>("request").unwrap_or_default())
+            .unwrap_or_default(),
+        handle: json_column(&row, "handle"),
+        result: json_column(&row, "result"),
+        usage: json_column(&row, "usage"),
+        warnings: json_column(&row, "warnings"),
+        error: json_column(&row, "error"),
+        created_at: row.get("created_at").unwrap_or_default(),
+        completed_at: row.get("completed_at").unwrap_or_default(),
     })
 }
 
@@ -465,6 +515,79 @@ impl Storage for MysqlStorage {
         rows.into_iter().map(read_embedding).collect()
     }
 
+    fn store_media(&self, record: &StoredMedia) -> Result<()> {
+        let mut conn = self.pool.get_conn()?;
+        conn.exec_drop(
+            "INSERT INTO media (id, api_key_id, task, status, input_model, resolved_model, provider, request, handle, result, `usage`, warnings, error, created_at, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            mysql::Params::Positional(vec![
+                record.id.clone().into(),
+                record.api_key_id.into(),
+                record.task.clone().into(),
+                record.status.clone().into(),
+                record.input_model.clone().into(),
+                record.resolved_model.clone().into(),
+                record.provider.clone().into(),
+                serde_json::to_string(&record.request)?.into(),
+                encode_json_column(record.handle.as_ref()).into(),
+                encode_json_column(record.result.as_ref()).into(),
+                encode_json_column(record.usage.as_ref()).into(),
+                encode_json_column(record.warnings.as_ref()).into(),
+                encode_json_column(record.error.as_ref()).into(),
+                record.created_at.into(),
+                record.completed_at.into(),
+            ]),
+        )?;
+        Ok(())
+    }
+
+    fn update_media(&self, record: &StoredMedia) -> Result<()> {
+        let mut conn = self.pool.get_conn()?;
+        // Only the mutable half is written: identity, ownership and the
+        // original request are immutable once the job has been submitted.
+        conn.exec_drop(
+            "UPDATE media SET status = ?, handle = ?, result = ?, `usage` = ?, \
+             warnings = ?, error = ?, completed_at = ? WHERE id = ?",
+            (
+                &record.status,
+                encode_json_column(record.handle.as_ref()),
+                encode_json_column(record.result.as_ref()),
+                encode_json_column(record.usage.as_ref()),
+                encode_json_column(record.warnings.as_ref()),
+                encode_json_column(record.error.as_ref()),
+                record.completed_at,
+                &record.id,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {
+        let mut conn = self.pool.get_conn()?;
+        let row: Option<mysql::Row> = conn.exec_first(
+            "SELECT * FROM media WHERE id = ? AND api_key_id = ?",
+            (id, api_key_id),
+        )?;
+        row.map(read_media).transpose()
+    }
+
+    fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>> {
+        let mut conn = self.pool.get_conn()?;
+        let (where_clause, mut params) = build_filter(&filter.key_ids, filter.since, filter.until);
+
+        let limit = effective_limit(filter.limit);
+        params.push(limit.into());
+        params.push(filter.offset.into());
+
+        let sql = format!(
+            "SELECT * FROM media{} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        let rows: Vec<mysql::Row> = conn.exec(sql, mysql::Params::Positional(params))?;
+        rows.into_iter().map(read_media).collect()
+    }
+
     fn get_usage(
         &self,
         key_ids: &[i64],
@@ -488,7 +611,8 @@ impl Storage for MysqlStorage {
             "SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
              COALESCE(SUM(JSON_EXTRACT(`usage`, '$.input_tokens')), 0) AS inp, \
-             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.output_tokens')), 0) AS outp \
+             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.output_tokens')), 0) AS outp, \
+             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.cost')), 0.0) AS cost \
              FROM completions{where_clause} \
              GROUP BY api_key_id, period",
             bucket = bucket_expr,
@@ -498,8 +622,21 @@ impl Storage for MysqlStorage {
         let emb_sql = format!(
             "SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
-             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.input_tokens')), 0) AS inp \
+             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.input_tokens')), 0) AS inp, \
+             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.cost')), 0.0) AS cost \
              FROM embeddings{where_clause} \
+             GROUP BY api_key_id, period",
+            bucket = bucket_expr,
+            where_clause = where_clause,
+        );
+
+        // Media rows carry cost but no tokens; an unpriced row contributes
+        // nothing rather than zero-filling the total.
+        let media_sql = format!(
+            "SELECT api_key_id, {bucket} AS period, \
+             COUNT(*) AS cnt, \
+             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.cost')), 0.0) AS cost \
+             FROM media{where_clause} \
              GROUP BY api_key_id, period",
             bucket = bucket_expr,
             where_clause = where_clause,
@@ -517,6 +654,7 @@ impl Storage for MysqlStorage {
             let cnt: u64 = row.get("cnt").unwrap_or_default();
             let inp: u64 = row.get("inp").unwrap_or_default();
             let outp: u64 = row.get("outp").unwrap_or_default();
+            let cost: f64 = row.get("cost").unwrap_or_default();
 
             let entry = usage_map
                 .entry((key_id, period))
@@ -528,20 +666,24 @@ impl Storage for MysqlStorage {
                     embeddings_count: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
+                    media_count: 0,
+                    total_cost: 0.0,
                 });
             entry.completions_count = cnt;
             entry.total_input_tokens += inp;
             entry.total_output_tokens += outp;
+            entry.total_cost += cost;
         }
 
         // Embedding stats
         let emb_rows: Vec<mysql::Row> =
-            conn.exec(&emb_sql, mysql::Params::Positional(filter_params))?;
+            conn.exec(&emb_sql, mysql::Params::Positional(filter_params.clone()))?;
         for row in emb_rows {
             let key_id: i64 = row.get("api_key_id").unwrap_or_default();
             let period: u64 = row.get("period").unwrap_or_default();
             let cnt: u64 = row.get("cnt").unwrap_or_default();
             let inp: u64 = row.get("inp").unwrap_or_default();
+            let cost: f64 = row.get("cost").unwrap_or_default();
 
             let entry = usage_map
                 .entry((key_id, period))
@@ -553,9 +695,38 @@ impl Storage for MysqlStorage {
                     embeddings_count: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
+                    media_count: 0,
+                    total_cost: 0.0,
                 });
             entry.embeddings_count = cnt;
             entry.total_input_tokens += inp;
+            entry.total_cost += cost;
+        }
+
+        // Media stats
+        let media_rows: Vec<mysql::Row> =
+            conn.exec(&media_sql, mysql::Params::Positional(filter_params))?;
+        for row in media_rows {
+            let key_id: i64 = row.get("api_key_id").unwrap_or_default();
+            let period: u64 = row.get("period").unwrap_or_default();
+            let cnt: u64 = row.get("cnt").unwrap_or_default();
+            let cost: f64 = row.get("cost").unwrap_or_default();
+
+            let entry = usage_map
+                .entry((key_id, period))
+                .or_insert_with(|| UsageRow {
+                    period: if bucket.is_some() { Some(period) } else { None },
+                    key_id,
+                    key_name: String::new(),
+                    completions_count: 0,
+                    embeddings_count: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    media_count: 0,
+                    total_cost: 0.0,
+                });
+            entry.media_count = cnt;
+            entry.total_cost += cost;
         }
 
         // Resolve key names

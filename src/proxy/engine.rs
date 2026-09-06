@@ -120,7 +120,7 @@ pub(crate) fn upstream_status_code(msg: &str) -> Option<u16> {
 /// (connect/transport/unavailable provider). NOT provider faults: our own
 /// queue timeout (capacity is our problem) and embedded 4xx — every
 /// provider would reject that request the same way.
-fn is_provider_fault(error: &anyhow::Error) -> bool {
+pub(crate) fn is_provider_fault(error: &anyhow::Error) -> bool {
     match error.downcast_ref::<ProxyTimeoutError>() {
         Some(ProxyTimeoutError::Upstream { .. }) => true,
         Some(ProxyTimeoutError::ProviderQueue { .. }) => false,
@@ -148,7 +148,7 @@ pub struct EmbeddingOutcome {
 /// `main`), so each request reads a fresh snapshot instead of a value frozen
 /// at startup.
 pub struct ProxyEngine {
-    storage: Arc<dyn Storage>,
+    pub(crate) storage: Arc<dyn Storage>,
     config: crate::Live<Config>,
     limiter: crate::Live<ProviderLimiter>,
     /// Per-owner in-flight budgets (keys sharing `ApiKey::owner`). Plain Arc,
@@ -158,10 +158,10 @@ pub struct ProxyEngine {
     /// Per-provider request/token windows. Plain Arc for the same reason as
     /// `owner_limiter`: a SIGHUP reload must update the LIMITS (read from the
     /// live config at admission) without zeroing the day's counters.
-    rate_tracker: Arc<ProviderRateTracker>,
+    pub(crate) rate_tracker: Arc<ProviderRateTracker>,
     /// Per-provider failure streaks + cooldowns (SIGHUP-safe, like the
     /// trackers above). Only active when `provider_error_cooldown_secs` > 0.
-    provider_health: Arc<ProviderHealth>,
+    pub(crate) provider_health: Arc<ProviderHealth>,
 }
 
 impl ProxyEngine {
@@ -183,7 +183,7 @@ impl ProxyEngine {
     /// Take a slot in the key's shared owner budget, or fail with the 429
     /// marker after `OWNER_QUEUE_WAIT`. `None` = key is ungrouped/unlimited —
     /// hold the returned permit (if any) for the whole upstream call.
-    async fn acquire_owner_slot(
+    pub(crate) async fn acquire_owner_slot(
         &self,
         api_key: &ApiKey,
     ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
@@ -214,7 +214,7 @@ impl ProxyEngine {
     }
 
     /// Current limiter snapshot. Same poison-free reasoning as `config`.
-    fn limiter(&self) -> Arc<ProviderLimiter> {
+    pub(crate) fn limiter(&self) -> Arc<ProviderLimiter> {
         self.limiter.read().unwrap().clone()
     }
 
@@ -1262,7 +1262,7 @@ fn retain_same_model_failover_candidates(
 /// [`ProviderHealth`]) are sorted behind healthy ones — deprioritized, not
 /// blocked. Exhausted candidates are skipped; when ALL are exhausted the
 /// caller gets [`RateLimitedError`] carrying the soonest retry among them.
-fn pick_admitted(
+pub(crate) fn pick_admitted(
     tracker: &ProviderRateTracker,
     health: &ProviderHealth,
     config: &Config,
@@ -1298,7 +1298,7 @@ fn pick_admitted(
     }))
 }
 
-fn ensure_model_allowed(api_key: &ApiKey, model: &str) -> Result<()> {
+pub(crate) fn ensure_model_allowed(api_key: &ApiKey, model: &str) -> Result<()> {
     if api_key.is_model_allowed(model) {
         return Ok(());
     }
@@ -1335,10 +1335,13 @@ mod tests {
             server: Default::default(),
             models: HashMap::new(),
             embedding_models: HashMap::new(),
+            media_models: HashMap::new(),
             auto: HashMap::new(),
             providers,
             logging: Default::default(),
             metrics: Default::default(),
+            media: Default::default(),
+            media_providers: HashMap::new(),
         }
     }
 

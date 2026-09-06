@@ -1,6 +1,7 @@
 use super::{
-    decode_auto_map, encode_allowed_models, encode_auto_map, generate_api_key, make_key_hint,
-    now_unix, ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, TimeBucket, UsageRow,
+    decode_auto_map, encode_allowed_models, encode_auto_map, encode_json_column, generate_api_key,
+    make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding,
+    StoredMedia, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use postgres::NoTls;
@@ -78,6 +79,27 @@ impl PostgresStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_embeddings_api_key ON embeddings(api_key_id);
             CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);
+
+            CREATE TABLE IF NOT EXISTS media (
+                id TEXT PRIMARY KEY,
+                api_key_id BIGINT NOT NULL REFERENCES api_keys(id),
+                task TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_model TEXT NOT NULL,
+                resolved_model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                request JSONB NOT NULL,
+                handle JSONB,
+                result JSONB,
+                usage JSONB,
+                warnings JSONB,
+                error JSONB,
+                created_at BIGINT NOT NULL,
+                completed_at BIGINT
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_api_key ON media(api_key_id);
+            CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at);
+            CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
 
             CREATE TABLE IF NOT EXISTS owner_auto_models (
                 owner TEXT PRIMARY KEY,
@@ -197,6 +219,26 @@ fn read_embedding(row: &postgres::Row) -> StoredEmbedding {
         input: row.get("input"),
         usage: row.get("usage"),
         created_at: row.get::<_, i64>("created_at") as u64,
+    }
+}
+
+fn read_media(row: &postgres::Row) -> StoredMedia {
+    StoredMedia {
+        id: row.get("id"),
+        api_key_id: row.get("api_key_id"),
+        task: row.get("task"),
+        status: row.get("status"),
+        input_model: row.get("input_model"),
+        resolved_model: row.get("resolved_model"),
+        provider: row.get("provider"),
+        request: row.get("request"),
+        handle: row.get("handle"),
+        result: row.get("result"),
+        usage: row.get("usage"),
+        warnings: row.get("warnings"),
+        error: row.get("error"),
+        created_at: row.get::<_, i64>("created_at") as u64,
+        completed_at: row.get::<_, Option<i64>>("completed_at").map(|v| v as u64),
     }
 }
 
@@ -476,6 +518,105 @@ impl Storage for PostgresStorage {
         Ok(rows.iter().map(read_embedding).collect())
     }
 
+    fn store_media(&self, record: &StoredMedia) -> Result<()> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        // Text-encoded + ::jsonb casts, same shape as create_api_key. Going
+        // through encode_json_column also collapses a JSON `null` payload onto
+        // SQL NULL, which a direct jsonb binding would store as `'null'::jsonb`.
+        let request = serde_json::to_string(&record.request)?;
+        let handle = encode_json_column(record.handle.as_ref());
+        let result = encode_json_column(record.result.as_ref());
+        let usage = encode_json_column(record.usage.as_ref());
+        let warnings = encode_json_column(record.warnings.as_ref());
+        let error = encode_json_column(record.error.as_ref());
+        let created_at = record.created_at as i64;
+        let completed_at = record.completed_at.map(|v| v as i64);
+        client.execute(
+            "INSERT INTO media (id, api_key_id, task, status, input_model, resolved_model, provider, request, handle, result, usage, warnings, error, created_at, completed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14, $15)",
+            &[
+                &record.id,
+                &record.api_key_id,
+                &record.task,
+                &record.status,
+                &record.input_model,
+                &record.resolved_model,
+                &record.provider,
+                &request,
+                &handle,
+                &result,
+                &usage,
+                &warnings,
+                &error,
+                &created_at,
+                &completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn update_media(&self, record: &StoredMedia) -> Result<()> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        let handle = encode_json_column(record.handle.as_ref());
+        let result = encode_json_column(record.result.as_ref());
+        let usage = encode_json_column(record.usage.as_ref());
+        let warnings = encode_json_column(record.warnings.as_ref());
+        let error = encode_json_column(record.error.as_ref());
+        let completed_at = record.completed_at.map(|v| v as i64);
+        // Only the mutable half is written: identity, ownership and the
+        // original request are immutable once the job has been submitted.
+        client.execute(
+            "UPDATE media SET status = $1, handle = $2::jsonb, result = $3::jsonb, usage = $4::jsonb, \
+             warnings = $5::jsonb, error = $6::jsonb, completed_at = $7 WHERE id = $8",
+            &[
+                &record.status,
+                &handle,
+                &result,
+                &usage,
+                &warnings,
+                &error,
+                &completed_at,
+                &record.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        let rows = client.query(
+            "SELECT * FROM media WHERE id = $1 AND api_key_id = $2",
+            &[&id, &api_key_id],
+        )?;
+        Ok(rows.first().map(read_media))
+    }
+
+    fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        let (where_clause, mut params, mut idx) =
+            build_filter(&filter.key_ids, filter.since, filter.until);
+
+        let limit = effective_limit(filter.limit);
+        let offset = filter.offset as i64;
+
+        let sql = format!(
+            "SELECT * FROM media{} ORDER BY created_at DESC LIMIT ${} OFFSET ${}",
+            where_clause,
+            idx,
+            idx + 1
+        );
+        idx += 2;
+        let _ = idx;
+
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = client.query(&sql, &param_refs)?;
+        Ok(rows.iter().map(read_media).collect())
+    }
+
     fn get_usage(
         &self,
         key_ids: &[i64],
@@ -499,7 +640,8 @@ impl Storage for PostgresStorage {
             "SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
              COALESCE(SUM((usage->>'input_tokens')::bigint), 0) AS inp, \
-             COALESCE(SUM((usage->>'output_tokens')::bigint), 0) AS outp \
+             COALESCE(SUM((usage->>'output_tokens')::bigint), 0) AS outp, \
+             COALESCE(SUM((usage->>'cost')::double precision), 0.0) AS cost \
              FROM completions{where_clause} \
              GROUP BY api_key_id, period",
             bucket = bucket_expr,
@@ -509,8 +651,21 @@ impl Storage for PostgresStorage {
         let emb_sql = format!(
             "SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
-             COALESCE(SUM((usage->>'input_tokens')::bigint), 0) AS inp \
+             COALESCE(SUM((usage->>'input_tokens')::bigint), 0) AS inp, \
+             COALESCE(SUM((usage->>'cost')::double precision), 0.0) AS cost \
              FROM embeddings{where_clause} \
+             GROUP BY api_key_id, period",
+            bucket = bucket_expr,
+            where_clause = where_clause,
+        );
+
+        // Media rows carry cost but no tokens; an unpriced row contributes
+        // nothing rather than zero-filling the total.
+        let media_sql = format!(
+            "SELECT api_key_id, {bucket} AS period, \
+             COUNT(*) AS cnt, \
+             COALESCE(SUM((usage->>'cost')::double precision), 0.0) AS cost \
+             FROM media{where_clause} \
              GROUP BY api_key_id, period",
             bucket = bucket_expr,
             where_clause = where_clause,
@@ -531,6 +686,7 @@ impl Storage for PostgresStorage {
             let cnt: i64 = row.get("cnt");
             let inp: i64 = row.get("inp");
             let outp: i64 = row.get("outp");
+            let cost: f64 = row.get("cost");
 
             let entry = usage_map
                 .entry((key_id, period))
@@ -542,10 +698,13 @@ impl Storage for PostgresStorage {
                     embeddings_count: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
+                    media_count: 0,
+                    total_cost: 0.0,
                 });
             entry.completions_count = cnt as u64;
             entry.total_input_tokens += inp as u64;
             entry.total_output_tokens += outp as u64;
+            entry.total_cost += cost;
         }
 
         // Embedding stats
@@ -556,6 +715,7 @@ impl Storage for PostgresStorage {
             let period = period as u64;
             let cnt: i64 = row.get("cnt");
             let inp: i64 = row.get("inp");
+            let cost: f64 = row.get("cost");
 
             let entry = usage_map
                 .entry((key_id, period))
@@ -567,9 +727,38 @@ impl Storage for PostgresStorage {
                     embeddings_count: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
+                    media_count: 0,
+                    total_cost: 0.0,
                 });
             entry.embeddings_count = cnt as u64;
             entry.total_input_tokens += inp as u64;
+            entry.total_cost += cost;
+        }
+
+        // Media stats
+        let media_rows = client.query(&media_sql, &param_refs)?;
+        for row in &media_rows {
+            let key_id: i64 = row.get("api_key_id");
+            let period: i64 = row.get("period");
+            let period = period as u64;
+            let cnt: i64 = row.get("cnt");
+            let cost: f64 = row.get("cost");
+
+            let entry = usage_map
+                .entry((key_id, period))
+                .or_insert_with(|| UsageRow {
+                    period: if bucket.is_some() { Some(period) } else { None },
+                    key_id,
+                    key_name: String::new(),
+                    completions_count: 0,
+                    embeddings_count: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    media_count: 0,
+                    total_cost: 0.0,
+                });
+            entry.media_count = cnt as u64;
+            entry.total_cost += cost;
         }
 
         // Resolve key names

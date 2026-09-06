@@ -83,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
     // rather than the generic library default.
     octolib::set_user_agent(concat!("Octohub/", env!("CARGO_PKG_VERSION")));
 
+    // Media adapters read their base URL from the process environment, so a
+    // configured override has to land there before the first request.
+    config.export_media_provider_endpoints();
+
     // Initialize logging (must happen after config load so we have LogFormat)
     logging::init(&config.logging)?;
 
@@ -168,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         providers = %provider_summary,
         models = cfg.models.len(),
         embed_models = cfg.embedding_models.len(),
+        media_models = cfg.media_models.len(),
         metrics = cfg.metrics.enabled,
         provider_queue_timeout_secs = cfg.server.provider_queue_timeout_secs,
         upstream_timeout_secs = cfg.server.upstream_timeout_secs,
@@ -237,6 +242,19 @@ fn classify_route(path: &str) -> &'static str {
         "/v1/chat/completions"
     } else if path == "/v1/embeddings" {
         "/v1/embeddings"
+    } else if path == "/v1/images/generations" {
+        "/v1/images/generations"
+    } else if path == "/v1/videos" {
+        "/v1/videos"
+    } else if path == "/v1/audio/speech" {
+        "/v1/audio/speech"
+    } else if path == "/v1/audio/transcriptions" {
+        "/v1/audio/transcriptions"
+    } else if path == "/v1/media/models" {
+        "/v1/media/models"
+    } else if path.starts_with("/v1/media/") {
+        // Collapsed so a per-record label cannot explode metric cardinality.
+        "/v1/media/{id}"
     } else if path.starts_with("/v1/admin/keys") {
         "/v1/admin/keys"
     } else if path == "/v1/admin/usage" {
@@ -337,8 +355,23 @@ async fn route(
             (Method::POST, "/v1/embeddings") => {
                 api::handler::handle_create_embedding(req, engine, storage).await
             }
+            (Method::POST, "/v1/images/generations") => {
+                api::handler::handle_image_generation(req, engine, storage).await
+            }
+            (Method::POST, "/v1/videos") => {
+                api::handler::handle_video_generation(req, engine, storage).await
+            }
+            (Method::POST, "/v1/audio/speech") => {
+                api::handler::handle_speech(req, engine, storage).await
+            }
+            (Method::POST, "/v1/audio/transcriptions") => {
+                api::handler::handle_transcription(req, engine, storage).await
+            }
+            (Method::GET, "/v1/media/models") => {
+                api::handler::handle_media_models(req, engine, storage).await
+            }
             (Method::GET, "/health") => api::handler::handle_health(),
-            _ => not_found(),
+            (method, path) => route_media_record(req, method, path, engine, storage).await,
         }
     }
     .instrument(span.clone())
@@ -358,6 +391,28 @@ async fn route(
     tracing::info!(parent: &span, "request completed");
 
     attach_request_id(response, &request_id)
+}
+
+/// `/v1/media/{id}` and `/v1/media/{id}/cancel`. Split out because these are
+/// the only client routes with a path parameter.
+async fn route_media_record(
+    req: Request<hyper::body::Incoming>,
+    method: Method,
+    path: &str,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    let Some(rest) = path.strip_prefix("/v1/media/") else {
+        return not_found();
+    };
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    match (method, segments.as_slice()) {
+        (Method::GET, [id]) => api::handler::handle_media_get(req, engine, storage, id).await,
+        (Method::POST, [id, "cancel"]) => {
+            api::handler::handle_media_cancel(req, engine, storage, id).await
+        }
+        _ => not_found(),
+    }
 }
 
 async fn route_admin(

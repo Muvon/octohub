@@ -280,3 +280,20 @@ or your HTTP client of choice — the wire protocol is plain JSON.
 | `401` | Missing/invalid `Authorization` header, or empty master key in config |
 | `404` | Key id not found (revoke / get-one) |
 | `500` | Database error (rare; check logs) |
+
+
+---
+
+## Usage: media and cost fields
+
+`GET /v1/admin/usage` rows carry two fields beyond the token counts:
+
+| Field | Meaning |
+|---|---|
+| `media_count` | Media requests in the bucket |
+| `total_cost` | Summed USD across completions, embeddings and media |
+
+`total_cost` only counts what could actually be priced. A media request nothing
+could price contributes nothing rather than zero — see
+[11 — Media](./11-media.md#cost) for what makes a request unpriced, and the
+`octohub_media_cost_unknown_total` metric for how often it happens.

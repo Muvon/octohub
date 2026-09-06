@@ -270,3 +270,60 @@ concurrency = 4   # GPU is busy; queue the rest
 [providers.openai]
 concurrency = 30  # stay under the 60-rps published limit
 ```
+
+
+---
+
+## `[media_models]`
+
+Media aliases, identical in shape and resolution to `[models]`: an alias mapped
+to a list of `provider:model` mirrors, picked in rotation with fallthrough.
+
+```toml
+[media_models]
+"flux" = ["fal:fal-ai/flux/dev", "replicate:black-forest-labs/flux-1.1-pro"]
+"veo"  = ["openrouter:google/veo-3.1"]
+"tts"  = ["elevenlabs:eleven_flash_v2_5"]
+```
+
+Providers: `elevenlabs`, `fal`, `openrouter`, `replicate`, `runway`. Rate limits
+and concurrency come from `[providers.<name>]` unchanged — the media adapters
+are keyed by the same names. `tokens_per_minute` / `tokens_per_day` never bind,
+because media providers report no tokens.
+
+Pricing is **not** configured here. octolib resolves a rate from its own
+reference table and reports it on the response; see
+[11 — Media](./11-media.md#cost).
+
+The server refuses to start on an unknown provider, a malformed
+`provider:model`, an empty mirror list, or an alias that collides with
+`[models]` or `[embedding_models]`.
+
+## `[media]`
+
+Transport knobs for media requests. All optional.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_source_bytes` | `20971520` (20 MiB) | Cap on a decoded inline upload, checked before anything reaches a provider |
+| `max_response_bytes` | `104857600` (100 MiB) | Cap on a provider response body |
+| `polling_interval_secs` | `2` | Delay between job polls |
+| `submit_timeout_secs` | `120` | Deadline for the submit call itself |
+
+The inline wait deadline reuses `server.upstream_timeout_secs`; the provider
+permit wait reuses `server.provider_queue_timeout_secs`.
+
+## `[media_providers]`
+
+Point an adapter at a self-hosted or gateway-fronted endpoint:
+
+```toml
+[media_providers.fal]
+api_base = "https://fal.internal.example"
+```
+
+Applied by exporting the adapter's own base-URL environment variable at startup
+(`FAL_API_URL`, `OPENROUTER_MEDIA_API_URL`, `REPLICATE_API_URL`,
+`ELEVENLABS_API_URL`, `RUNWAY_API_URL`). Because those are process-global, there
+is exactly **one custom endpoint per adapter** per deployment. An
+already-set environment variable wins over the config.
