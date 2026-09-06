@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.8.0] - 2026-09-06
+
+### 📋 Release Summary
+
+This release introduces a unified media API with access to tracked media records (3d96a9f3, 03e68c53). Media cost, outcome, and spend tracking have been improved, and Octohub now identifies itself in upstream requests (0432eef0, cc3047d8, 1556fd2d).
+
+
+### ✨ New Features & Enhancements
+
+- **media**: expose tracked media records `03e68c53`
+- **media**: add unified media API `3d96a9f3`
+- **proxy**: set Octohub upstream user agent `1556fd2d`
+
+### 🔧 Improvements & Optimizations
+
+- **media**: unify cost and outcome handling `0432eef0`
+
+### 🐛 Bug Fixes & Stability
+
+- **metrics**: track media spend as a counter `cc3047d8`
+
+### 🔄 Other Changes
+
+4 maintenance, dependency, and tooling updates not listed individually.
+
 ## [0.7.13] - 2026-09-04
 
 ### 📋 Release Summary
