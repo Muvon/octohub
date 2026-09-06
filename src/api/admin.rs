@@ -584,6 +584,54 @@ pub async fn handle_list_embeddings(
     }
 }
 
+/// GET /v1/admin/media?key_id=1,3&since=...&until=...
+pub async fn handle_list_media(
+    req: Request<hyper::body::Incoming>,
+    storage: Arc<dyn Storage>,
+    master_key: &str,
+) -> Response<BoxBody> {
+    if let Err(resp) = check_admin(&req, master_key) {
+        return *resp;
+    }
+
+    let query = req.uri().query().unwrap_or("");
+    let params = parse_query(query);
+    let filter = build_filter(&params);
+
+    match storage.list_media(&filter) {
+        Ok(records) => {
+            let items: Vec<serde_json::Value> = records
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "api_key_id": m.api_key_id,
+                        "task": m.task,
+                        "status": m.status,
+                        "input_model": m.input_model,
+                        "resolved_model": m.resolved_model,
+                        "provider": m.provider,
+                        "usage": m.usage,
+                        // The request is already stored with binary payloads
+                        // redacted, so it is safe to return verbatim.
+                        "request": m.request,
+                        "result": m.result,
+                        "warnings": m.warnings,
+                        "error": m.error,
+                        "created_at": m.created_at,
+                        "completed_at": m.completed_at,
+                    })
+                })
+                .collect();
+            json_response(StatusCode::OK, serde_json::json!({ "data": items }))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "list media failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to list media")
+        }
+    }
+}
+
 // --- Query parsing helpers ---
 
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {

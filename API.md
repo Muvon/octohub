@@ -595,6 +595,9 @@ Every response carries `usage.cost` and `usage.cost_source`
 (`provider` | `estimate` | `unavailable`). Unpriced requests record `null`,
 never `0`.
 
+Raw media records are readable from the admin API at `GET /v1/admin/media`,
+with the same filters and envelope as `/v1/admin/completions`.
+
 Full contract: [doc/11-media.md](doc/11-media.md).
 
 ## Admin Endpoints

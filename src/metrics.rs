@@ -333,22 +333,37 @@ pub fn record_queue_wait(provider: &str, duration: Duration) {
         .record(duration.as_secs_f64());
 }
 
-/// Record a media request. `cost` is the billed amount (`None` when nothing
-/// could price it) and `cost_source` says whether it came from the provider or
-/// from octolib's reference table — the two are different claims and are
-/// counted separately.
-#[allow(clippy::too_many_arguments)]
-pub fn record_media(
-    task: &str,
-    model: &str,
-    provider: &str,
-    status: &str,
-    duration: Duration,
-    cost: Option<f64>,
-    cost_source: Option<crate::api::media_types::CostSource>,
-    api_key_id: Option<i64>,
-    per_key: bool,
-) {
+/// One media call's telemetry.
+///
+/// A struct rather than nine positional parameters: the four `&str` labels are
+/// trivially transposable at a call site, and `usage` keeps the billed amount
+/// with the claim about where it came from — the two are only meaningful
+/// together.
+pub struct MediaCall<'a> {
+    pub task: &'a str,
+    /// The alias as the client sent it, so the label survives a routing change.
+    pub model: &'a str,
+    pub provider: &'a str,
+    pub status: &'a str,
+    pub duration: Duration,
+    /// `None` when the request never produced usage at all.
+    pub usage: Option<&'a crate::api::media_types::WireUsage>,
+    pub api_key_id: Option<i64>,
+    pub per_key: bool,
+}
+
+/// Record a media request.
+pub fn record_media(call: MediaCall<'_>) {
+    let MediaCall {
+        task,
+        model,
+        provider,
+        status,
+        duration,
+        usage,
+        api_key_id,
+        per_key,
+    } = call;
     // Same funnel as completions and embeddings, so `/v1/admin/status` sees
     // media traffic too. A 202 is not a failure — the job is live.
     crate::health::record(
@@ -383,8 +398,8 @@ pub fn record_media(
     )
     .record(duration.as_secs_f64());
 
-    match (cost, cost_source) {
-        (Some(cost), Some(source)) => {
+    match usage.and_then(|usage| usage.cost.map(|cost| (cost, usage.cost_source))) {
+        Some((cost, source)) => {
             let source = match source {
                 crate::api::media_types::CostSource::Provider => "provider",
                 crate::api::media_types::CostSource::Estimate => "estimate",
@@ -399,7 +414,7 @@ pub fn record_media(
             )
             .increment(cost.max(0.0));
         }
-        _ => {
+        None => {
             // An unpriced request is tracked separately rather than counted as
             // $0 — a free generation and an unknown one are different facts.
             counter!(

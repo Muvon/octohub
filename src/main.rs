@@ -263,6 +263,8 @@ fn classify_route(path: &str) -> &'static str {
         "/v1/admin/completions"
     } else if path == "/v1/admin/embeddings" {
         "/v1/admin/embeddings"
+    } else if path == "/v1/admin/media" {
+        "/v1/admin/media"
     } else if path == "/health" {
         "/health"
     } else {
@@ -483,6 +485,8 @@ async fn route_admin(
         (Method::GET, ["embeddings"]) => {
             api::admin::handle_list_embeddings(req, storage, master_key).await
         }
+        // GET /v1/admin/media
+        (Method::GET, ["media"]) => api::admin::handle_list_media(req, storage, master_key).await,
         _ => not_found(),
     }
 }
