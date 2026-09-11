@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.2] - 2026-09-11
+
+### 📋 Release Summary
+
+This release updates the Rust dependency lockfile to maintain current dependency versions and compatibility (7b2ee103).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.8.1] - 2026-09-06
 
 ### 📋 Release Summary
