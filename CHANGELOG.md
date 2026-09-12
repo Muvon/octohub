@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.3] - 2026-09-12
+
+### 📋 Release Summary
+
+This release updates the underlying Octolib dependency to version 0.37.0, improving the configuration experience and compatibility (d6d8a4a4).
+
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.8.2] - 2026-09-11
 
 ### 📋 Release Summary
