@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.4] - 2026-09-14
+
+### 📋 Release Summary
+
+Development documentation and contribution instructions were reorganized for greater clarity and consistency (c9d17a20, 1543ee64). Project dependencies were updated, including octolib and related crates (881f73a6).
+
+
+### 📚 Documentation & Examples
+
+- **agents**: rework development guidance `c9d17a20`
+- rename instructions file `1543ee64`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.8.3] - 2026-09-12
 
 ### 📋 Release Summary
