@@ -10,7 +10,7 @@ use crate::api::types::{
 use crate::auth::{authenticate_client, ClientAuth};
 use crate::proxy::engine::{
     upstream_status_code, ModalityNotSupportedError, ProxyEngine, ProxyTimeoutError,
-    RateLimitedError, MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
+    RateLimitedError, SchemaNotEnforcedError, MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
 };
 use crate::storage::Storage;
 
@@ -349,7 +349,9 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
         return (StatusCode::TOO_MANY_REQUESTS, top);
     }
 
-    if error.downcast_ref::<ModalityNotSupportedError>().is_some() {
+    if error.downcast_ref::<ModalityNotSupportedError>().is_some()
+        || error.downcast_ref::<SchemaNotEnforcedError>().is_some()
+    {
         return (StatusCode::BAD_REQUEST, top);
     }
 
@@ -1026,6 +1028,19 @@ mod tests {
         assert!(message.contains("llama3.2"));
         assert!(message.contains("image"));
         assert!(!message.contains("No provider candidate"));
+    }
+
+    #[test]
+    fn unenforceable_schema_is_a_client_error() {
+        // A 5xx would make octolib's retry classifier re-send it forever.
+        let error = anyhow::anyhow!(SchemaNotEnforcedError {
+            model: "glm-5.3-flash".to_string(),
+        });
+
+        let (status, message) = classify_engine_error(&error);
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("glm-5.3-flash"));
     }
 
     #[test]

@@ -101,6 +101,26 @@ impl std::fmt::Display for ModalityNotSupportedError {
 
 impl std::error::Error for ModalityNotSupportedError {}
 
+/// A JSON-schema request for a model none of whose lanes guarantees the
+/// schema's shape. A request fault, not a provider fault: every lane was
+/// filtered out before any upstream call.
+#[derive(Debug)]
+pub struct SchemaNotEnforcedError {
+    pub model: String,
+}
+
+impl std::fmt::Display for SchemaNotEnforcedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no provider for model '{}' enforces a JSON schema",
+            self.model
+        )
+    }
+}
+
+impl std::error::Error for SchemaNotEnforcedError {}
+
 /// Extract the upstream HTTP status embedded in an octolib provider error.
 /// octolib formats provider failures as "... API error <code> <message>", e.g.
 /// "ollama API error 400 Bad Request: ...". Returns the first such code, if any.
@@ -379,6 +399,21 @@ impl ProxyEngine {
             .with_context(|| format!("Failed to resolve model '{}'", routed_model))?;
         if let Some(ref sticky) = sticky_provider {
             prefer_provider(&mut candidates, sticky);
+        }
+        // A JSON-schema request only goes to lanes that guarantee the shape;
+        // the rest would approximate it with a forced tool call that can miss
+        // required fields. No such lane is an error, never an unenforced answer.
+        if req
+            .text
+            .as_ref()
+            .is_some_and(|t| matches!(t.format, TextFormat::JsonSchema { .. }))
+        {
+            retain_schema_enforcing_candidates(&mut candidates);
+            if candidates.is_empty() {
+                return Err(anyhow!(SchemaNotEnforcedError {
+                    model: routed_model.clone(),
+                }));
+            }
         }
 
         let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
@@ -1257,6 +1292,14 @@ fn retain_same_model_failover_candidates(
     });
 }
 
+/// Keep the candidates whose provider guarantees a JSON schema's shape —
+/// octolib's `enforces_response_schema` is the single source of that fact.
+fn retain_schema_enforcing_candidates(candidates: &mut Vec<(String, String)>) {
+    candidates.retain(|(provider, model)| {
+        ProviderFactory::create_provider(provider).is_ok_and(|p| p.enforces_response_schema(model))
+    });
+}
+
 /// Pick the first candidate whose provider rate windows admit a request
 /// (counting it against the winner's windows). Cooling providers (see
 /// [`ProviderHealth`]) are sorted behind healthy ones — deprioritized, not
@@ -1473,6 +1516,30 @@ mod tests {
         // Turn 2: sticky provider's window exhausted — fall through, don't fail.
         let picked = pick(&tracker, &config, candidates, "m").unwrap();
         assert_eq!(picked.0, "openai");
+    }
+
+    #[test]
+    fn schema_requests_keep_only_enforcing_lanes_in_order() {
+        // Z.ai answers schemas with json_object only; Alibaba's Qwen3.8 family
+        // decodes against the schema; an unknown provider can't be trusted.
+        let mut candidates = vec![
+            candidate("zai", "glm-5.3-flash"),
+            candidate("alibaba", "qwen3.8-flash"),
+            candidate("no-such-provider", "m"),
+            candidate("openai", "gpt-5.5"),
+        ];
+        retain_schema_enforcing_candidates(&mut candidates);
+        assert_eq!(
+            candidates,
+            vec![
+                candidate("alibaba", "qwen3.8-flash"),
+                candidate("openai", "gpt-5.5")
+            ]
+        );
+
+        let mut candidates = vec![candidate("zai", "glm-5.3-flash")];
+        retain_schema_enforcing_candidates(&mut candidates);
+        assert!(candidates.is_empty());
     }
 
     #[test]
