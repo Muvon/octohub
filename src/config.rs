@@ -119,6 +119,9 @@ fn default_metrics_bind() -> String {
 pub const AUTO_MODEL: &str = "auto";
 /// The reserved purpose key that terminates the resolution chain.
 pub const AUTO_DEFAULT_KEY: &str = "default";
+/// The purpose key `auto` resolves through on `/v1/evaluations`. Its value
+/// names an `[evaluation_models]` alias, never a `[models]` one.
+pub const AUTO_EVALUATION_KEY: &str = "evaluation";
 
 /// Server configuration loaded from TOML file (with env fallback)
 #[derive(Debug, Clone, Deserialize)]
@@ -150,8 +153,10 @@ pub struct Config {
     /// override) picks for the request's `X-Model-Purpose` header, and THEN
     /// routed through `[models]` like any other request. The reserved
     /// `default` key is the ultimate fallback and must be present; every
-    /// value must be a `[models]` alias. Absent/empty = `auto` is not a
-    /// virtual model (a literal `[models.auto]` entry keeps working).
+    /// value must be a `[models]` alias except `evaluation`, which names an
+    /// `[evaluation_models]` alias for `/v1/evaluations`. Absent/empty =
+    /// `auto` is not a virtual model (a literal `[models.auto]` entry keeps
+    /// working).
     #[serde(default)]
     pub auto: HashMap<String, String>,
     /// Per-provider tuning (concurrency, etc.). Keyed by lowercase provider
@@ -356,11 +361,17 @@ impl Config {
                     AUTO_MODEL
                 );
             }
-            if !self.models.contains_key(target) {
+            let (map, section) = if purpose == AUTO_EVALUATION_KEY {
+                (&self.evaluation_models, "[evaluation_models]")
+            } else {
+                (&self.models, "[models]")
+            };
+            if !map.contains_key(target) {
                 anyhow::bail!(
-                    "[auto].{} points at '{}', which is not defined in [models]",
+                    "[auto].{} points at '{}', which is not defined in {}",
                     purpose,
-                    target
+                    target,
+                    section
                 );
             }
         }
@@ -797,6 +808,32 @@ mod tests {
 
         // Self-reference can never resolve.
         let c = config_with_auto(&[("glm", "z:g")], &[("default", "auto")]);
+        assert!(c.validate_auto().is_err());
+    }
+
+    #[test]
+    fn auto_evaluation_names_an_evaluation_alias_only() {
+        let mut c = config_with_auto(
+            &[("glm", "z:g")],
+            &[("default", "glm"), ("evaluation", "jev")],
+        );
+        c.evaluation_models
+            .insert("jev".into(), vec!["typesafe:jev-latest".into()]);
+        assert!(c.validate_auto().is_ok());
+
+        // A chat alias is not an evaluation model, and the reverse.
+        let c = config_with_auto(
+            &[("glm", "z:g")],
+            &[("default", "glm"), ("evaluation", "glm")],
+        );
+        assert!(c
+            .validate_auto()
+            .unwrap_err()
+            .to_string()
+            .contains("[evaluation_models]"));
+        let mut c = config_with_auto(&[("glm", "z:g")], &[("default", "jev")]);
+        c.evaluation_models
+            .insert("jev".into(), vec!["typesafe:jev-latest".into()]);
         assert!(c.validate_auto().is_err());
     }
 

@@ -112,6 +112,8 @@ The owner's whole chain runs before the config's — an owner who stored only `d
 
 Key `allowed_models` is enforced on **both** the as-sent `"auto"` and the resolved alias, so `auto` never grants access the key's roster doesn't. Stored completions keep `input_model = "auto"` with the real `resolved_model`, and metrics/health record the resolved model — `auto` is invisible downstream of resolution.
 
+`POST /v1/evaluations` takes `"model": "auto"` too, through one reserved purpose: `evaluation`, whose value is an `[evaluation_models]` alias (checked at load). The chain is the owner's `evaluation` entry, then the config's — no header, no dash hierarchy and no `default`, since `default` names a chat model. No `evaluation` entry anywhere is a 400.
+
 ```bash
 curl http://127.0.0.1:8080/v1/completions \
   -H "Authorization: Bearer sk-..." \
@@ -571,7 +573,7 @@ Evaluate typed questions against one state and get calibrated answers. This is o
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `model` | string | ✅ | Alias from `[evaluation_models]` or `"provider:model"` (`typesafe:jev-latest`, `cloudflare:typesafe/jev`). |
+| `model` | string | ✅ | Alias from `[evaluation_models]`, `"provider:model"` (`typesafe:jev-latest`, `cloudflare:typesafe/jev`), or `"auto"` (resolved through `[auto].evaluation`). |
 | `state` | string \| object \| array | ✅ | What every question is evaluated against. Keep it within the model's 32k-token context. |
 | `questions` | map | ✅ | Question ids you choose; answers come back under the same ids. |
 

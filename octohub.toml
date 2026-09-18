@@ -128,6 +128,9 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 #
 # [evaluation_models]
 # "jev" = ["typesafe:jev-latest", "cloudflare:typesafe/jev"]
+#
+# With [auto] configured, `evaluation = "jev"` there lets clients send
+# "model": "auto" to /v1/evaluations.
 
 # Rate limits and concurrency reuse [providers.<name>] unchanged — the media
 # adapters are keyed by the same provider names:

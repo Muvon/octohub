@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::AUTO_DEFAULT_KEY;
+use crate::config::{AUTO_DEFAULT_KEY, AUTO_EVALUATION_KEY};
 
 /// Purposes are hierarchical by dash segments: `supervisor-gate` falls back to
 /// `supervisor` before a map's `default`. One `supervisor` entry covers every
@@ -70,6 +70,25 @@ pub fn resolve(
             return Some(target.clone());
         }
         tracing::warn!(target = %target, "auto map entry points at unknown model — skipping");
+    }
+    None
+}
+
+/// Pick the evaluation alias for an `auto` request on `/v1/evaluations`: the
+/// owner's `evaluation` entry, then the config's. No purpose hierarchy and no
+/// `default` — both chains name chat models, which cannot answer an
+/// evaluation. `known` filters against the live `[evaluation_models]`.
+pub fn resolve_evaluation(
+    owner_map: Option<&HashMap<String, String>>,
+    config_map: &HashMap<String, String>,
+    known: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let owner = owner_map.and_then(|m| m.get(AUTO_EVALUATION_KEY));
+    for target in owner.into_iter().chain(config_map.get(AUTO_EVALUATION_KEY)) {
+        if known(target) {
+            return Some(target.clone());
+        }
+        tracing::warn!(target = %target, "auto evaluation entry points at unknown model — skipping");
     }
     None
 }
@@ -163,6 +182,23 @@ mod tests {
         let config = map(&[("supervisor-gate", "cfg-exact"), ("default", "floor")]);
         let got = resolve(Some("supervisor-gate"), Some(&owner), &config, |_| true);
         assert_eq!(got.as_deref(), Some("family"));
+    }
+
+    #[test]
+    fn evaluation_resolves_owner_then_config_and_never_default() {
+        let config = map(&[("default", "glm"), ("evaluation", "jev")]);
+        let owner = map(&[("evaluation", "jev-next"), ("default", "mine")]);
+        let got = resolve_evaluation(Some(&owner), &config, |_| true);
+        assert_eq!(got.as_deref(), Some("jev-next"));
+        // A stale owner entry falls through to the config's.
+        let got = resolve_evaluation(Some(&owner), &config, |m| m == "jev");
+        assert_eq!(got.as_deref(), Some("jev"));
+        // `default` is a chat model: without an evaluation entry, nothing.
+        let chat_only = map(&[("default", "glm")]);
+        assert_eq!(
+            resolve_evaluation(Some(&chat_only), &chat_only, |_| true),
+            None
+        );
     }
 
     #[test]

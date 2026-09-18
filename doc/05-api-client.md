@@ -340,6 +340,11 @@ Handler: `handle_create_evaluation` in `src/api/handler.rs`.
 }
 ```
 
+`"model": "auto"` first resolves to an `[evaluation_models]` alias: the key
+owner's stored `evaluation` entry, then `[auto].evaluation` (never
+`default`, which names a chat model); none is a 400. The resolved alias
+must also be in the key's `allowed_models`, and `input_model` keeps `auto`.
+
 The model is resolved through `[evaluation_models]`, with the same
 rotation, rate-window admission and optional provider failover as
 embeddings. The request goes to octolib's `EvaluationProvider` for the

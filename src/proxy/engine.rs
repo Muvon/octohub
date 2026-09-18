@@ -150,10 +150,13 @@ pub(crate) fn is_provider_fault(error: &anyhow::Error) -> bool {
         Some(ProxyTimeoutError::ProviderQueue { .. }) => false,
         None => {
             if let Some(evaluation) = evaluation_error(error) {
+                // A missing key is this lane's deployment gap, not the
+                // request's — the same unkeyed error fails over on LLM lanes.
                 return match evaluation {
                     EvaluationError::RateLimit { .. }
                     | EvaluationError::Transport(_)
-                    | EvaluationError::InvalidResponse { .. } => true,
+                    | EvaluationError::InvalidResponse { .. }
+                    | EvaluationError::MissingApiKey(_) => true,
                     EvaluationError::Api { status, .. } => *status == 529 || *status >= 500,
                     _ => false,
                 };
@@ -994,9 +997,35 @@ impl ProxyEngine {
         let limiter = self.limiter();
         let start = std::time::Instant::now();
 
+        // Virtual `auto`: the owner's `evaluation` entry, then the [auto]
+        // floor's. As for completions, `req.model` stays "auto" and lands in
+        // `input_model`; the resolved alias must pass the key's roster too.
+        let routed_model = if config.is_auto(&req.model) {
+            let owner_map = match api_key.owner.clone() {
+                Some(owner) => {
+                    let storage = self.storage.clone();
+                    tokio::task::spawn_blocking(move || storage.get_owner_auto_map(&owner))
+                        .await??
+                }
+                None => None,
+            };
+            let resolved =
+                super::auto::resolve_evaluation(owner_map.as_ref(), &config.auto, |m| {
+                    config.evaluation_models.contains_key(m)
+                })
+                .context(
+                    "Failed to resolve model 'auto' for an evaluation: no usable [auto].evaluation mapping",
+                )?;
+            ensure_model_allowed(api_key, &resolved)?;
+            tracing::info!(resolved = %resolved, "auto evaluation model resolved");
+            resolved
+        } else {
+            req.model.clone()
+        };
+
         let mut candidates = config
-            .evaluation_model_candidates(&req.model)
-            .with_context(|| format!("Failed to resolve evaluation model '{}'", req.model))?;
+            .evaluation_model_candidates(&routed_model)
+            .with_context(|| format!("Failed to resolve evaluation model '{}'", routed_model))?;
 
         let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
         let (provider_name, resolved_model, result, upstream_duration) = loop {
@@ -1005,7 +1034,7 @@ impl ProxyEngine {
                 &self.provider_health,
                 &config,
                 candidates.clone(),
-                &req.model,
+                &routed_model,
             )?;
             tracing::Span::current().record("provider", provider_name.as_str());
 
@@ -1846,6 +1875,10 @@ mod tests {
             message: "bad key".into(),
         });
         assert!(!is_provider_fault(&unauthenticated));
+
+        // An unkeyed lane must not block the keyed one behind it.
+        let unkeyed = anyhow!(EvaluationError::MissingApiKey("TYPESAFE_API_KEY".into()));
+        assert!(is_provider_fault(&unkeyed));
     }
 
     #[test]

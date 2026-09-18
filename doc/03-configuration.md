@@ -153,7 +153,15 @@ entries and empty lists are rejected at load, like `[media_models]`.
 ```toml
 [evaluation_models]
 "jev" = ["typesafe:jev-latest", "cloudflare:typesafe/jev"]
+
+[auto]
+default = "glm"      # [auto] needs its chat default either way
+evaluation = "jev"   # "model": "auto" on /v1/evaluations
 ```
+
+`[auto].evaluation` is the one `[auto]` value that names an
+`[evaluation_models]` alias instead of a `[models]` one; the load check
+enforces both directions.
 
 ## `[providers.<name>]`
 
