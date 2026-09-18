@@ -23,6 +23,7 @@ go through the `check_admin` helper at `src/api/admin.rs:34`–`57`.
 | `GET`    | `/v1/admin/usage`                 | `handle_usage`           | `src/api/admin.rs:208`  | Aggregated usage by time bucket |
 | `GET`    | `/v1/admin/completions`           | `handle_list_completions`| `src/api/admin.rs:251`  | Raw completion history |
 | `GET`    | `/v1/admin/embeddings`            | `handle_list_embeddings` | `src/api/admin.rs:296`  | Raw embedding history |
+| `GET`    | `/v1/admin/evaluations`           | `handle_list_evaluations` | `src/api/admin.rs`     | Raw evaluation history |
 
 Routing: see `classify_route` in `src/main.rs:163` for the low-cardinality
 labels these produce in metrics.
@@ -327,7 +328,8 @@ status, so there is no separate queue to inspect.
 | Field | Meaning |
 |---|---|
 | `media_count` | Media requests in the bucket |
-| `total_cost` | Summed USD across completions, embeddings and media |
+| `evaluations_count` | Evaluation requests in the bucket |
+| `total_cost` | Summed USD across completions, embeddings, media and evaluations |
 
 `total_cost` only counts what could actually be priced. A media request nothing
 could price contributes nothing rather than zero — see

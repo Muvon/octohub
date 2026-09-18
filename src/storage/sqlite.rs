@@ -1,7 +1,8 @@
 use super::{
     decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models,
     encode_auto_map, encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey,
-    ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredMedia, TimeBucket, UsageRow,
+    ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia,
+    TimeBucket, UsageRow,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -73,6 +74,20 @@ impl SqliteStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_embeddings_api_key ON embeddings(api_key_id);
             CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);
+
+            CREATE TABLE IF NOT EXISTS evaluations (
+                id TEXT PRIMARY KEY,
+                api_key_id INTEGER NOT NULL REFERENCES api_keys(id),
+                input_model TEXT NOT NULL,
+                resolved_model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                request TEXT NOT NULL,
+                answers TEXT NOT NULL,
+                usage TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_evaluations_api_key ON evaluations(api_key_id);
+            CREATE INDEX IF NOT EXISTS idx_evaluations_created ON evaluations(created_at);
 
             CREATE TABLE IF NOT EXISTS media (
                 id TEXT PRIMARY KEY,
@@ -577,6 +592,67 @@ impl Storage for SqliteStorage {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    fn store_evaluation(&self, evaluation: &StoredEvaluation) -> Result<()> {
+        let conn = lock_conn(&self.conn)?;
+        conn.execute(
+            "INSERT INTO evaluations (id, api_key_id, input_model, resolved_model, provider, request, answers, usage, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                evaluation.id,
+                evaluation.api_key_id,
+                evaluation.input_model,
+                evaluation.resolved_model,
+                evaluation.provider,
+                evaluation.request.to_string(),
+                evaluation.answers.to_string(),
+                evaluation.usage.to_string(),
+                evaluation.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_evaluations(&self, filter: &ListFilter) -> Result<Vec<StoredEvaluation>> {
+        let conn = lock_conn(&self.conn)?;
+        let (where_clause, filter_params) =
+            build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
+
+        let limit_idx = filter_params.len() + 1;
+        let offset_idx = filter_params.len() + 2;
+        let sql = format!(
+            "SELECT id, api_key_id, input_model, resolved_model, provider, request, answers, usage, created_at \
+             FROM evaluations{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+            where_clause, limit_idx, offset_idx
+        );
+
+        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
+        let limit = if filter.limit == 0 {
+            50
+        } else {
+            filter.limit.min(1000)
+        };
+        all_params.push(Box::new(limit));
+        all_params.push(Box::new(filter.offset));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            all_params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(StoredEvaluation {
+                id: row.get(0)?,
+                api_key_id: row.get(1)?,
+                input_model: row.get(2)?,
+                resolved_model: row.get(3)?,
+                provider: row.get(4)?,
+                request: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                answers: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+                usage: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+                created_at: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     fn store_media(&self, record: &StoredMedia) -> Result<()> {
         let conn = lock_conn(&self.conn)?;
         conn.execute(
@@ -713,6 +789,18 @@ impl Storage for SqliteStorage {
             where_clause = where_clause,
         );
 
+        let eval_sql = format!(
+            "SELECT api_key_id, {bucket} AS period, \
+             COUNT(*) AS cnt, \
+             COALESCE(SUM(json_extract(usage, '$.input_tokens')), 0) AS inp, \
+             COALESCE(SUM(json_extract(usage, '$.output_tokens')), 0) AS outp, \
+             COALESCE(SUM(json_extract(usage, '$.cost')), 0.0) AS cost \
+             FROM evaluations{where_clause} \
+             GROUP BY api_key_id, period",
+            bucket = bucket_expr,
+            where_clause = where_clause,
+        );
+
         // Media rows carry cost but no tokens; an unpriced row contributes
         // nothing rather than zero-filling the total.
         let media_sql = format!(
@@ -758,6 +846,7 @@ impl Storage for SqliteStorage {
                         total_input_tokens: 0,
                         total_output_tokens: 0,
                         media_count: 0,
+                        evaluations_count: 0,
                         total_cost: 0.0,
                     });
                 entry.completions_count = cnt;
@@ -792,10 +881,47 @@ impl Storage for SqliteStorage {
                         total_input_tokens: 0,
                         total_output_tokens: 0,
                         media_count: 0,
+                        evaluations_count: 0,
                         total_cost: 0.0,
                     });
                 entry.embeddings_count = cnt;
                 entry.total_input_tokens += inp;
+                entry.total_cost += cost;
+            }
+        }
+
+        // Collect evaluation stats
+        {
+            let mut stmt = conn.prepare(&eval_sql)?;
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, f64>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (key_id, period, cnt, inp, outp, cost) = row?;
+                let entry = usage_map
+                    .entry((key_id, period))
+                    .or_insert_with(|| UsageRow {
+                        period: if bucket.is_some() { Some(period) } else { None },
+                        key_id,
+                        key_name: String::new(),
+                        completions_count: 0,
+                        embeddings_count: 0,
+                        total_input_tokens: 0,
+                        total_output_tokens: 0,
+                        media_count: 0,
+                        evaluations_count: 0,
+                        total_cost: 0.0,
+                    });
+                entry.evaluations_count = cnt;
+                entry.total_input_tokens += inp;
+                entry.total_output_tokens += outp;
                 entry.total_cost += cost;
             }
         }
@@ -824,6 +950,7 @@ impl Storage for SqliteStorage {
                         total_input_tokens: 0,
                         total_output_tokens: 0,
                         media_count: 0,
+                        evaluations_count: 0,
                         total_cost: 0.0,
                     });
                 entry.media_count = cnt;

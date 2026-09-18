@@ -120,6 +120,15 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 # "veo"  = ["openrouter:google/veo-3.1"]
 # "tts"  = ["elevenlabs:eleven_flash_v2_5"]
 
+# Evaluation models (POST /v1/evaluations): typed noul/choice/score questions
+# answered with calibrated probabilities. Providers are octolib's evaluation
+# adapters — `typesafe` (TYPESAFE_API_KEY) or `cloudflare` (AI Gateway unified
+# billing with CLOUDFLARE_API_KEY + CLOUDFLARE_ACCOUNT_ID). Same alias rules
+# and [providers.<name>] limits as the other maps.
+#
+# [evaluation_models]
+# "jev" = ["typesafe:jev-latest", "cloudflare:typesafe/jev"]
+
 # Rate limits and concurrency reuse [providers.<name>] unchanged — the media
 # adapters are keyed by the same provider names:
 #

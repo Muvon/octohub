@@ -555,6 +555,68 @@ curl -X POST http://127.0.0.1:8080/v1/embeddings \
 
 ---
 
+### POST /v1/evaluations
+
+Evaluate typed questions against one state and get calibrated answers. This is octolib's evaluation surface (TypeSafe's Jev, directly or through Cloudflare AI Gateway): no generated text, one answer per question with probabilities your code can branch on.
+
+#### Request
+
+```json
+{
+  "model": "string",
+  "state": "string | object | array",
+  "questions": { "<id>": { "type": "noul | choice | score", "instructions": "string", "criteria": "..." } }
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `model` | string | ✅ | Alias from `[evaluation_models]` or `"provider:model"` (`typesafe:jev-latest`, `cloudflare:typesafe/jev`). |
+| `state` | string \| object \| array | ✅ | What every question is evaluated against. Keep it within the model's 32k-token context. |
+| `questions` | map | ✅ | Question ids you choose; answers come back under the same ids. |
+
+Question types: `noul` (yes/no; optional `criteria: {"true": "...", "false": "..."}`), `choice` (`criteria` maps each option to a description or `null`; at least two), `score` (`criteria` is an ordered list of at least two level descriptions).
+
+#### Response
+
+```json
+{
+  "id": "eval_9f1c...",
+  "model": "jev-1.13.0",
+  "answers": {
+    "is_urgent": { "type": "noul", "noul": 0.95 },
+    "department": { "type": "choice", "choice": "billing", "probabilities": { "billing": 0.88, "technical": 0.12 }, "confidence": 0.82 },
+    "frustration": { "type": "score", "score": 1.03, "legend": { "0": "Calm", "1": "Frustrated", "2": "Very angry" }, "probabilities": { "0": 0.0, "1": 0.97, "2": 0.03 }, "confidence": 0.95 }
+  },
+  "usage": { "input_tokens": 414, "output_tokens": 73, "cost": 0.000017388 }
+}
+```
+
+`model` is the versioned model that answered. `usage.cost` is octolib's published rate for the provider ($0.042 per 1M input tokens, output free for Jev); it is absent when the rate is unknown.
+
+#### Example
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/evaluations \
+  -H "Authorization: Bearer <client-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jev",
+    "state": "Help! My payouts have been failing for 3 days.",
+    "questions": {
+      "is_urgent": {"type": "noul", "instructions": "Does this convey urgency?"},
+      "department": {"type": "choice", "instructions": "Which team should handle this?",
+                     "criteria": {"billing": "Payments, refunds", "technical": "Bugs, outages"}},
+      "frustration": {"type": "score", "instructions": "How frustrated is the customer?",
+                      "criteria": ["Calm", "Frustrated", "Very angry"]}
+    }
+  }'
+```
+
+Errors follow the completion rules: a 403 means the model is not in the key's `allowed_models`; a 400 is a request the provider or octolib rejected; a 429 carries `Retry-After` when every candidate is rate-limited upstream or locally.
+
+---
+
 ### GET /health
 
 Health check endpoint. No authentication required.
@@ -1089,6 +1151,13 @@ Use `"provider:model"` format. Available providers depend on octolib configurati
 | Jina | `jina:jina-embeddings-v3` |
 | Google | `google:gemini-embedding-001` |
 | OpenRouter | `openrouter:openai/text-embedding-3-small` |
+
+### Evaluations (`/v1/evaluations`)
+
+| Provider | Format Example | Notes |
+|---|---|---|
+| TypeSafe | `typesafe:jev-latest` | `TYPESAFE_API_KEY`; also `jev-preview` and versioned ids such as `jev-1.13.0` |
+| Cloudflare AI Gateway | `cloudflare:typesafe/jev` | `CLOUDFLARE_API_KEY` + `CLOUDFLARE_ACCOUNT_ID`; billed from prepaid gateway credits |
 
 ---
 

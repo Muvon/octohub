@@ -91,7 +91,7 @@ cargo build --release
 ## Features
 
 - **One endpoint, many providers** — OpenAI-style `POST /v1/completions`,
-  `/v1/chat/completions`, and `/v1/embeddings` routed to 20+ upstream providers
+  `/v1/chat/completions`, `/v1/embeddings`, and `/v1/evaluations` routed to 20+ upstream providers
 - **Media generation** — `/v1/images/generations`, `/v1/videos`,
   `/v1/audio/speech` and `/v1/audio/transcriptions` across ElevenLabs, fal,
   OpenRouter, Replicate and Runway, with durable resumable jobs and per-request
@@ -128,6 +128,9 @@ api_key = "your-master-secret"   # master key for the admin API
 
 [embedding_models]
 "voyage-3.5" = ["voyage:voyage-3.5"]
+
+[evaluation_models]
+"jev" = ["typesafe:jev-latest", "cloudflare:typesafe/jev"]
 ```
 
 | Backend | DSN example |
@@ -148,7 +151,7 @@ Two independent layers:
 
 | Layer | Endpoints | Key source |
 |---|---|---|
-| **Client** | `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/images/generations`, `/v1/videos`, `/v1/audio/*`, `/v1/media/*` | Keys from the `api_keys` DB table |
+| **Client** | `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/evaluations`, `/v1/images/generations`, `/v1/videos`, `/v1/audio/*`, `/v1/media/*` | Keys from the `api_keys` DB table |
 | **Admin** | `/v1/admin/*` | Master key from `octohub.toml` |
 
 Details: [doc/04 — Authentication](doc/04-authentication.md).

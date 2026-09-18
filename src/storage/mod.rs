@@ -86,6 +86,26 @@ pub struct StoredEmbedding {
     pub created_at: u64,
 }
 
+/// Stored evaluation record from the database
+#[derive(Debug, Clone)]
+pub struct StoredEvaluation {
+    /// "eval_<uuid>"
+    pub id: String,
+    pub api_key_id: i64,
+    /// Model name as sent by the client (alias or `provider:model`)
+    pub input_model: String,
+    /// Provider-native model actually called
+    pub resolved_model: String,
+    pub provider: String,
+    /// `{state, questions}` as sent by the client
+    pub request: serde_json::Value,
+    /// One typed answer per question id
+    pub answers: serde_json::Value,
+    /// Usage stats (input_tokens, output_tokens, cost, request_time_ms)
+    pub usage: serde_json::Value,
+    pub created_at: u64,
+}
+
 /// Stored media record. A job *is* the record at an earlier status, so
 /// in-flight and finished work share one row: `handle` carries the resumable
 /// octolib `JobHandle` until the operation reaches a terminal state.
@@ -131,7 +151,9 @@ pub struct UsageRow {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub media_count: u64,
-    /// Summed `usage.cost` across completions, embeddings and media. Rows the
+    pub evaluations_count: u64,
+    /// Summed `usage.cost` across completions, embeddings, media and
+    /// evaluations. Rows the
     /// provider never priced contribute nothing rather than zero-filling.
     pub total_cost: f64,
 }
@@ -219,6 +241,10 @@ pub trait Storage: Send + Sync {
     // Embeddings
     fn store_embedding(&self, embedding: &StoredEmbedding) -> Result<()>;
     fn list_embeddings(&self, filter: &ListFilter) -> Result<Vec<StoredEmbedding>>;
+
+    // Evaluations
+    fn store_evaluation(&self, evaluation: &StoredEvaluation) -> Result<()>;
+    fn list_evaluations(&self, filter: &ListFilter) -> Result<Vec<StoredEvaluation>>;
 
     // Media
     /// Insert a submitted media job. Called BEFORE any waiting, so a restart

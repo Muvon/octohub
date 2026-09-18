@@ -321,6 +321,60 @@ vectors. Embeddings have no "output" token side.
 Same classification rules as completions. A 403 here means the
 embedding model name is not in the key's `allowed_models` list.
 
+## `POST /v1/evaluations`
+
+Schema: `CreateEvaluationRequest` in `src/api/types.rs`.
+Handler: `handle_create_evaluation` in `src/api/handler.rs`.
+
+```jsonc
+{
+  "model": "jev",                       // required — alias from [evaluation_models] or "provider:model"
+  "state": "Help! My payouts have been failing for 3 days.",  // string, object or array
+  "questions": {
+    "is_urgent":   {"type": "noul",   "instructions": "Does this convey urgency?"},
+    "department":  {"type": "choice", "instructions": "Which team should handle this?",
+                    "criteria": {"billing": "Payments, refunds", "technical": "Bugs, outages"}},
+    "frustration": {"type": "score",  "instructions": "How frustrated is the customer?",
+                    "criteria": ["Calm", "Frustrated", "Very angry"]}
+  }
+}
+```
+
+The model is resolved through `[evaluation_models]`, with the same
+rotation, rate-window admission and optional provider failover as
+embeddings. The request goes to octolib's `EvaluationProvider` for the
+chosen candidate; there is no job to poll.
+
+### Response
+
+```jsonc
+{
+  "id": "eval_9f1c...",
+  "model": "jev-1.13.0",               // the versioned model that answered
+  "answers": {
+    "is_urgent":   {"type": "noul", "noul": 0.95},
+    "department":  {"type": "choice", "choice": "billing",
+                    "probabilities": {"billing": 0.88, "technical": 0.12}, "confidence": 0.82},
+    "frustration": {"type": "score", "score": 1.03,
+                    "legend": {"0": "Calm", "1": "Frustrated", "2": "Very angry"},
+                    "probabilities": {"0": 0.0, "1": 0.97, "2": 0.03}, "confidence": 0.95}
+  },
+  "usage": {"input_tokens": 414, "output_tokens": 73, "cost": 0.000017388}
+}
+```
+
+`usage.cost` is octolib's published rate applied to the tokens (Jev:
+$0.042 per 1M input, output free); it is `null` when no rate is known.
+Tokens are counted against the provider's windows and recorded in
+`octohub_evaluation_tokens_total` in both directions.
+
+### Errors
+
+Same classification rules as completions. octolib's typed evaluation
+errors map directly: a request the provider or octolib rejected → 400,
+upstream rate limit → 429 with `Retry-After`, upstream authentication or
+permission failure → 401/403, anything else upstream → 500.
+
 ## Examples
 
 ### Plain text completion

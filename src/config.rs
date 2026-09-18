@@ -139,6 +139,11 @@ pub struct Config {
     /// is octolib's (`media::reference_pricing`), so nothing else lives here.
     #[serde(default)]
     pub media_models: HashMap<String, Vec<String>>,
+    /// Evaluation model mappings — same shape and resolution as `models`.
+    /// Providers are octolib's evaluation adapters (`typesafe`, `cloudflare`);
+    /// pricing is octolib's, so nothing else lives here.
+    #[serde(default)]
+    pub evaluation_models: HashMap<String, Vec<String>>,
     /// The virtual `auto` model: purpose → model-alias map, the deployment's
     /// floor for purpose-based routing. When non-empty, a request for model
     /// "auto" is rewritten to the alias this map (or the key owner's stored
@@ -299,6 +304,7 @@ impl Config {
                 .with_context(|| format!("Failed to parse config file: {}", path))?;
             config.validate_auto()?;
             config.validate_media()?;
+            config.validate_evaluation()?;
             // Override with environment variables if set
             if let Ok(master_key) = env::var("OCTOHUB_MASTER_KEY") {
                 config.server.api_key = master_key;
@@ -420,6 +426,7 @@ impl Config {
             models: HashMap::new(),
             embedding_models: HashMap::new(),
             media_models: HashMap::new(),
+            evaluation_models: HashMap::new(),
             auto: HashMap::new(),
             providers: HashMap::new(),
             logging: LoggingConfig::default(),
@@ -447,6 +454,57 @@ impl Config {
     /// Media counterpart of [`model_candidates`](Self::model_candidates).
     pub fn media_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
         self.candidates_from_map(model, &self.media_models, "media model")
+    }
+
+    /// Evaluation counterpart of [`model_candidates`](Self::model_candidates).
+    pub fn evaluation_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
+        self.candidates_from_map(model, &self.evaluation_models, "evaluation model")
+    }
+
+    /// Same boot-time checks as [`validate_media`](Self::validate_media) for
+    /// `[evaluation_models]`: alias collisions, empty lists, malformed
+    /// entries, unknown providers.
+    fn validate_evaluation(&self) -> Result<()> {
+        let supported = octolib::evaluation::EvaluationProviderFactory::supported_providers();
+        for (alias, entries) in &self.evaluation_models {
+            if self.models.contains_key(alias)
+                || self.embedding_models.contains_key(alias)
+                || self.media_models.contains_key(alias)
+            {
+                anyhow::bail!(
+                    "[evaluation_models].{} collides with an alias already defined in [models], [embedding_models] or [media_models]",
+                    alias
+                );
+            }
+            if entries.is_empty() {
+                anyhow::bail!("[evaluation_models].{} has an empty provider list", alias);
+            }
+            for entry in entries {
+                let (provider, model) = entry.split_once(':').with_context(|| {
+                    format!(
+                        "[evaluation_models].{} entry '{}' is not in 'provider:model' format",
+                        alias, entry
+                    )
+                })?;
+                if model.trim().is_empty() {
+                    anyhow::bail!(
+                        "[evaluation_models].{} entry '{}' has an empty model",
+                        alias,
+                        entry
+                    );
+                }
+                if !supported.iter().any(|s| s.eq_ignore_ascii_case(provider)) {
+                    anyhow::bail!(
+                        "[evaluation_models].{} entry '{}' names unknown evaluation provider '{}'. Available: {}",
+                        alias,
+                        entry,
+                        provider,
+                        supported.join(", ")
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Fail loudly at load on a `[media_models]` section that cannot work.
@@ -668,6 +726,7 @@ mod tests {
             models: HashMap::new(),
             embedding_models: HashMap::new(),
             media_models: HashMap::new(),
+            evaluation_models: HashMap::new(),
             auto: HashMap::new(),
             providers,
             logging: Default::default(),
@@ -689,6 +748,7 @@ mod tests {
                 .collect(),
             embedding_models: HashMap::new(),
             media_models: HashMap::new(),
+            evaluation_models: HashMap::new(),
             auto: auto
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -752,6 +812,7 @@ mod tests {
             models,
             embedding_models: HashMap::new(),
             media_models: HashMap::new(),
+            evaluation_models: HashMap::new(),
             auto: HashMap::new(),
             providers: HashMap::new(),
             logging: Default::default(),
@@ -845,6 +906,7 @@ mod tests {
                 .collect(),
             server: Default::default(),
             embedding_models: HashMap::new(),
+            evaluation_models: HashMap::new(),
             auto: HashMap::new(),
             providers: HashMap::new(),
             logging: Default::default(),
@@ -897,6 +959,52 @@ mod tests {
         c.media_providers
             .insert("openai".to_string(), MediaProviderConfig::default());
         assert!(c.validate_media().is_err());
+    }
+
+    #[test]
+    fn evaluation_models_are_validated_like_media() {
+        fn base() -> Config {
+            Config {
+                server: Default::default(),
+                models: HashMap::new(),
+                embedding_models: HashMap::new(),
+                media_models: HashMap::new(),
+                evaluation_models: HashMap::new(),
+                auto: HashMap::new(),
+                providers: HashMap::new(),
+                logging: Default::default(),
+                metrics: Default::default(),
+                media: Default::default(),
+                media_providers: HashMap::new(),
+            }
+        }
+
+        let mut ok = base();
+        ok.evaluation_models.insert(
+            "jev".to_string(),
+            vec![
+                "typesafe:jev-latest".to_string(),
+                "cloudflare:typesafe/jev".to_string(),
+            ],
+        );
+        assert!(ok.validate_evaluation().is_ok());
+        assert_eq!(ok.evaluation_model_candidates("jev").unwrap().len(), 2);
+
+        let mut collides = ok.clone();
+        collides
+            .embedding_models
+            .insert("jev".to_string(), vec!["voyage:voyage-3.5".to_string()]);
+        assert!(collides.validate_evaluation().is_err());
+
+        let mut unknown = base();
+        unknown
+            .evaluation_models
+            .insert("jev".to_string(), vec!["openai:jev-latest".to_string()]);
+        assert!(unknown.validate_evaluation().is_err());
+
+        let mut empty = base();
+        empty.evaluation_models.insert("jev".to_string(), vec![]);
+        assert!(empty.validate_evaluation().is_err());
     }
 
     #[test]

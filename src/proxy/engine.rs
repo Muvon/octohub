@@ -3,6 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use octolib::embedding::{create_embedding_provider_from_parts, InputType};
+use octolib::evaluation::{EvaluationError, EvaluationProviderFactory, EvaluationRequest};
+
+use crate::api::types::{CreateEvaluationRequest, CreateEvaluationResponse};
+use crate::storage::StoredEvaluation;
 use octolib::llm::{
     chat_completion_enforced, ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData,
     Message, OutputFormat, ProviderFactory, ReasoningEffort, ResponseMode, SourceType,
@@ -144,11 +148,29 @@ pub(crate) fn is_provider_fault(error: &anyhow::Error) -> bool {
     match error.downcast_ref::<ProxyTimeoutError>() {
         Some(ProxyTimeoutError::Upstream { .. }) => true,
         Some(ProxyTimeoutError::ProviderQueue { .. }) => false,
-        None => match upstream_status_code(&format!("{:#}", error)) {
-            Some(code) => code == 429 || code >= 500,
-            None => true,
-        },
+        None => {
+            if let Some(evaluation) = evaluation_error(error) {
+                return match evaluation {
+                    EvaluationError::RateLimit { .. }
+                    | EvaluationError::Transport(_)
+                    | EvaluationError::InvalidResponse { .. } => true,
+                    EvaluationError::Api { status, .. } => *status == 529 || *status >= 500,
+                    _ => false,
+                };
+            }
+            match upstream_status_code(&format!("{:#}", error)) {
+                Some(code) => code == 429 || code >= 500,
+                None => true,
+            }
+        }
     }
+}
+
+/// The typed octolib evaluation error inside an anyhow chain, if any. The
+/// evaluation adapters keep their errors typed instead of embedding "API
+/// error <code>" text, so classification reads the variant.
+pub(crate) fn evaluation_error(error: &anyhow::Error) -> Option<&EvaluationError> {
+    error.chain().find_map(|cause| cause.downcast_ref())
 }
 
 /// Result of `process_embedding`. Carries telemetry alongside the response so
@@ -160,6 +182,15 @@ pub struct EmbeddingOutcome {
     pub provider: String,
     pub upstream_duration: std::time::Duration,
     pub input_tokens: u64,
+}
+
+/// Result of `process_evaluation`, mirroring [`EmbeddingOutcome`].
+pub struct EvaluationOutcome {
+    pub response: CreateEvaluationResponse,
+    pub provider: String,
+    pub upstream_duration: std::time::Duration,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// Core proxy engine that processes requests through octolib providers.
@@ -946,6 +977,166 @@ impl ProxyEngine {
         })
     }
 
+    /// Process an evaluation request: same admission, failover and
+    /// accounting as embeddings, against octolib's evaluation adapters.
+    pub async fn process_evaluation(
+        &self,
+        req: CreateEvaluationRequest,
+        api_key: &ApiKey,
+    ) -> Result<EvaluationOutcome> {
+        ensure_model_allowed(api_key, &req.model)?;
+        if req.questions.is_empty() {
+            anyhow::bail!("Invalid request: at least one question is required");
+        }
+        let _owner_slot = self.acquire_owner_slot(api_key).await?;
+
+        let config = self.config();
+        let limiter = self.limiter();
+        let start = std::time::Instant::now();
+
+        let mut candidates = config
+            .evaluation_model_candidates(&req.model)
+            .with_context(|| format!("Failed to resolve evaluation model '{}'", req.model))?;
+
+        let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
+        let (provider_name, resolved_model, result, upstream_duration) = loop {
+            let (provider_name, resolved_model) = pick_admitted(
+                &self.rate_tracker,
+                &self.provider_health,
+                &config,
+                candidates.clone(),
+                &req.model,
+            )?;
+            tracing::Span::current().record("provider", provider_name.as_str());
+
+            let attempt = async {
+                let provider = EvaluationProviderFactory::create_provider(&provider_name)?;
+                if !provider.supports_model(&resolved_model) {
+                    return Err(anyhow!(EvaluationError::UnsupportedModel {
+                        provider: provider_name.clone(),
+                        model: resolved_model.clone(),
+                    }));
+                }
+                let mut request =
+                    EvaluationRequest::new(req.state.clone()).with_model(resolved_model.clone());
+                request.questions = req.questions.clone();
+
+                let queue_start = std::time::Instant::now();
+                let queue_timeout =
+                    std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
+                let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(ProxyTimeoutError::ProviderQueue {
+                            provider: provider_name.clone(),
+                            timeout: queue_timeout,
+                        })
+                    })?;
+                let queue_wait = queue_start.elapsed();
+                if queue_wait.as_millis() > 0 {
+                    tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
+                }
+                crate::metrics::record_queue_wait(&provider_name, queue_wait);
+
+                let upstream_start = std::time::Instant::now();
+                let upstream_timeout =
+                    std::time::Duration::from_secs(config.server.upstream_timeout_secs);
+                let result = tokio::time::timeout(upstream_timeout, provider.evaluate(request))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(ProxyTimeoutError::Upstream {
+                            provider: provider_name.clone(),
+                            timeout: upstream_timeout,
+                        })
+                    })?
+                    .with_context(|| {
+                        format!(
+                            "Evaluation provider '{}' failed for model '{}'",
+                            provider_name, resolved_model
+                        )
+                    })?;
+                let upstream_duration = upstream_start.elapsed();
+                tracing::Span::current()
+                    .record("upstream_ms", upstream_duration.as_millis() as u64);
+                anyhow::Ok((result, upstream_duration))
+            }
+            .await;
+
+            match attempt {
+                Ok((result, duration)) => {
+                    self.provider_health.record_success(&provider_name);
+                    break (provider_name, resolved_model, result, duration);
+                }
+                Err(err) => {
+                    let provider_fault = is_provider_fault(&err);
+                    if provider_fault {
+                        self.provider_health
+                            .record_failure(&provider_name, cooldown);
+                    }
+                    candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
+                    if !(config.server.failover_on_error && provider_fault) || candidates.is_empty()
+                    {
+                        return Err(err);
+                    }
+                    crate::metrics::record_failover(&provider_name);
+                    tracing::warn!(
+                        provider = %provider_name,
+                        error = %err,
+                        "evaluation provider failed — failing over to next candidate"
+                    );
+                }
+            }
+        };
+
+        // Evaluations drain the same provider token windows as completions.
+        self.rate_tracker.record_tokens(
+            &provider_name,
+            result.usage.input_tokens + result.usage.output_tokens,
+        );
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let usage = serde_json::json!({
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+            "cost": result.usage.cost,
+            "request_time_ms": elapsed_ms,
+        });
+
+        let evaluation_id = format!("eval_{}", Uuid::new_v4().simple());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let stored = StoredEvaluation {
+            id: evaluation_id.clone(),
+            api_key_id: api_key.id,
+            input_model: req.model.clone(),
+            resolved_model,
+            provider: provider_name.clone(),
+            request: serde_json::json!({"state": req.state, "questions": req.questions}),
+            answers: serde_json::to_value(&result.answers).unwrap_or(serde_json::Value::Null),
+            usage,
+            created_at: now,
+        };
+        let store_start = std::time::Instant::now();
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || storage.store_evaluation(&stored)).await??;
+        tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
+
+        Ok(EvaluationOutcome {
+            response: CreateEvaluationResponse {
+                id: evaluation_id,
+                model: result.model,
+                answers: result.answers,
+                usage: result.usage.clone(),
+            },
+            provider: provider_name,
+            upstream_duration,
+            input_tokens: result.usage.input_tokens,
+            output_tokens: result.usage.output_tokens,
+        })
+    }
+
     /// Reconstruct input messages from stored JSON
     fn reconstruct_input(&self, input: &serde_json::Value, messages: &mut Vec<Message>) {
         // Input can be a string or array of items
@@ -1379,6 +1570,7 @@ mod tests {
             models: HashMap::new(),
             embedding_models: HashMap::new(),
             media_models: HashMap::new(),
+            evaluation_models: HashMap::new(),
             auto: HashMap::new(),
             providers,
             logging: Default::default(),
@@ -1623,6 +1815,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(picked.0, "openai", "cooldown deprioritizes, never blocks");
+    }
+
+    #[test]
+    fn evaluation_errors_are_classified_by_variant() {
+        let rate = anyhow!(EvaluationError::RateLimit {
+            provider: "typesafe".into(),
+            message: "slow down".into(),
+            retry_after_secs: Some(2),
+        })
+        .context("Evaluation provider 'typesafe' failed for model 'jev-latest'");
+        assert!(is_provider_fault(&rate));
+        assert!(matches!(
+            evaluation_error(&rate),
+            Some(EvaluationError::RateLimit { .. })
+        ));
+
+        let overloaded = anyhow!(EvaluationError::Api {
+            provider: "typesafe".into(),
+            status: 529,
+            message: "overloaded".into(),
+        });
+        assert!(is_provider_fault(&overloaded));
+
+        let rejected = anyhow!(EvaluationError::InvalidRequest("bad question".into()));
+        assert!(!is_provider_fault(&rejected));
+
+        let unauthenticated = anyhow!(EvaluationError::Authentication {
+            provider: "typesafe".into(),
+            message: "bad key".into(),
+        });
+        assert!(!is_provider_fault(&unauthenticated));
     }
 
     #[test]

@@ -242,6 +242,8 @@ fn classify_route(path: &str) -> &'static str {
         "/v1/chat/completions"
     } else if path == "/v1/embeddings" {
         "/v1/embeddings"
+    } else if path == "/v1/evaluations" {
+        "/v1/evaluations"
     } else if path == "/v1/images/generations" {
         "/v1/images/generations"
     } else if path == "/v1/videos" {
@@ -263,6 +265,8 @@ fn classify_route(path: &str) -> &'static str {
         "/v1/admin/completions"
     } else if path == "/v1/admin/embeddings" {
         "/v1/admin/embeddings"
+    } else if path == "/v1/admin/evaluations" {
+        "/v1/admin/evaluations"
     } else if path == "/v1/admin/media" {
         "/v1/admin/media"
     } else if path == "/health" {
@@ -356,6 +360,9 @@ async fn route(
             }
             (Method::POST, "/v1/embeddings") => {
                 api::handler::handle_create_embedding(req, engine, storage).await
+            }
+            (Method::POST, "/v1/evaluations") => {
+                api::handler::handle_create_evaluation(req, engine, storage).await
             }
             (Method::POST, "/v1/images/generations") => {
                 api::handler::handle_image_generation(req, engine, storage).await
@@ -484,6 +491,10 @@ async fn route_admin(
         // GET /v1/admin/embeddings
         (Method::GET, ["embeddings"]) => {
             api::admin::handle_list_embeddings(req, storage, master_key).await
+        }
+        // GET /v1/admin/evaluations
+        (Method::GET, ["evaluations"]) => {
+            api::admin::handle_list_evaluations(req, storage, master_key).await
         }
         // GET /v1/admin/media
         (Method::GET, ["media"]) => api::admin::handle_list_media(req, storage, master_key).await,

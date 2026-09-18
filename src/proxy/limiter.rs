@@ -389,6 +389,7 @@ mod tests {
             models: HashMap::new(),
             embedding_models: HashMap::new(),
             media_models: HashMap::new(),
+            evaluation_models: HashMap::new(),
             auto: HashMap::new(),
             providers,
             logging: Default::default(),

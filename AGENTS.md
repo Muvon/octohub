@@ -21,7 +21,7 @@ OctoHub is a Rust 2021 binary using Tokio and Hyper 1. It proxies completions, e
 | `src/api/types.rs` | Completion/chat/embedding wire types and conversions, structured output and multimodal content |
 | `src/api/media_types.rs` | Media wire types, source decoding, validation, redaction, response envelope |
 | `src/api/admin.rs` | Key/owner management, owner auto maps, usage and stored-record queries, observed model status |
-| `src/proxy/engine.rs` | Completion replay, routing/admission, upstream calls, embeddings, persistence |
+| `src/proxy/engine.rs` | Completion replay, routing/admission, upstream calls, embeddings, evaluations, persistence |
 | `src/proxy/auto.rs` | Purpose-to-alias resolution for virtual `auto` |
 | `src/proxy/limiter.rs` | Provider and owner semaphores, request/token windows, provider cooldowns |
 | `src/proxy/media.rs` | Media submission, persistence, polling/cancellation, normalization and pricing |
@@ -30,7 +30,7 @@ OctoHub is a Rust 2021 binary using Tokio and Hyper 1. It proxies completions, e
 | `src/logging.rs`, `src/http_util.rs` | Logging setup and effective remote address parsing |
 | `src/metrics.rs`, `src/health.rs` | Prometheus instrumentation and in-memory health from actual traffic |
 
-The active `octolib` dependency comes from the registry, with default features disabled and `llm`, `embeddings`, and `media` enabled. The sibling path declaration in `Cargo.toml` is commented out. Treat the active manifest and lockfile as authoritative for dependency versions. Provider adapters, capability/pricing registries, and schema enforcement belong to `octolib`; OctoHub owns HTTP translation, routing, limits, and storage.
+The active `octolib` dependency has default features disabled and `llm`, `embeddings`, `media`, and `evaluation` enabled. Until an octolib release carries the `evaluation` module, the manifest points at the sibling checkout; switch back to the registry version once it is published. Treat the active manifest and lockfile as authoritative for dependency versions. Provider adapters, capability/pricing registries, and schema enforcement belong to `octolib`; OctoHub owns HTTP translation, routing, limits, and storage.
 
 ## HTTP and Authentication
 
@@ -43,6 +43,7 @@ Every route below requires an active DB key via `Authorization: Bearer <client-k
 | POST | `/v1/completions` | Responses-style input/output with `previous_completion_id` chaining |
 | POST | `/v1/chat/completions` | Classic chat format converted through the same completion engine |
 | POST | `/v1/embeddings` | Embedding proxy |
+| POST | `/v1/evaluations` | Structured evaluation proxy (octolib `evaluation`: TypeSafe Jev direct or via Cloudflare AI Gateway); synchronous, one stored row per call |
 | POST | `/v1/images/generations` | Image generation/edit modes |
 | POST | `/v1/videos` | Video generation |
 | POST | `/v1/audio/speech` | Speech synthesis |
@@ -70,7 +71,7 @@ Every route below requires an active DB key via `Authorization: Bearer <client-k
 - `POST /v1/admin/keys`, `GET /v1/admin/keys`, `GET /v1/admin/keys/{id}`.
 - `POST /v1/admin/keys/{id}/revoke`, `/models`, and `/owner`.
 - `GET` and `PUT /v1/admin/owners/{owner}/auto` (empty/null map clears the override).
-- `GET /v1/admin/status`, `/usage`, `/completions`, `/embeddings`, and `/media`.
+- `GET /v1/admin/status`, `/usage`, `/completions`, `/embeddings`, `/evaluations`, and `/media`.
 
 Use existing handler authentication, parsing, filtering, and error helpers when extending these routes.
 
@@ -81,7 +82,7 @@ Use existing handler authentication, parsing, filtering, and error helpers when 
 - Pass a file explicitly with `-c PATH` / `--config PATH`. There is **no automatic loading of `./octohub.toml`**. Without a path, startup uses defaults plus environment variables and empty model maps.
 - `--bind HOST:PORT` overrides the loaded bind address. `OCTOHUB_HOST` and `OCTOHUB_PORT` apply only in the no-file environment path.
 - If a TOML `[server]` table is present, `api_key` is currently a required field during deserialization, even when `OCTOHUB_MASTER_KEY` will override it. Omitting the entire table uses `ServerConfig::default()`.
-- Supported sections are `[server]`, `[models]`, `[embedding_models]`, `[media_models]`, `[auto]`, `[providers.<name>]`, `[logging]`, `[metrics]`, `[media]`, and `[media_providers.<name>]`.
+- Supported sections are `[server]`, `[models]`, `[embedding_models]`, `[media_models]`, `[evaluation_models]`, `[auto]`, `[providers.<name>]`, `[logging]`, `[metrics]`, `[media]`, and `[media_providers.<name>]`.
 - File and no-file modes both accept `OCTOHUB_MASTER_KEY`, `OCTOHUB_DB_URL`, `OCTOHUB_LOG_FORMAT`, `OCTOHUB_LOG_LEVEL`, `OCTOHUB_METRICS_BIND`, `OCTOHUB_METRICS_ENABLED`, `OCTOHUB_PROVIDER_QUEUE_TIMEOUT_SECS`, `OCTOHUB_UPSTREAM_TIMEOUT_SECS`, `OCTOHUB_FAILOVER_ON_ERROR`, and `OCTOHUB_PROVIDER_ERROR_COOLDOWN_SECS`.
 - Boolean env overrides for metrics/failover are true only for `true` or `1`. Invalid numeric overrides are ignored. Check `Config::apply_env_overrides` before adding or documenting new overrides.
 
@@ -156,7 +157,7 @@ Config and provider concurrency limiter handles are replaced separately. Do not 
 - Schema setup and additive column upgrades run in backend constructors. Extend their existing idempotent initialization paths for both fresh and existing databases; there is no separate migration runner.
 - Bind SQL values with the backend's parameter APIs. Keep JSON/null behavior aligned using shared encoding/decoding helpers; PostgreSQL uses JSONB and explicit casts where the existing implementation requires them.
 - Preserve the distinction between SQL NULL (unrestricted models) and `[]` (lockout). Current `decode_allowed_models` treats malformed JSON as unrestricted and logs a warning; do not describe it as fail-closed validation.
-- Usage aggregates span completions, embeddings, and media, with key/time filters and optional buckets. Unpriced records contribute no priced amount. Keep `usage.cost` and backend aggregate expressions aligned when touching accounting.
+- Usage aggregates span completions, embeddings, media, and evaluations, with key/time filters and optional buckets. Unpriced records contribute no priced amount. Keep `usage.cost` and backend aggregate expressions aligned when touching accounting.
 
 ## Observability
 

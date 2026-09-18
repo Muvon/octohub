@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Request to create a completion (OpenAI Responses API compatible)
 #[derive(Debug, Deserialize)]
@@ -403,6 +404,30 @@ impl Serialize for EmbeddingInput {
 pub enum CreateEmbeddingResponse {
     Single(Vec<f32>),
     Batch(Vec<Vec<f32>>),
+}
+
+// ── Evaluation types ─────────────────────────────────────────────────
+
+/// Request to evaluate typed questions against one state (`POST /v1/evaluations`).
+#[derive(Debug, Deserialize)]
+pub struct CreateEvaluationRequest {
+    /// Alias from `[evaluation_models]` or `provider:model`.
+    pub model: String,
+    /// Text, or a JSON object/array, evaluated by every question.
+    pub state: serde_json::Value,
+    /// Typed questions keyed by the ids their answers come back under.
+    pub questions: BTreeMap<String, octolib::evaluation::Question>,
+}
+
+/// Response for `POST /v1/evaluations`. Answers keep octolib's wire shape;
+/// `usage.cost` is the provider's published rate applied to the tokens.
+#[derive(Debug, Serialize)]
+pub struct CreateEvaluationResponse {
+    pub id: String,
+    /// Versioned model that answered, as reported by the provider.
+    pub model: String,
+    pub answers: BTreeMap<String, octolib::evaluation::Answer>,
+    pub usage: octolib::evaluation::EvaluationUsage,
 }
 
 // ── Classic OpenAI Chat Completions types ────────────────────────────────────

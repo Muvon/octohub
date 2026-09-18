@@ -480,6 +480,7 @@ pub async fn handle_usage(
                         "key_name": r.key_name,
                         "completions_count": r.completions_count,
                         "embeddings_count": r.embeddings_count,
+                        "evaluations_count": r.evaluations_count,
                         "total_input_tokens": r.total_input_tokens,
                         "total_output_tokens": r.total_output_tokens,
                         "media_count": r.media_count,
@@ -579,6 +580,50 @@ pub async fn handle_list_embeddings(
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to list embeddings",
+            )
+        }
+    }
+}
+
+/// GET /v1/admin/evaluations?key_id=1,3&since=...&until=...
+pub async fn handle_list_evaluations(
+    req: Request<hyper::body::Incoming>,
+    storage: Arc<dyn Storage>,
+    master_key: &str,
+) -> Response<BoxBody> {
+    if let Err(resp) = check_admin(&req, master_key) {
+        return *resp;
+    }
+
+    let query = req.uri().query().unwrap_or("");
+    let params = parse_query(query);
+    let filter = build_filter(&params);
+
+    match storage.list_evaluations(&filter) {
+        Ok(evaluations) => {
+            let items: Vec<serde_json::Value> = evaluations
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "id": e.id,
+                        "api_key_id": e.api_key_id,
+                        "input_model": e.input_model,
+                        "resolved_model": e.resolved_model,
+                        "provider": e.provider,
+                        "usage": e.usage,
+                        "request": e.request,
+                        "answers": e.answers,
+                        "created_at": e.created_at,
+                    })
+                })
+                .collect();
+            json_response(StatusCode::OK, serde_json::json!({ "data": items }))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "list evaluations failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list evaluations",
             )
         }
     }

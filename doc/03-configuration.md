@@ -53,6 +53,7 @@ The default file ships in the repo root as [`octohub.toml`](../../octohub.toml).
 | `[metrics]` | table | `enabled=true`, `bind="127.0.0.1:9090"`, `per_key=false` | Prometheus endpoint |
 | `[models]` | table | `{}` | Short model name → list of `provider:model` strings |
 | `[embedding_models]` | table | `{}` | Same, for embedding calls |
+| `[evaluation_models]` | table | `{}` | Same, for `POST /v1/evaluations` (`typesafe`, `cloudflare`) |
 | `[providers.<name>]` | table | none | Per-provider tuning: `concurrency` + rate windows |
 
 ## `[server]`
@@ -138,6 +139,21 @@ field. The above config lets clients do either.
 The `[embedding_models]` table works the same way for
 `POST /v1/embeddings`. An alias in `[embedding_models]` does not work
 for `/v1/completions` and vice versa.
+
+### Evaluation models
+
+The `[evaluation_models]` table works the same way for
+`POST /v1/evaluations`. Entries name octolib's evaluation adapters:
+`typesafe:jev-latest` (direct, `TYPESAFE_API_KEY`) or
+`cloudflare:typesafe/jev` (AI Gateway unified billing, the Cloudflare
+key and account id). Aliases must not collide with `[models]`,
+`[embedding_models]` or `[media_models]`; unknown providers, malformed
+entries and empty lists are rejected at load, like `[media_models]`.
+
+```toml
+[evaluation_models]
+"jev" = ["typesafe:jev-latest", "cloudflare:typesafe/jev"]
+```
 
 ## `[providers.<name>]`
 

@@ -1,7 +1,7 @@
 use super::{
     decode_auto_map, encode_allowed_models, encode_auto_map, encode_json_column, generate_api_key,
     make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding,
-    StoredMedia, TimeBucket, UsageRow,
+    StoredEvaluation, StoredMedia, TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use postgres::NoTls;
@@ -79,6 +79,20 @@ impl PostgresStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_embeddings_api_key ON embeddings(api_key_id);
             CREATE INDEX IF NOT EXISTS idx_embeddings_created ON embeddings(created_at);
+
+            CREATE TABLE IF NOT EXISTS evaluations (
+                id TEXT PRIMARY KEY,
+                api_key_id BIGINT NOT NULL REFERENCES api_keys(id),
+                input_model TEXT NOT NULL,
+                resolved_model TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                request JSONB NOT NULL,
+                answers JSONB NOT NULL,
+                usage JSONB NOT NULL,
+                created_at BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_evaluations_api_key ON evaluations(api_key_id);
+            CREATE INDEX IF NOT EXISTS idx_evaluations_created ON evaluations(created_at);
 
             CREATE TABLE IF NOT EXISTS media (
                 id TEXT PRIMARY KEY,
@@ -217,6 +231,20 @@ fn read_embedding(row: &postgres::Row) -> StoredEmbedding {
         resolved_model: row.get("resolved_model"),
         provider: row.get("provider"),
         input: row.get("input"),
+        usage: row.get("usage"),
+        created_at: row.get::<_, i64>("created_at") as u64,
+    }
+}
+
+fn read_evaluation(row: &postgres::Row) -> StoredEvaluation {
+    StoredEvaluation {
+        id: row.get("id"),
+        api_key_id: row.get("api_key_id"),
+        input_model: row.get("input_model"),
+        resolved_model: row.get("resolved_model"),
+        provider: row.get("provider"),
+        request: row.get("request"),
+        answers: row.get("answers"),
         usage: row.get("usage"),
         created_at: row.get::<_, i64>("created_at") as u64,
     }
@@ -518,6 +546,51 @@ impl Storage for PostgresStorage {
         Ok(rows.iter().map(read_embedding).collect())
     }
 
+    fn store_evaluation(&self, evaluation: &StoredEvaluation) -> Result<()> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        let created_at = evaluation.created_at as i64;
+        client.execute(
+            "INSERT INTO evaluations (id, api_key_id, input_model, resolved_model, provider, request, answers, usage, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &evaluation.id,
+                &evaluation.api_key_id,
+                &evaluation.input_model,
+                &evaluation.resolved_model,
+                &evaluation.provider,
+                &evaluation.request,
+                &evaluation.answers,
+                &evaluation.usage,
+                &created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_evaluations(&self, filter: &ListFilter) -> Result<Vec<StoredEvaluation>> {
+        let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+        let (where_clause, mut params, idx) =
+            build_filter(&filter.key_ids, filter.since, filter.until);
+
+        let limit = effective_limit(filter.limit);
+        let offset = filter.offset as i64;
+
+        let sql = format!(
+            "SELECT * FROM evaluations{} ORDER BY created_at DESC LIMIT ${} OFFSET ${}",
+            where_clause,
+            idx,
+            idx + 1
+        );
+
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = client.query(&sql, &param_refs)?;
+        Ok(rows.iter().map(read_evaluation).collect())
+    }
+
     fn store_media(&self, record: &StoredMedia) -> Result<()> {
         let mut client = self.pool.get().context("PostgreSQL connection failed")?;
         // Text-encoded + ::jsonb casts, same shape as create_api_key. Going
@@ -659,6 +732,18 @@ impl Storage for PostgresStorage {
             where_clause = where_clause,
         );
 
+        let eval_sql = format!(
+            "SELECT api_key_id, {bucket} AS period, \
+             COUNT(*) AS cnt, \
+             COALESCE(SUM((usage->>'input_tokens')::bigint), 0) AS inp, \
+             COALESCE(SUM((usage->>'output_tokens')::bigint), 0) AS outp, \
+             COALESCE(SUM((usage->>'cost')::double precision), 0.0) AS cost \
+             FROM evaluations{where_clause} \
+             GROUP BY api_key_id, period",
+            bucket = bucket_expr,
+            where_clause = where_clause,
+        );
+
         // Media rows carry cost but no tokens; an unpriced row contributes
         // nothing rather than zero-filling the total.
         let media_sql = format!(
@@ -699,6 +784,7 @@ impl Storage for PostgresStorage {
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     media_count: 0,
+                    evaluations_count: 0,
                     total_cost: 0.0,
                 });
             entry.completions_count = cnt as u64;
@@ -728,10 +814,42 @@ impl Storage for PostgresStorage {
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     media_count: 0,
+                    evaluations_count: 0,
                     total_cost: 0.0,
                 });
             entry.embeddings_count = cnt as u64;
             entry.total_input_tokens += inp as u64;
+            entry.total_cost += cost;
+        }
+
+        // Evaluation stats
+        let eval_rows = client.query(&eval_sql, &param_refs)?;
+        for row in &eval_rows {
+            let key_id: i64 = row.get("api_key_id");
+            let period: i64 = row.get("period");
+            let period = period as u64;
+            let cnt: i64 = row.get("cnt");
+            let inp: i64 = row.get("inp");
+            let outp: i64 = row.get("outp");
+            let cost: f64 = row.get("cost");
+
+            let entry = usage_map
+                .entry((key_id, period))
+                .or_insert_with(|| UsageRow {
+                    period: if bucket.is_some() { Some(period) } else { None },
+                    key_id,
+                    key_name: String::new(),
+                    completions_count: 0,
+                    embeddings_count: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    media_count: 0,
+                    evaluations_count: 0,
+                    total_cost: 0.0,
+                });
+            entry.evaluations_count = cnt as u64;
+            entry.total_input_tokens += inp as u64;
+            entry.total_output_tokens += outp as u64;
             entry.total_cost += cost;
         }
 
@@ -755,6 +873,7 @@ impl Storage for PostgresStorage {
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     media_count: 0,
+                    evaluations_count: 0,
                     total_cost: 0.0,
                 });
             entry.media_count = cnt as u64;

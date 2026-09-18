@@ -1,7 +1,8 @@
 use super::{
     decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models,
     encode_auto_map, encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey,
-    ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredMedia, TimeBucket, UsageRow,
+    ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia,
+    TimeBucket, UsageRow,
 };
 use anyhow::{Context, Result};
 use mysql::prelude::*;
@@ -93,6 +94,21 @@ impl MysqlStorage {
                 created_at BIGINT UNSIGNED NOT NULL,
                 INDEX idx_embeddings_api_key (api_key_id),
                 INDEX idx_embeddings_created (created_at)
+            )",
+        )?;
+        conn.query_drop(
+            "CREATE TABLE IF NOT EXISTS evaluations (
+                id VARCHAR(255) PRIMARY KEY,
+                api_key_id BIGINT NOT NULL,
+                input_model VARCHAR(255) NOT NULL,
+                resolved_model VARCHAR(255) NOT NULL,
+                provider VARCHAR(255) NOT NULL,
+                request JSON NOT NULL,
+                answers JSON NOT NULL,
+                `usage` JSON NOT NULL,
+                created_at BIGINT UNSIGNED NOT NULL,
+                INDEX idx_evaluations_api_key (api_key_id),
+                INDEX idx_evaluations_created (created_at)
             )",
         )?;
         conn.query_drop(
@@ -233,6 +249,23 @@ fn read_embedding(row: mysql::Row) -> Result<StoredEmbedding> {
         resolved_model: row.get("resolved_model").unwrap_or_default(),
         provider: row.get("provider").unwrap_or_default(),
         input: serde_json::from_str(&row.get::<String, _>("input").unwrap_or_default())
+            .unwrap_or_default(),
+        usage: serde_json::from_str(&row.get::<String, _>("usage").unwrap_or_default())
+            .unwrap_or_default(),
+        created_at: row.get("created_at").unwrap_or_default(),
+    })
+}
+
+fn read_evaluation(row: mysql::Row) -> Result<StoredEvaluation> {
+    Ok(StoredEvaluation {
+        id: row.get("id").unwrap_or_default(),
+        api_key_id: row.get("api_key_id").unwrap_or_default(),
+        input_model: row.get("input_model").unwrap_or_default(),
+        resolved_model: row.get("resolved_model").unwrap_or_default(),
+        provider: row.get("provider").unwrap_or_default(),
+        request: serde_json::from_str(&row.get::<String, _>("request").unwrap_or_default())
+            .unwrap_or_default(),
+        answers: serde_json::from_str(&row.get::<String, _>("answers").unwrap_or_default())
             .unwrap_or_default(),
         usage: serde_json::from_str(&row.get::<String, _>("usage").unwrap_or_default())
             .unwrap_or_default(),
@@ -515,6 +548,43 @@ impl Storage for MysqlStorage {
         rows.into_iter().map(read_embedding).collect()
     }
 
+    fn store_evaluation(&self, evaluation: &StoredEvaluation) -> Result<()> {
+        let mut conn = self.pool.get_conn()?;
+        conn.exec_drop(
+            "INSERT INTO evaluations (id, api_key_id, input_model, resolved_model, provider, request, answers, `usage`, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                &evaluation.id,
+                evaluation.api_key_id,
+                &evaluation.input_model,
+                &evaluation.resolved_model,
+                &evaluation.provider,
+                evaluation.request.to_string(),
+                evaluation.answers.to_string(),
+                evaluation.usage.to_string(),
+                evaluation.created_at,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn list_evaluations(&self, filter: &ListFilter) -> Result<Vec<StoredEvaluation>> {
+        let mut conn = self.pool.get_conn()?;
+        let (where_clause, mut params) = build_filter(&filter.key_ids, filter.since, filter.until);
+
+        let limit = effective_limit(filter.limit);
+        params.push(limit.into());
+        params.push(filter.offset.into());
+
+        let sql = format!(
+            "SELECT * FROM evaluations{} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        let rows: Vec<mysql::Row> = conn.exec(sql, mysql::Params::Positional(params))?;
+        rows.into_iter().map(read_evaluation).collect()
+    }
+
     fn store_media(&self, record: &StoredMedia) -> Result<()> {
         let mut conn = self.pool.get_conn()?;
         conn.exec_drop(
@@ -630,6 +700,18 @@ impl Storage for MysqlStorage {
             where_clause = where_clause,
         );
 
+        let eval_sql = format!(
+            "SELECT api_key_id, {bucket} AS period, \
+             COUNT(*) AS cnt, \
+             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.input_tokens')), 0) AS inp, \
+             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.output_tokens')), 0) AS outp, \
+             COALESCE(SUM(JSON_EXTRACT(`usage`, '$.cost')), 0.0) AS cost \
+             FROM evaluations{where_clause} \
+             GROUP BY api_key_id, period",
+            bucket = bucket_expr,
+            where_clause = where_clause,
+        );
+
         // Media rows carry cost but no tokens; an unpriced row contributes
         // nothing rather than zero-filling the total.
         let media_sql = format!(
@@ -667,6 +749,7 @@ impl Storage for MysqlStorage {
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     media_count: 0,
+                    evaluations_count: 0,
                     total_cost: 0.0,
                 });
             entry.completions_count = cnt;
@@ -696,10 +779,42 @@ impl Storage for MysqlStorage {
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     media_count: 0,
+                    evaluations_count: 0,
                     total_cost: 0.0,
                 });
             entry.embeddings_count = cnt;
             entry.total_input_tokens += inp;
+            entry.total_cost += cost;
+        }
+
+        // Evaluation stats
+        let eval_rows: Vec<mysql::Row> =
+            conn.exec(&eval_sql, mysql::Params::Positional(filter_params.clone()))?;
+        for row in eval_rows {
+            let key_id: i64 = row.get("api_key_id").unwrap_or_default();
+            let period: u64 = row.get("period").unwrap_or_default();
+            let cnt: u64 = row.get("cnt").unwrap_or_default();
+            let inp: u64 = row.get("inp").unwrap_or_default();
+            let outp: u64 = row.get("outp").unwrap_or_default();
+            let cost: f64 = row.get("cost").unwrap_or_default();
+
+            let entry = usage_map
+                .entry((key_id, period))
+                .or_insert_with(|| UsageRow {
+                    period: if bucket.is_some() { Some(period) } else { None },
+                    key_id,
+                    key_name: String::new(),
+                    completions_count: 0,
+                    embeddings_count: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    media_count: 0,
+                    evaluations_count: 0,
+                    total_cost: 0.0,
+                });
+            entry.evaluations_count = cnt;
+            entry.total_input_tokens += inp;
+            entry.total_output_tokens += outp;
             entry.total_cost += cost;
         }
 
@@ -723,6 +838,7 @@ impl Storage for MysqlStorage {
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     media_count: 0,
+                    evaluations_count: 0,
                     total_cost: 0.0,
                 });
             entry.media_count = cnt;

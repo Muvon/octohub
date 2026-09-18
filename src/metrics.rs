@@ -45,6 +45,12 @@ pub fn init(cfg: &MetricsConfig) -> Result<Option<metrics_exporter_prometheus::P
         )?
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(
+                "octohub_evaluation_duration_seconds".to_owned(),
+            ),
+            REQUEST_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
                 "octohub_provider_queue_wait_seconds".to_owned(),
             ),
             QUEUE_WAIT_BUCKETS,
@@ -88,6 +94,18 @@ pub fn init(cfg: &MetricsConfig) -> Result<Option<metrics_exporter_prometheus::P
     describe_counter!(
         "octohub_embedding_tokens_total",
         "Total tokens processed by embeddings"
+    );
+    describe_counter!(
+        "octohub_evaluations_total",
+        "Total number of evaluation requests"
+    );
+    describe_histogram!(
+        "octohub_evaluation_duration_seconds",
+        "Evaluation upstream call duration in seconds"
+    );
+    describe_counter!(
+        "octohub_evaluation_tokens_total",
+        "Total tokens processed by evaluations"
     );
     describe_histogram!(
         "octohub_provider_queue_wait_seconds",
@@ -325,6 +343,53 @@ pub fn record_embedding(
         ("direction", "in".to_owned()),
     ];
     counter!("octohub_embedding_tokens_total", &tok_labels).increment(tok_in);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_evaluation(
+    model: &str,
+    provider: &str,
+    status: &str,
+    duration: Duration,
+    tok_in: u64,
+    tok_out: u64,
+    api_key_id: Option<i64>,
+    per_key: bool,
+) {
+    // Same funnel as completions and embeddings, so `/v1/admin/status` sees
+    // evaluation traffic too.
+    crate::health::record(model, provider, status == "ok", duration, status);
+
+    let model = model.to_owned();
+    let provider = provider.to_owned();
+    let status = status.to_owned();
+    let mut labels: Vec<(&str, String)> = vec![
+        ("model", model.clone()),
+        ("provider", provider.clone()),
+        ("status", status),
+    ];
+    if per_key {
+        if let Some(id) = api_key_id {
+            labels.push(("api_key_id", id.to_string()));
+        }
+    }
+
+    counter!("octohub_evaluations_total", &labels).increment(1);
+    histogram!("octohub_evaluation_duration_seconds", "model" => model.clone(), "provider" => provider.clone())
+        .record(duration.as_secs_f64());
+
+    let in_labels: Vec<(&str, String)> = vec![
+        ("model", model.clone()),
+        ("provider", provider.clone()),
+        ("direction", "in".to_owned()),
+    ];
+    let out_labels: Vec<(&str, String)> = vec![
+        ("model", model),
+        ("provider", provider),
+        ("direction", "out".to_owned()),
+    ];
+    counter!("octohub_evaluation_tokens_total", &in_labels).increment(tok_in);
+    counter!("octohub_evaluation_tokens_total", &out_labels).increment(tok_out);
 }
 
 pub fn record_queue_wait(provider: &str, duration: Duration) {

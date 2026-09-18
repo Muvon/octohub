@@ -6,13 +6,16 @@ use hyper::{Request, Response, StatusCode};
 
 use crate::api::types::{
     ChatCompletionRequest, ChatCompletionResponse, CreateCompletionRequest, CreateEmbeddingRequest,
+    CreateEvaluationRequest,
 };
 use crate::auth::{authenticate_client, ClientAuth};
 use crate::proxy::engine::{
-    upstream_status_code, ModalityNotSupportedError, ProxyEngine, ProxyTimeoutError,
-    RateLimitedError, SchemaNotEnforcedError, MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
+    evaluation_error, upstream_status_code, ModalityNotSupportedError, ProxyEngine,
+    ProxyTimeoutError, RateLimitedError, SchemaNotEnforcedError, MODEL_FORBIDDEN_MARKER,
+    OWNER_LIMIT_MARKER,
 };
 use crate::storage::Storage;
+use octolib::evaluation::EvaluationError;
 
 type BoxBody = Full<Bytes>;
 
@@ -71,8 +74,17 @@ fn engine_error_response(
     message: &str,
 ) -> Response<BoxBody> {
     let mut response = error_response_typed(status, message, engine_error_type(error));
-    if let Some(rate) = error.downcast_ref::<RateLimitedError>() {
-        let secs = rate.retry_after.as_secs().max(1);
+    let retry_after_secs = match error.downcast_ref::<RateLimitedError>() {
+        Some(rate) => Some(rate.retry_after.as_secs().max(1)),
+        None => match evaluation_error(error) {
+            Some(EvaluationError::RateLimit {
+                retry_after_secs: Some(secs),
+                ..
+            }) => Some((*secs).max(1)),
+            _ => None,
+        },
+    };
+    if let Some(secs) = retry_after_secs {
         if let Ok(value) = hyper::header::HeaderValue::from_str(&secs.to_string()) {
             response
                 .headers_mut()
@@ -317,6 +329,98 @@ pub async fn handle_create_embedding(
     }
 }
 
+/// Handle POST /v1/evaluations
+pub async fn handle_create_evaluation(
+    req: Request<hyper::body::Incoming>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    let header = auth_header(&req);
+    let storage_clone = storage.clone();
+    let auth_result =
+        tokio::task::spawn_blocking(move || authenticate_client(header.as_deref(), &storage_clone))
+            .await
+            .unwrap_or(ClientAuth::Invalid);
+    let api_key = match auth_result {
+        ClientAuth::Ok(key) => key,
+        ClientAuth::Missing => {
+            tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
+            return error_response(StatusCode::UNAUTHORIZED, "Missing API key");
+        }
+        ClientAuth::Invalid => {
+            tracing::warn!(kind = "client", reason = "invalid_token", "auth failed");
+            return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key");
+        }
+    };
+    tracing::Span::current().record("api_key_id", api_key.id);
+
+    let body_bytes = match req.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Failed to read request body: {}", e),
+            );
+        }
+    };
+
+    let create_req: CreateEvaluationRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid request JSON: {}", e),
+            );
+        }
+    };
+
+    tracing::Span::current().record("model", create_req.model.as_str());
+
+    let per_key = engine.config().metrics.per_key;
+    let model_label = create_req.model.clone();
+    match engine.process_evaluation(create_req, &api_key).await {
+        Ok(outcome) => {
+            tracing::Span::current().record("tok_in", outcome.input_tokens);
+            tracing::Span::current().record("tok_out", outcome.output_tokens);
+
+            crate::metrics::record_evaluation(
+                &model_label,
+                &outcome.provider,
+                "ok",
+                outcome.upstream_duration,
+                outcome.input_tokens,
+                outcome.output_tokens,
+                Some(api_key.id),
+                per_key,
+            );
+
+            let body = serde_json::to_value(&outcome.response).unwrap_or_default();
+            json_response(StatusCode::OK, body)
+        }
+        Err(e) => {
+            let (status, msg) = classify_engine_error(&e);
+            if status.is_server_error() {
+                tracing::error!(error = ?e, "evaluation failed");
+            } else {
+                tracing::warn!(reason = %msg, "evaluation request rejected");
+            }
+
+            crate::metrics::record_evaluation(
+                &model_label,
+                "unknown",
+                "error",
+                std::time::Duration::ZERO,
+                0,
+                0,
+                Some(api_key.id),
+                per_key,
+            );
+
+            engine_error_response(&e, status, &msg)
+        }
+    }
+}
+
 /// Classify engine errors into HTTP status codes.
 /// Per-key model restriction → 403, bad model/input → 400, otherwise 500.
 fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
@@ -325,6 +429,25 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
     // text). For 500s we surface the full chain below.
     let top = format!("{}", error);
     let full = format!("{:#}", error);
+
+    // octolib's evaluation adapters keep their errors typed: map the variant
+    // instead of scanning for an embedded status code.
+    if let Some(evaluation) = evaluation_error(error) {
+        return match evaluation {
+            EvaluationError::InvalidRequest(_)
+            | EvaluationError::InvalidModelFormat(_)
+            | EvaluationError::UnsupportedProvider(_)
+            | EvaluationError::UnsupportedModel { .. } => (StatusCode::BAD_REQUEST, full),
+            EvaluationError::RateLimit { .. } => (StatusCode::TOO_MANY_REQUESTS, full),
+            EvaluationError::Authentication { .. } => (StatusCode::UNAUTHORIZED, full),
+            EvaluationError::Permission { .. } => (StatusCode::FORBIDDEN, full),
+            EvaluationError::Api { status, .. } if (400..500).contains(status) => (
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_REQUEST),
+                full,
+            ),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, full),
+        };
+    }
 
     if let Some(timeout) = error.downcast_ref::<ProxyTimeoutError>() {
         let status = match timeout {
@@ -367,6 +490,7 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
     let is_client_error = top.contains("not found in config")
         || top.contains("Failed to resolve model")
         || top.contains("Failed to resolve embedding model")
+        || top.contains("Failed to resolve evaluation model")
         || top.contains("Failed to resolve media model")
         || top.contains("not available")
         || top.contains("Invalid request");
