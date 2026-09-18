@@ -135,8 +135,12 @@ Two variants (`src/api/types.rs:75`–`84`):
   provided schema; `strict: true` enables strict adherence when the
   upstream provider supports it.
 
-The proxy passes this through to the provider. Whether it actually
-constrains the response is a property of the upstream, not of OctoHub.
+A `json_schema` request is routed only to the model's lanes whose provider
+guarantees the schema (octolib's `enforces_response_schema`), in their
+configured order. Lanes that could only approximate it — a forced tool
+call or `json_object` mode — are skipped. When no lane of the model
+qualifies, the request fails with 400 before any upstream call.
+`json_object` requests use every lane.
 
 ### Response shape
 
