@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.0] - 2026-09-18
+
+### 📋 Release Summary
+
+This release introduces evaluation support, including routing automatic evaluations by alias (925a2611, 335ae028). Requests with unenforceable schemas are now rejected, and API documentation explains schema lane filtering (8047f3ad, 3130d9fb).
+
+
+### ✨ New Features & Enhancements
+
+- **eval**: route auto evaluations by alias `335ae028`
+- **evaluations**: add evaluation support `925a2611`
+
+### 🐛 Bug Fixes & Stability
+
+- **proxy**: reject unenforceable schema requests `8047f3ad`
+
+### 📚 Documentation & Examples
+
+- **api-client**: document schema lane filtering `3130d9fb`
+
+### 🔄 Other Changes
+
+3 maintenance, dependency, and tooling updates not listed individually.
+
 ## [0.8.4] - 2026-09-14
 
 ### 📋 Release Summary
