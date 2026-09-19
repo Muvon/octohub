@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.1] - 2026-09-19
+
+### 📋 Release Summary
+
+This release adds configurable owner queue timeouts, giving users greater control over request queuing behavior (3dd42990).
+
+
+### ✨ New Features & Enhancements
+
+- **queue**: configure owner queue timeout `3dd42990`
+
 ## [0.9.0] - 2026-09-18
 
 ### 📋 Release Summary
