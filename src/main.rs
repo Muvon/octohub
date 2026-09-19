@@ -175,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
         media_models = cfg.media_models.len(),
         metrics = cfg.metrics.enabled,
         provider_queue_timeout_secs = cfg.server.provider_queue_timeout_secs,
+        owner_queue_timeout_secs = cfg.server.owner_queue_timeout_secs,
         upstream_timeout_secs = cfg.server.upstream_timeout_secs,
         "octohub starting"
     );

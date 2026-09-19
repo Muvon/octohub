@@ -60,7 +60,7 @@ Every route below requires an active DB key via `Authorization: Bearer <client-k
 - Admin handlers authenticate against `server.api_key`, overridden by `OCTOHUB_MASTER_KEY`. The master key has no special authority on client routes.
 - **Current limitation:** startup warns that an empty master key disables admin endpoints, but `authenticate_admin` compares tokens directly and its tests explicitly accept `Bearer ` against an empty master key. Do not claim unconditional 401 behavior until the implementation changes.
 - `allowed_models: None` means unrestricted; `Some([])` means deny all. Matching is exact against the requested alias or `provider:model`. Virtual `auto` checks both the requested `auto` and its resolved alias.
-- Keys with the same owner label and a positive `owner_concurrency` share an in-process request budget. Completion, embedding, and media creation hold the owner permit through queueing, upstream work, and storage. Saturation waits up to `OWNER_QUEUE_WAIT` (30 seconds), then returns 429. Missing owner or missing/zero capacity is unlimited.
+- Keys with the same owner label and a positive `owner_concurrency` share an in-process request budget. Completion, embedding, and media creation hold the owner permit through queueing, upstream work, and storage. Saturation waits up to `server.owner_queue_timeout_secs` (30 seconds; `0` never queues), then returns 429. Missing owner or missing/zero capacity is unlimited.
 - Model-list and owner updates change active key metadata in place without rotating credentials. Owner budgets are read from authenticated key rows; resizing swaps semaphores, allowing old permits to drain.
 - Media lookups include `api_key_id`; another key's record is returned as absent (404). Preserve that boundary for both poll and cancel.
 
@@ -95,6 +95,7 @@ Use existing handler authentication, parsing, filtering, and error helpers when 
 | `server.api_key` | Empty in the default server config |
 | `server.trust_forwarded_for` | `false` |
 | `server.provider_queue_timeout_secs` | `60` |
+| `server.owner_queue_timeout_secs` | `30` |
 | `server.upstream_timeout_secs` | `360` |
 | `server.failover_on_error` | `false` |
 | `server.provider_error_cooldown_secs` | `0` (disabled) |

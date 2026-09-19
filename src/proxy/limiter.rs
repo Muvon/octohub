@@ -75,16 +75,11 @@ impl ProviderLimiter {
 ///
 /// Unlike the provider limiter (which parks callers silently — capacity
 /// protection is OUR problem), a saturated owner budget waits at most
-/// `OWNER_QUEUE_WAIT` and then fails the request: the caller is the
-/// bottleneck and must hear about it (the handler maps it to HTTP 429).
+/// `[server].owner_queue_timeout_secs` and then fails the request: the caller
+/// is the bottleneck and must hear about it (the handler maps it to HTTP 429).
 pub struct OwnerLimiter {
     slots: std::sync::Mutex<HashMap<String, (u32, Arc<Semaphore>)>>,
 }
-
-/// How long a request may queue for an owner slot before 429ing. Long enough
-/// to smooth an agent's parallel tool-call burst, short enough that a truly
-/// saturated tenant gets told instead of silently serialized.
-pub const OWNER_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl OwnerLimiter {
     pub fn new() -> Self {
@@ -653,6 +648,20 @@ mod tests {
             health.record_failure_at("OpenAI", cooldown, t0);
         }
         assert!(health.is_cooling_at("openai", t0));
+    }
+
+    #[tokio::test]
+    async fn zero_owner_wait_admits_a_free_slot_and_never_queues() {
+        let limiter = OwnerLimiter::new();
+        let held = limiter
+            .acquire("acct-1", 1, Duration::ZERO)
+            .await
+            .expect("a free slot must admit even with no wait");
+        assert!(
+            limiter.acquire("acct-1", 1, Duration::ZERO).await.is_err(),
+            "a held slot must reject at once"
+        );
+        drop(held);
     }
 
     #[tokio::test]

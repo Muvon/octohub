@@ -16,9 +16,7 @@ use uuid::Uuid;
 
 use crate::api::types::*;
 use crate::config::Config;
-use crate::proxy::limiter::{
-    OwnerLimiter, ProviderHealth, ProviderLimiter, ProviderRateTracker, OWNER_QUEUE_WAIT,
-};
+use crate::proxy::limiter::{OwnerLimiter, ProviderHealth, ProviderLimiter, ProviderRateTracker};
 use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
 
 /// Marker added to model-restriction errors so the HTTP layer can map them
@@ -235,7 +233,7 @@ impl ProxyEngine {
     }
 
     /// Take a slot in the key's shared owner budget, or fail with the 429
-    /// marker after `OWNER_QUEUE_WAIT`. `None` = key is ungrouped/unlimited —
+    /// marker after `[server].owner_queue_timeout_secs`. `None` = key is ungrouped/unlimited —
     /// hold the returned permit (if any) for the whole upstream call.
     pub(crate) async fn acquire_owner_slot(
         &self,
@@ -249,7 +247,11 @@ impl ProxyEngine {
         }
         match self
             .owner_limiter
-            .acquire(owner, capacity, OWNER_QUEUE_WAIT)
+            .acquire(
+                owner,
+                capacity,
+                std::time::Duration::from_secs(self.config().server.owner_queue_timeout_secs),
+            )
             .await
         {
             Ok(permit) => Ok(Some(permit)),

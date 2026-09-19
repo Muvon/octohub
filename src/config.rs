@@ -202,6 +202,11 @@ pub struct ServerConfig {
     /// Maximum time to wait for a provider concurrency permit.
     #[serde(default = "default_provider_queue_timeout_secs")]
     pub provider_queue_timeout_secs: u64,
+    /// Maximum time a request waits for a slot in its owner's shared budget
+    /// (keys with an `owner` and a positive `owner_concurrency`) before 429.
+    /// `0` = never queue: fail at once unless a slot is free.
+    #[serde(default = "default_owner_queue_timeout_secs")]
+    pub owner_queue_timeout_secs: u64,
     /// Maximum time for the complete upstream provider operation, including
     /// octolib retries and response parsing.
     #[serde(default = "default_upstream_timeout_secs")]
@@ -277,6 +282,10 @@ fn default_provider_queue_timeout_secs() -> u64 {
     60
 }
 
+fn default_owner_queue_timeout_secs() -> u64 {
+    30
+}
+
 fn default_upstream_timeout_secs() -> u64 {
     6 * 60
 }
@@ -290,6 +299,7 @@ impl Default for ServerConfig {
             db_url: default_db_url(),
             trust_forwarded_for: false,
             provider_queue_timeout_secs: default_provider_queue_timeout_secs(),
+            owner_queue_timeout_secs: default_owner_queue_timeout_secs(),
             upstream_timeout_secs: default_upstream_timeout_secs(),
             failover_on_error: false,
             provider_error_cooldown_secs: 0,
@@ -402,6 +412,11 @@ impl Config {
                 config.server.provider_queue_timeout_secs = seconds;
             }
         }
+        if let Ok(val) = env::var("OCTOHUB_OWNER_QUEUE_TIMEOUT_SECS") {
+            if let Ok(seconds) = val.parse() {
+                config.server.owner_queue_timeout_secs = seconds;
+            }
+        }
         if let Ok(val) = env::var("OCTOHUB_UPSTREAM_TIMEOUT_SECS") {
             if let Ok(seconds) = val.parse() {
                 config.server.upstream_timeout_secs = seconds;
@@ -430,6 +445,7 @@ impl Config {
                 db_url: env::var("OCTOHUB_DB_URL").unwrap_or_else(|_| default_db_url()),
                 trust_forwarded_for: false,
                 provider_queue_timeout_secs: default_provider_queue_timeout_secs(),
+                owner_queue_timeout_secs: default_owner_queue_timeout_secs(),
                 upstream_timeout_secs: default_upstream_timeout_secs(),
                 failover_on_error: false,
                 provider_error_cooldown_secs: 0,
@@ -666,6 +682,7 @@ mod tests {
     fn server_timeout_defaults_are_bounded() {
         let config = ServerConfig::default();
         assert_eq!(config.provider_queue_timeout_secs, 60);
+        assert_eq!(config.owner_queue_timeout_secs, 30);
         assert_eq!(config.upstream_timeout_secs, 360);
         assert!(!config.failover_on_error, "failover is opt-in");
         assert_eq!(config.provider_error_cooldown_secs, 0, "cooldown is opt-in");
@@ -1063,12 +1080,14 @@ mod tests {
             [server]
             api_key = ""
             provider_queue_timeout_secs = 45
+            owner_queue_timeout_secs = 5
             upstream_timeout_secs = 420
             "#,
         )
         .unwrap();
 
         assert_eq!(config.server.provider_queue_timeout_secs, 45);
+        assert_eq!(config.server.owner_queue_timeout_secs, 5);
         assert_eq!(config.server.upstream_timeout_secs, 420);
     }
 }
