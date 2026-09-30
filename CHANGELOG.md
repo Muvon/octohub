@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.4] - 2026-09-30
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update locked dependencies `80446347`
+
 ## [0.9.3] - 2026-09-30
 
 ### 🔧 Improvements & Optimizations
