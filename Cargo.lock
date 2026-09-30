@@ -119,9 +119,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.48"
+version = "0.4.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb61aea1a7def73ee7c350a184f0e70b32c182344e2e75bf70c9b621b83417fd"
+checksum = "a3789ca2cd1c4e8ce71fe9bd6312566014e20ff3016fc87bc71c59ff93b5fa61"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -384,9 +384,9 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.43"
+version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef16c47ba2797aa6a909cc37d39911f3a6743811fe7408ac0b0cc0276b656e9"
+checksum = "5f018b36ac50598f7bfb0aa6094281e253e6b3cbc507a69652d2fb963a326d8d"
 dependencies = [
  "brotli",
  "compression-core",
@@ -1267,7 +1267,7 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.17",
  "js-sys",
- "pem",
+ "pem 3.0.6",
  "serde",
  "serde_json",
  "signature",
@@ -1353,9 +1353,9 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lru"
-version = "0.16.4"
+version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 
 [[package]]
 name = "lru-slab"
@@ -1468,9 +1468,9 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "mysql"
-version = "28.0.2"
+version = "28.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e99968f000e2aadff1545932ac7f7ed4002eeb0207061f377f15ac95ae82626c"
+checksum = "7d3d30e2806645e218163f49c2656286061cc91ffce24d93d758fd136e70eb5d"
 dependencies = [
  "arc-swap",
  "bufstream",
@@ -1484,7 +1484,7 @@ dependencies = [
  "mysql_common",
  "named_pipe",
  "native-tls",
- "pem",
+ "pem 4.0.0",
  "percent-encoding",
  "socket2",
  "twox-hash",
@@ -1696,9 +1696,9 @@ dependencies = [
 
 [[package]]
 name = "octolib"
-version = "0.40.0"
+version = "0.40.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5fc0b9b099236000ac107e8cec19a668b5f3fad6d4834a7674c47e2c3a3e2d6"
+checksum = "7d6f7baf3800d0fe8609ba230f89e9e2d746b28f72c5d9d3ea65eec6b7606e1d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1818,6 +1818,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
  "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.1",
  "serde_core",
 ]
 
@@ -2880,9 +2890,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.5"
+version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
  "tokio",
