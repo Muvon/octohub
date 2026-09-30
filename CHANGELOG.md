@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.3] - 2026-09-30
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib and dependency versions `5f72d815`
+
 ## [0.9.2] - 2026-09-27
 
 ### 🔄 Other Changes
