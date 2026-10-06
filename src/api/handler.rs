@@ -113,14 +113,15 @@ fn model_purpose(req: &Request<hyper::body::Incoming>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// OpenRouter-style attribution headers from the client (X-Title, HTTP-Referer),
-/// forwarded upstream so the originating app — not this proxy — gets credited.
+/// OpenRouter-style attribution headers from the client (X-Title, HTTP-Referer,
+/// X-OpenRouter-Categories), forwarded upstream so the originating app — not
+/// this proxy — gets credited.
 /// Read BEFORE the body is consumed.
 fn attribution_headers(
     req: &Request<hyper::body::Incoming>,
 ) -> Option<std::collections::HashMap<String, String>> {
     let mut map = std::collections::HashMap::new();
-    for name in ["X-Title", "HTTP-Referer"] {
+    for name in ["X-Title", "HTTP-Referer", "X-OpenRouter-Categories"] {
         if let Some(v) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
             map.insert(name.to_string(), v.to_string());
         }
