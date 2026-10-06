@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.9.6] - 2026-10-06
+
+### 📋 Release Summary
+
+Modality failover now matches equivalent models correctly.
+
+### 🐛 Bug Fixes & Stability
+
+- **proxy**: match equivalent models during modality failover `c1f514fa`
+
 ## [0.9.5] - 2026-10-06
 
 ### 📋 Release Summary
