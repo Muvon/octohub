@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.9.5] - 2026-10-06
+
+### 📋 Release Summary
+
+OpenRouter category headers are now forwarded correctly.
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: upgrade octolib dependency `2b92565c`
+
+### 🐛 Bug Fixes & Stability
+
+- **api**: forward OpenRouter category headers `9e9401bf`
+
 ## [0.9.4] - 2026-09-30
 
 ### 🔧 Improvements & Optimizations
