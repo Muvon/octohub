@@ -7,6 +7,7 @@ use octolib::evaluation::{EvaluationError, EvaluationProviderFactory, Evaluation
 
 use crate::api::types::{CreateEvaluationRequest, CreateEvaluationResponse};
 use crate::storage::StoredEvaluation;
+use octolib::llm::reference_models::reference_model_id;
 use octolib::llm::{
     chat_completion_enforced, ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData,
     Message, OutputFormat, ProviderFactory, ReasoningEffort, ResponseMode, SourceType,
@@ -1510,8 +1511,15 @@ fn retain_same_model_failover_candidates(
     mismatch: &ModalityNotSupportedError,
 ) {
     candidates.retain(|(provider, model)| {
-        !provider.eq_ignore_ascii_case(&mismatch.provider) && model == &mismatch.model
+        !provider.eq_ignore_ascii_case(&mismatch.provider) && same_model(model, &mismatch.model)
     });
+}
+
+/// Hosts name one model differently (`kimi-2.7-code` on Ollama,
+/// `@cf/moonshotai/kimi-k2.7-code` on Workers AI); octolib's reference id is
+/// what says two lane models are the same model.
+fn same_model(a: &str, b: &str) -> bool {
+    a == b || reference_model_id(a).is_some_and(|id| reference_model_id(b) == Some(id))
 }
 
 /// Keep the candidates whose provider guarantees a JSON schema's shape —
@@ -1781,6 +1789,31 @@ mod tests {
         retain_same_model_failover_candidates(&mut candidates, &mismatch);
 
         assert_eq!(candidates, vec![candidate("ollama", "vision-model")]);
+    }
+
+    #[test]
+    fn modality_failover_keeps_other_hosts_that_name_the_model_differently() {
+        let mut candidates = vec![
+            candidate("ollama", "kimi-2.7-code"),
+            candidate("cloudflare", "@cf/moonshotai/kimi-k2.7-code"),
+            candidate("together", "moonshotai/Kimi-K2.7-Code"),
+            candidate("together", "moonshotai/Kimi-K2.6"),
+        ];
+        let mismatch = ModalityNotSupportedError {
+            provider: "ollama".to_string(),
+            model: "kimi-2.7-code".to_string(),
+            modality: "video".to_string(),
+        };
+
+        retain_same_model_failover_candidates(&mut candidates, &mismatch);
+
+        assert_eq!(
+            candidates,
+            vec![
+                candidate("cloudflare", "@cf/moonshotai/kimi-k2.7-code"),
+                candidate("together", "moonshotai/Kimi-K2.7-Code"),
+            ]
+        );
     }
 
     #[test]
