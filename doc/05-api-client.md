@@ -34,8 +34,12 @@ Both endpoints share the **same engine, same storage, same auth, same
 metrics**. The completion `id` returned is the same DB row either way. The
 only difference is the wire format going in and coming out.
 
-> **Streaming:** `/v1/chat/completions` does not support `"stream": true`.
-> Requests with streaming enabled return `501 Not Implemented`.
+> **Streaming:** `/v1/chat/completions` accepts `"stream": true` and emits
+> buffered SSE with text and indexed tool-call deltas. The upstream call finishes
+> first; this is not upstream token streaming and does not reduce first-token latency.
+> Set `"stream_options": {"include_usage": true}` to receive a final usage-only
+> chunk (`choices: []`) before `[DONE]`. Other chunks have `usage: null` when
+> requested; without this option no usage chunk is emitted.
 
 All client responses include an `X-Request-Id` header
 (`src/main.rs:198`). Use it to correlate against server logs and
@@ -208,7 +212,8 @@ identical to `/v1/completions` — same engine, same DB row, same auth.
   "temperature": 1.0,      // optional, default 1.0
   "top_p": 1.0,            // optional, default 1.0
   "max_tokens": 512,       // optional, 0/null = provider default
-  "stream": false,         // optional — true returns 501
+  "stream": false,         // optional — true emits buffered SSE
+  "stream_options": {"include_usage": true}, // optional — usage-only final chunk
   "tools": [...],          // optional — classic nested-function shape
   "tool_choice": "auto"    // optional — accepted and ignored
 }

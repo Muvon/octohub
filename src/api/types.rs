@@ -445,15 +445,23 @@ pub struct ChatCompletionRequest {
     pub top_p: f32,
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    /// Streaming is not supported — callers that set this to true receive 501.
+    /// Buffered upstream responses are re-framed as SSE deltas.
     #[serde(default)]
     pub stream: bool,
+    #[serde(default)]
+    pub stream_options: Option<ChatStreamOptions>,
     #[serde(default)]
     pub tools: Option<Vec<ChatTool>>,
     /// Accepted and ignored — tool selection is left to the upstream provider.
     #[serde(default)]
     #[expect(dead_code, reason = "accepted from the wire and deliberately ignored")]
     pub tool_choice: Option<serde_json::Value>,
+}
+/// Options for the buffered chat SSE response.
+#[derive(Debug, Deserialize)]
+pub struct ChatStreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 /// A single message in the classic `messages` array.
@@ -828,6 +836,31 @@ impl From<CreateCompletionResponse> for ChatCompletionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_stream_options_parse_and_validate() {
+        for (options, expected) in [
+            ("", false),
+            (r#", "stream_options": null"#, false),
+            (r#", "stream_options": {}"#, false),
+            (r#", "stream_options": {"include_usage": false}"#, false),
+            (r#", "stream_options": {"include_usage": true}"#, true),
+        ] {
+            let json = format!(r#"{{"model":"test","messages":[],"stream":true{options}}}"#);
+            let req: ChatCompletionRequest = serde_json::from_str(&json).unwrap();
+            assert!(req.stream);
+            assert_eq!(
+                req.stream_options.as_ref().is_some_and(|o| o.include_usage),
+                expected
+            );
+            let converted: CreateCompletionRequest = req.into();
+            assert_eq!(converted.model, "test");
+        }
+        assert!(serde_json::from_str::<ChatCompletionRequest>(
+            r#"{"model":"test","messages":[],"stream_options":{"include_usage":"true"}}"#,
+        )
+        .is_err());
+    }
 
     #[test]
     fn test_deserialize_text_input() {

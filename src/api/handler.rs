@@ -577,6 +577,10 @@ pub async fn handle_chat_completion(
     // time-to-first-token is the same as non-streaming (see
     // `chat_completion_stream_body`).
     let stream = chat_req.stream;
+    let include_usage = chat_req
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
 
     // Convert to internal representation — same engine path as /v1/completions
     let model_label = chat_req.model.clone();
@@ -606,7 +610,7 @@ pub async fn handle_chat_completion(
 
             let chat_resp: ChatCompletionResponse = response.into();
             if stream {
-                let body = Bytes::from(chat_completion_stream_body(&chat_resp));
+                let body = Bytes::from(chat_completion_stream_body(&chat_resp, include_usage));
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "text/event-stream")
@@ -648,7 +652,7 @@ pub async fn handle_chat_completion(
 /// deltas the way a real stream would arrive, then a `[DONE]` sentinel. The
 /// concatenated `delta.content` of every chunk reassembles the exact original
 /// text.
-fn chat_completion_stream_body(resp: &ChatCompletionResponse) -> String {
+fn chat_completion_stream_body(resp: &ChatCompletionResponse, include_usage: bool) -> String {
     let choice = resp
         .choices
         .first()
@@ -659,7 +663,7 @@ fn chat_completion_stream_body(resp: &ChatCompletionResponse) -> String {
     let finish_reason = &choice.finish_reason;
 
     let base = |delta: serde_json::Value| {
-        serde_json::json!({
+        let mut chunk = serde_json::json!({
             "id": id,
             "object": "chat.completion.chunk",
             "created": created,
@@ -669,7 +673,11 @@ fn chat_completion_stream_body(resp: &ChatCompletionResponse) -> String {
                 "delta": delta,
                 "finish_reason": serde_json::Value::Null,
             }],
-        })
+        });
+        if include_usage {
+            chunk["usage"] = serde_json::Value::Null;
+        }
+        chunk
     };
 
     let mut out = String::new();
@@ -691,19 +699,34 @@ fn chat_completion_stream_body(resp: &ChatCompletionResponse) -> String {
             prev = word_end;
         }
     }
+    if let Some(tool_calls) = &choice.message.tool_calls {
+        for (index, call) in tool_calls.iter().enumerate() {
+            out.push_str(&sse_chunk(base(serde_json::json!({
+                "tool_calls": [{
+                    "index": index,
+                    "id": call.id,
+                    "type": call.call_type,
+                    "function": call.function,
+                }],
+            }))));
+        }
+    }
 
     // Terminal chunk: empty delta carrying the finish reason.
-    out.push_str(&sse_chunk(serde_json::json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": serde_json::json!({}),
-            "finish_reason": finish_reason,
-        }],
-    })));
+    let mut terminal = base(serde_json::json!({}));
+    terminal["choices"][0]["finish_reason"] = serde_json::json!(finish_reason);
+    out.push_str(&sse_chunk(terminal));
+
+    if include_usage {
+        out.push_str(&sse_chunk(serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": resp.usage,
+        })));
+    }
 
     out.push_str("data: [DONE]\n\n");
     out
@@ -1272,7 +1295,42 @@ mod tests {
             },
         };
 
-        let body = chat_completion_stream_body(&resp);
+        for include_usage in [false, true] {
+            let body = chat_completion_stream_body(&resp, include_usage);
+            assert!(body.ends_with("data: [DONE]\n\n"));
+            let chunks: Vec<serde_json::Value> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect();
+            if include_usage {
+                let usage_chunk = chunks.last().unwrap();
+                assert_eq!(usage_chunk["choices"], serde_json::json!([]));
+                assert_eq!(
+                    usage_chunk["usage"],
+                    serde_json::to_value(&resp.usage).unwrap()
+                );
+                assert_eq!(usage_chunk["id"], resp.id);
+                assert_eq!(usage_chunk["model"], resp.model);
+                assert_eq!(usage_chunk["created"], resp.created);
+                assert_eq!(usage_chunk["object"], "chat.completion.chunk");
+                for chunk in &chunks[..chunks.len() - 1] {
+                    assert_eq!(chunk.get("usage"), Some(&serde_json::Value::Null));
+                }
+                assert_eq!(
+                    chunks[chunks.len() - 2]["choices"][0]["finish_reason"],
+                    "stop"
+                );
+            } else {
+                assert!(chunks.iter().all(|chunk| chunk.get("usage").is_none()));
+                assert_eq!(
+                    chunks.last().unwrap()["choices"][0]["finish_reason"],
+                    "stop"
+                );
+            }
+        }
+        let body = chat_completion_stream_body(&resp, false);
 
         // Terminates with the [DONE] sentinel.
         assert!(body.ends_with("data: [DONE]\n\n"), "body: {body}");
@@ -1292,6 +1350,93 @@ mod tests {
             }
         }
         assert_eq!(reassembled, "Hello, world!  This is a test.");
+    }
+    #[test]
+    fn stream_body_preserves_single_and_multiple_tool_calls() {
+        for count in [1, 2] {
+            for content in [None, Some("Calling tools now. 世界".to_string())] {
+                let calls = (0..count)
+                    .map(|index| crate::api::types::ChatToolCall {
+                        id: format!("call_{index}"),
+                        call_type: "function".to_string(),
+                        function: crate::api::types::ChatToolCallFunction {
+                            name: format!("weather_{index}"),
+                            arguments: format!(r#"{{"city":"Oslo 世界","day":{index}}}"#),
+                        },
+                    })
+                    .collect();
+                let resp = ChatCompletionResponse {
+                    id: "chatcmpl-tools".to_string(),
+                    object: "chat.completion",
+                    created: 1_700_000_000,
+                    model: "gpt-test".to_string(),
+                    choices: vec![ChatChoice {
+                        index: 0,
+                        message: ChatResponseMessage {
+                            role: "assistant",
+                            content: content.clone(),
+                            tool_calls: Some(calls),
+                        },
+                        finish_reason: "tool_calls".to_string(),
+                    }],
+                    usage: ChatUsage {
+                        prompt_tokens: 3,
+                        completion_tokens: 7,
+                        total_tokens: 10,
+                    },
+                };
+                let body = chat_completion_stream_body(&resp, false);
+                assert!(body.ends_with("data: [DONE]\n\n"));
+                let chunks: Vec<serde_json::Value> = body
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+                let mut reassembled = vec![serde_json::json!({}); count];
+                let mut text = String::new();
+                for chunk in &chunks {
+                    assert_eq!(chunk["id"], resp.id);
+                    assert_eq!(chunk["model"], resp.model);
+                    assert_eq!(chunk["object"], "chat.completion.chunk");
+                    let delta = &chunk["choices"][0]["delta"];
+                    if let Some(part) = delta["content"].as_str() {
+                        text.push_str(part);
+                    }
+                    if let Some(calls) = delta["tool_calls"].as_array() {
+                        for call in calls {
+                            let index = call["index"].as_u64().unwrap() as usize;
+                            let target = &mut reassembled[index];
+                            for key in ["id", "type"] {
+                                if let Some(value) = call.get(key) {
+                                    target[key] = value.clone();
+                                }
+                            }
+                            if let Some(name) = call["function"].get("name") {
+                                target["function"]["name"] = name.clone();
+                            }
+                            let mut arguments = target["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string();
+                            arguments.push_str(call["function"]["arguments"].as_str().unwrap());
+                            target["function"]["arguments"] = arguments.into();
+                        }
+                    }
+                }
+                assert_eq!(text, content.unwrap_or_default());
+                assert_eq!(
+                    serde_json::to_value(reassembled).unwrap(),
+                    serde_json::to_value(resp.choices[0].message.tool_calls.as_ref().unwrap())
+                        .unwrap()
+                );
+                assert_eq!(
+                    chunks.last().unwrap()["choices"][0]["finish_reason"],
+                    "tool_calls"
+                );
+            }
+        }
     }
 
     #[test]

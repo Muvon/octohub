@@ -57,7 +57,7 @@ OctoHub exposes two completion APIs. Use whichever fits your client:
 
 Both completion endpoints hit the **same proxy engine** and write to the **same `completions` table** with the same `id`, auth, metrics, and logging. The only difference is the wire format.
 
-> **Note:** `POST /v1/chat/completions` does not support streaming (`"stream": true`). Requests with streaming enabled receive `501 Not Implemented`.
+> **Note:** `POST /v1/chat/completions` supports `"stream": true` as buffered SSE: the upstream call completes before text and indexed tool-call deltas are emitted. This does not provide upstream token streaming or earlier first-token delivery. Set `"stream_options": {"include_usage": true}` to receive a final usage-only chunk with empty `choices` before `[DONE]`; other chunks have `usage: null` when requested.
 
 ---
 
@@ -347,7 +347,8 @@ Classic OpenAI Chat Completions API. Compatible with any OpenAI-compatible clien
 | `temperature` | float | — | `1.0` | Sampling temperature. |
 | `top_p` | float | — | `1.0` | Nucleus sampling. |
 | `max_tokens` | integer | — | provider default | Maximum output tokens. |
-| `stream` | bool | — | `false` | Streaming is **not supported** — `true` returns `501`. |
+| `stream` | bool | — | `false` | Emit buffered SSE text/tool-call deltas; upstream completes first. |
+| `stream_options` | object | — | `null` | `include_usage: true` adds a final usage-only chunk before `[DONE]`; only applies with `stream: true`. |
 | `tools` | array | — | `null` | Classic tool definitions (nested `function` object). |
 | `tool_choice` | any | — | `null` | Accepted and ignored — provider decides. |
 

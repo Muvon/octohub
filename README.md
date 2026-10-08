@@ -92,6 +92,9 @@ cargo build --release
 
 - **One endpoint, many providers** — OpenAI-style `POST /v1/completions`,
   `/v1/chat/completions`, `/v1/embeddings`, and `/v1/evaluations` routed to 20+ upstream providers
+- **Buffered chat SSE** — text and tool-call deltas with `stream: true`, plus
+  opt-in usage via `stream_options.include_usage`; upstream completes before SSE
+  delivery ([docs](doc/05-api-client.md))
 - **Media generation** — `/v1/images/generations`, `/v1/videos`,
   `/v1/audio/speech` and `/v1/audio/transcriptions` across ElevenLabs, fal,
   OpenRouter, Replicate and Runway, with durable resumable jobs and per-request
