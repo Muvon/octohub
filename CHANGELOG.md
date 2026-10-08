@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.0] - 2026-10-08
+
+### 📋 Release Summary
+
+Chat streams now support usage information and tool calls.
+
+### ✨ New Features & Enhancements
+
+- **api**: support usage and tool calls in chat streams `c46f4e48`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update locked dependency versions `767344fb`
+
 ## [0.9.6] - 2026-10-06
 
 ### 📋 Release Summary
