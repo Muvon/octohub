@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.1] - 2026-10-10
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update locked dependency versions `f4717aef`
+
 ## [0.10.0] - 2026-10-08
 
 ### 📋 Release Summary
