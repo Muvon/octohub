@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.2] - 2026-10-13
+
+### 📋 Release Summary
+
+Provider failover now correctly classifies failures that are not HTTP 400 errors.
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update locked dependency versions `f56486fc`
+
+### 🐛 Bug Fixes & Stability
+
+- **proxy**: classify non-400 failures for provider failover `3b1bb94d`
+
 ## [0.10.1] - 2026-10-10
 
 ### 🔧 Improvements & Optimizations
