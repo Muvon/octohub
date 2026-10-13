@@ -70,7 +70,7 @@ Defined in `src/config.rs:83`. All keys optional except as noted.
 | `provider_queue_timeout_secs` | `60` | Maximum wait for a provider concurrency permit. Exceeding it returns `503`. |
 | `owner_queue_timeout_secs` | `30` | Maximum wait for a slot in the key owner's shared budget (`owner_concurrency`). Exceeding it returns `429`. `0` = never queue. |
 | `upstream_timeout_secs` | `360` | Maximum duration of the complete provider operation, including octolib retries. Exceeding it returns `504`. |
-| `failover_on_error` | `false` | Re-route provider-side failures (timeout, connect, 429, 5xx) to the next candidate provider of the model alias. 4xx never fails over. |
+| `failover_on_error` | `false` | Re-route provider-side failures (timeout, connect, 401/403 key or billing rejection, 404, 429, 5xx) to the next candidate provider of the model alias. A 400 never fails over. |
 | `provider_error_cooldown_secs` | `0` | After 3 consecutive provider-side failures, deprioritize the provider for this many seconds (used only when no healthy candidate admits). `0` = off. |
 
 The legacy alias `db_path` is also accepted and treated as `db_url`

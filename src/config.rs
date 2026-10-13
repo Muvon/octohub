@@ -212,9 +212,9 @@ pub struct ServerConfig {
     #[serde(default = "default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
     /// Retry the request on the next candidate provider when an upstream
-    /// call fails with a provider-side error (timeout, connect, 429, 5xx).
-    /// Only kicks in when the model alias has another candidate left; the
-    /// request's own errors (4xx) always go straight back to the client.
+    /// call fails with a provider-side error (timeout, connect, 401/403/404,
+    /// 429, 5xx). Only kicks in when the model alias has another candidate
+    /// left; a 400 is the request's own error and goes straight back.
     #[serde(default)]
     pub failover_on_error: bool,
     /// After 3 consecutive provider-side failures, deprioritize the provider

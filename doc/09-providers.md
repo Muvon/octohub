@@ -203,10 +203,11 @@ and Anthropic splits input/output limits (ITPM/OTPM) — set
 ### Failover and cooldown (`[server]` knobs, both off by default)
 
 - `failover_on_error = true` — when an upstream call fails with a
-  **provider-side** error (upstream timeout, connect failure, 429, 5xx),
-  the request is re-sent to the next admitted candidate instead of
-  surfacing the error. Embedded 4xx (context overflow, bad request)
-  never fails over — every provider would reject it the same way. Each
+  **provider-side** error (upstream timeout, connect failure, 401/403 key
+  or billing rejection, 404 model gone, 429, 5xx), the request is re-sent
+  to the next admitted candidate instead of surfacing the error. An
+  embedded 400 (context overflow, bad request) never fails over — every
+  provider would reject it the same way. Each
   failover re-sends the full request and is counted in
   `octohub_provider_failovers_total{provider}` (labeled with the
   provider that FAILED).

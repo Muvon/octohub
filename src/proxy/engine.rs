@@ -138,32 +138,25 @@ pub(crate) fn upstream_status_code(msg: &str) -> Option<u16> {
 }
 
 /// Whether a dispatch failure is the PROVIDER's fault (worth failing over
-/// and counting toward its cooldown) rather than the request's. Provider
-/// faults: upstream deadline, 429/5xx, and errors with no embedded status
-/// (connect/transport/unavailable provider). NOT provider faults: our own
-/// queue timeout (capacity is our problem) and embedded 4xx — every
-/// provider would reject that request the same way.
+/// and counting toward its cooldown) rather than the request's. Only a 400 /
+/// invalid-request rejects the request itself — every lane would refuse it the
+/// same way. Every other upstream status says THIS lane cannot serve right now:
+/// 401/403 (key revoked, billing past due), 404 (model gone from the host),
+/// 429, 5xx, plus upstream deadlines and errors with no embedded status
+/// (connect/transport/unavailable provider). Our own queue timeout is a local
+/// capacity failure, never the provider's.
 pub(crate) fn is_provider_fault(error: &anyhow::Error) -> bool {
     match error.downcast_ref::<ProxyTimeoutError>() {
         Some(ProxyTimeoutError::Upstream { .. }) => true,
         Some(ProxyTimeoutError::ProviderQueue { .. }) => false,
         None => {
             if let Some(evaluation) = evaluation_error(error) {
-                // A missing key is this lane's deployment gap, not the
-                // request's — the same unkeyed error fails over on LLM lanes.
-                return match evaluation {
-                    EvaluationError::RateLimit { .. }
-                    | EvaluationError::Transport(_)
-                    | EvaluationError::InvalidResponse { .. }
-                    | EvaluationError::MissingApiKey(_) => true,
-                    EvaluationError::Api { status, .. } => *status == 529 || *status >= 500,
-                    _ => false,
-                };
+                return !matches!(
+                    evaluation,
+                    EvaluationError::InvalidRequest(_) | EvaluationError::Api { status: 400, .. }
+                );
             }
-            match upstream_status_code(&format!("{:#}", error)) {
-                Some(code) => code == 429 || code >= 500,
-                None => true,
-            }
+            upstream_status_code(&format!("{:#}", error)) != Some(400)
         }
     }
 }
@@ -1905,11 +1898,19 @@ mod tests {
         let rejected = anyhow!(EvaluationError::InvalidRequest("bad question".into()));
         assert!(!is_provider_fault(&rejected));
 
+        let bad_request = anyhow!(EvaluationError::Api {
+            provider: "typesafe".into(),
+            status: 400,
+            message: "bad question".into(),
+        });
+        assert!(!is_provider_fault(&bad_request));
+
+        // A revoked key is this lane's problem; the next lane may be keyed.
         let unauthenticated = anyhow!(EvaluationError::Authentication {
             provider: "typesafe".into(),
             message: "bad key".into(),
         });
-        assert!(!is_provider_fault(&unauthenticated));
+        assert!(is_provider_fault(&unauthenticated));
 
         // An unkeyed lane must not block the keyed one behind it.
         let unkeyed = anyhow!(EvaluationError::MissingApiKey("TYPESAFE_API_KEY".into()));
@@ -1942,8 +1943,20 @@ mod tests {
         let client_400 = anyhow::anyhow!("ollama API error 400 Bad Request: prompt too long");
         assert!(
             !is_provider_fault(&client_400),
-            "4xx is the request's fault — every provider rejects it"
+            "400 is the request's fault — every provider rejects it"
         );
+
+        let past_due = anyhow::anyhow!(
+            "Provider 'ollama' chat_completion failed: ollama API error 403 Forbidden: \
+             your subscription payment is past due"
+        );
+        assert!(
+            is_provider_fault(&past_due),
+            "a lane's billing/auth rejection must fail over and cool the lane"
+        );
+
+        let model_gone = anyhow::anyhow!("together API error 404 Not Found: model not found");
+        assert!(is_provider_fault(&model_gone));
 
         let connect_error = anyhow::anyhow!("connection refused");
         assert!(
