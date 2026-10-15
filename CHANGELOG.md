@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.5] - 2026-10-15
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib to 0.42.1 `5d350f10`
+
 ## [0.10.4] - 2026-10-15
 
 ### 🔧 Improvements & Optimizations
