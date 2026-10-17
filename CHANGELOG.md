@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.6] - 2026-10-17
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update locked dependency versions `801a6697`
+
 ## [0.10.5] - 2026-10-15
 
 ### 🔧 Improvements & Optimizations
