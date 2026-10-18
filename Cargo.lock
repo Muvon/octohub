@@ -1676,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "octohub"
-version = "0.10.7"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

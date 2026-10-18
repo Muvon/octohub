@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.11.0] - 2026-10-18
+
+### 📋 Release Summary
+
+A model discovery endpoint is now available through the API.
+
+### ✨ New Features & Enhancements
+
+- **api**: expose model discovery endpoint `a3c120e1`
+
+### 🔧 Improvements & Optimizations
+
+- **release**: inherit secrets in release workflow `765fa9bc`
+
 ## [0.10.7] - 2026-10-17
 
 ### 🔄 Other Changes
