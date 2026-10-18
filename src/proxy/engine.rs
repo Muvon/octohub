@@ -195,6 +195,8 @@ pub struct EvaluationOutcome {
 /// at startup.
 pub struct ProxyEngine {
     pub(crate) storage: Arc<dyn Storage>,
+    /// Startup config load time stays fixed even when SIGHUP replaces the model map.
+    pub(crate) config_loaded_at: u64,
     config: crate::Live<Config>,
     limiter: crate::Live<ProviderLimiter>,
     /// Per-owner in-flight budgets (keys sharing `ApiKey::owner`). Plain Arc,
@@ -215,9 +217,11 @@ impl ProxyEngine {
         storage: Arc<dyn Storage>,
         config: crate::Live<Config>,
         limiter: crate::Live<ProviderLimiter>,
+        config_loaded_at: u64,
     ) -> Self {
         Self {
             storage,
+            config_loaded_at,
             config,
             limiter,
             owner_limiter: Arc::new(OwnerLimiter::new()),
@@ -1518,9 +1522,11 @@ fn same_model(a: &str, b: &str) -> bool {
 /// Keep the candidates whose provider guarantees a JSON schema's shape —
 /// octolib's `enforces_response_schema` is the single source of that fact.
 fn retain_schema_enforcing_candidates(candidates: &mut Vec<(String, String)>) {
-    candidates.retain(|(provider, model)| {
-        ProviderFactory::create_provider(provider).is_ok_and(|p| p.enforces_response_schema(model))
-    });
+    candidates.retain(|(provider, model)| enforces_response_schema(provider, model));
+}
+
+pub(crate) fn enforces_response_schema(provider: &str, model: &str) -> bool {
+    ProviderFactory::create_provider(provider).is_ok_and(|p| p.enforces_response_schema(model))
 }
 
 /// Pick the first candidate whose provider rate windows admit a request

@@ -8,11 +8,11 @@ use crate::api::types::{
     ChatCompletionRequest, ChatCompletionResponse, CreateCompletionRequest, CreateEmbeddingRequest,
     CreateEvaluationRequest,
 };
-use crate::auth::{authenticate_client, ClientAuth};
+use crate::auth::{authenticate_admin, authenticate_client, ClientAuth};
 use crate::proxy::engine::{
-    evaluation_error, upstream_status_code, ModalityNotSupportedError, ProxyEngine,
-    ProxyTimeoutError, RateLimitedError, SchemaNotEnforcedError, MODEL_FORBIDDEN_MARKER,
-    OWNER_LIMIT_MARKER,
+    enforces_response_schema, evaluation_error, upstream_status_code, ModalityNotSupportedError,
+    ProxyEngine, ProxyTimeoutError, RateLimitedError, SchemaNotEnforcedError,
+    MODEL_FORBIDDEN_MARKER, OWNER_LIMIT_MARKER,
 };
 use crate::storage::Storage;
 use octolib::evaluation::EvaluationError;
@@ -95,7 +95,7 @@ fn engine_error_response(
 }
 
 /// Extract Authorization header value from request
-fn auth_header(req: &Request<hyper::body::Incoming>) -> Option<String> {
+fn auth_header<B>(req: &Request<B>) -> Option<String> {
     req.headers()
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -761,8 +761,8 @@ fn sse_chunk(value: serde_json::Value) -> String {
 // ── Media ──
 
 /// Authenticate a media request, returning the key or the ready-made 401.
-async fn media_auth(
-    req: &Request<hyper::body::Incoming>,
+async fn media_auth<B>(
+    req: &Request<B>,
     storage: Arc<dyn Storage>,
 ) -> Result<crate::storage::ApiKey, Box<Response<BoxBody>>> {
     let header = auth_header(req);
@@ -1084,6 +1084,63 @@ pub async fn handle_media_cancel(
     }
 }
 
+/// GET /v1/models — OpenAI model list; `supported_parameters` carries
+/// "structured_outputs" when a lane enforces JSON schemas (OpenRouter's convention).
+pub async fn handle_models<B>(
+    req: Request<B>,
+    engine: Arc<ProxyEngine>,
+    storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+    let config = engine.config();
+    let api_key = if authenticate_admin(auth_header(&req).as_deref(), &config.server.api_key) {
+        None
+    } else {
+        match media_auth(&req, storage).await {
+            Ok(key) => Some(key),
+            Err(response) => return *response,
+        }
+    };
+    let mut ids: Vec<_> = config
+        .models
+        .keys()
+        .filter(|id| api_key.as_ref().is_none_or(|key| key.is_model_allowed(id)))
+        .collect();
+    ids.sort();
+
+    let mut data = Vec::with_capacity(ids.len());
+    for id in ids {
+        let candidates = match config.model_candidates(id) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::error!(model = id, error = %error, "model discovery failed");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid model configuration",
+                );
+            }
+        };
+        let supported_parameters = if candidates
+            .iter()
+            .any(|(provider, model)| enforces_response_schema(provider, model))
+        {
+            vec!["structured_outputs"]
+        } else {
+            vec![]
+        };
+        data.push(serde_json::json!({
+            "id": id,
+            "object": "model",
+            "created": engine.config_loaded_at,
+            "owned_by": "octohub",
+            "supported_parameters": supported_parameters,
+        }));
+    }
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({"object": "list", "data": data}),
+    )
+}
+
 /// GET /v1/media/models — capability and pricing discovery.
 pub async fn handle_media_models(
     req: Request<hyper::body::Incoming>,
@@ -1100,7 +1157,188 @@ pub async fn handle_media_models(
 mod tests {
     use super::*;
     use crate::api::types::{ChatChoice, ChatResponseMessage, ChatUsage};
+    use crate::config::Config;
+    use crate::proxy::limiter::ProviderLimiter;
+    use crate::storage::sqlite::SqliteStorage;
     use anyhow::Context;
+    use std::sync::RwLock;
+
+    fn models_engine() -> (Arc<ProxyEngine>, crate::Live<Config>) {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            api_key = "master-secret"
+            [models]
+            qwen = ["zai:glm-5.3-flash", "alibaba:qwen3.8-flash"]
+            glm = ["zai:glm-5.3-flash", "ollama:glm-5.3-flash"]
+            [embedding_models]
+            embedding = ["openai:text-embedding-3-small"]
+            [media_models]
+            image = ["openai:gpt-image-1"]
+            [evaluation_models]
+            judge = ["typesafe:jev"]
+            [auto]
+            default = "qwen"
+            "#,
+        )
+        .unwrap();
+        let limiter = Arc::new(RwLock::new(Arc::new(ProviderLimiter::from_config(&config))));
+        let config = Arc::new(RwLock::new(Arc::new(config)));
+        let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+        (
+            Arc::new(ProxyEngine::new(
+                storage,
+                config.clone(),
+                limiter,
+                1_720_000_000,
+            )),
+            config,
+        )
+    }
+
+    fn models_request(auth: Option<&str>) -> Request<()> {
+        let mut request = Request::builder().uri("/v1/models");
+        if let Some(auth) = auth {
+            request = request.header("Authorization", auth);
+        }
+        request.body(()).unwrap()
+    }
+
+    async fn response_json(response: Response<BoxBody>) -> serde_json::Value {
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn models_list_has_openai_shape_and_shared_schema_capabilities() {
+        let (engine, _) = models_engine();
+        let key = engine
+            .storage
+            .create_api_key("unrestricted", None, None, None)
+            .unwrap();
+        let response = handle_models(
+            models_request(Some(&format!("Bearer {}", key.key))),
+            engine.clone(),
+            engine.storage.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["Content-Type"], "application/json");
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "glm", "object": "model", "created": 1_720_000_000,
+                     "owned_by": "octohub", "supported_parameters": []},
+                    {"id": "qwen", "object": "model", "created": 1_720_000_000,
+                     "owned_by": "octohub", "supported_parameters": ["structured_outputs"]}
+                ]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn models_list_filters_by_exact_requested_alias() {
+        let (engine, _) = models_engine();
+        for (allowed, expected) in [
+            (None, vec!["glm", "qwen"]),
+            (Some(vec![]), vec![]),
+            (Some(vec!["qwen".to_string()]), vec!["qwen"]),
+            (
+                Some(vec![
+                    "QWEN".to_string(),
+                    "alibaba:qwen3.8-flash".to_string(),
+                    "auto".to_string(),
+                ]),
+                vec![],
+            ),
+        ] {
+            let key = engine
+                .storage
+                .create_api_key("scoped", allowed.as_deref(), None, None)
+                .unwrap();
+            let response = handle_models(
+                models_request(Some(&format!("Bearer {}", key.key))),
+                engine.clone(),
+                engine.storage.clone(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            let ids: Vec<_> = body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|model| model["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn models_list_accepts_master_key_without_a_client_key() {
+        let (engine, _) = models_engine();
+        let response = handle_models(
+            models_request(Some("Bearer master-secret")),
+            engine.clone(),
+            engine.storage.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["data"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"][0]["id"], "glm");
+        assert_eq!(body["data"][1]["id"], "qwen");
+    }
+
+    #[tokio::test]
+    async fn models_list_preserves_media_auth_failures() {
+        let (engine, _) = models_engine();
+        let key = engine
+            .storage
+            .create_api_key("revoked", None, None, None)
+            .unwrap();
+        engine.storage.revoke_api_key(key.id).unwrap();
+        let revoked = format!("Bearer {}", key.key);
+        for auth in [
+            None,
+            Some("Basic token"),
+            Some("Bearer wrong"),
+            Some(&revoked),
+        ] {
+            let expected = media_auth(&models_request(auth), engine.storage.clone())
+                .await
+                .err()
+                .unwrap();
+            let response =
+                handle_models(models_request(auth), engine.clone(), engine.storage.clone()).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response_json(response).await,
+                response_json(*expected).await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn models_list_uses_reloaded_faces_with_the_startup_timestamp() {
+        let (engine, config) = models_engine();
+        let mut reloaded = (*engine.config()).clone();
+        reloaded.models.remove("glm");
+        *config.write().unwrap() = Arc::new(reloaded);
+        for _ in 0..2 {
+            let response = handle_models(
+                models_request(Some("Bearer master-secret")),
+                engine.clone(),
+                engine.storage.clone(),
+            )
+            .await;
+            let body = response_json(response).await;
+            assert_eq!(body["data"].as_array().unwrap().len(), 1);
+            assert_eq!(body["data"][0]["id"], "qwen");
+            assert_eq!(body["data"][0]["created"], 1_720_000_000);
+        }
+    }
 
     #[test]
     fn queue_timeout_maps_to_service_unavailable() {

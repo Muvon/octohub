@@ -10,7 +10,7 @@ mod storage;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -67,6 +67,10 @@ fn load_config(path: Option<String>, bind: Option<&str>) -> anyhow::Result<Confi
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = load_config(args.config.clone(), args.bind.as_deref())?;
+    let config_loaded_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System clock is before the Unix epoch")?
+        .as_secs();
 
     // OpenRouter attribution: octolib defaults X-Title to "octolib" unless
     // these are set, and upstream calls run in this process (not the client's).
@@ -148,7 +152,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize proxy engine
-    let engine = Arc::new(ProxyEngine::new(storage.clone(), config_live, limiter_live));
+    let engine = Arc::new(ProxyEngine::new(
+        storage.clone(),
+        config_live,
+        limiter_live,
+        config_loaded_at,
+    ));
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
     let listener = TcpListener::bind(addr).await?;
@@ -253,6 +262,8 @@ fn classify_route(path: &str) -> &'static str {
         "/v1/audio/speech"
     } else if path == "/v1/audio/transcriptions" {
         "/v1/audio/transcriptions"
+    } else if path == "/v1/models" {
+        "/v1/models"
     } else if path == "/v1/media/models" {
         "/v1/media/models"
     } else if path.starts_with("/v1/media/") {
@@ -377,6 +388,7 @@ async fn route(
             (Method::POST, "/v1/audio/transcriptions") => {
                 api::handler::handle_transcription(req, engine, storage).await
             }
+            (Method::GET, "/v1/models") => api::handler::handle_models(req, engine, storage).await,
             (Method::GET, "/v1/media/models") => {
                 api::handler::handle_media_models(req, engine, storage).await
             }

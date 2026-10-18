@@ -156,6 +156,7 @@ Two independent layers:
 |---|---|---|
 | **Client** | `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`, `/v1/evaluations`, `/v1/images/generations`, `/v1/videos`, `/v1/audio/*`, `/v1/media/*` | Keys from the `api_keys` DB table |
 | **Admin** | `/v1/admin/*` | Master key from `octohub.toml` |
+| **Discovery** | `GET /v1/models` (OpenAI list with `supported_parameters`, sorted by ID) | Client key for allowed models; master key for all configured LLM faces |
 
 Details: [doc/04 — Authentication](doc/04-authentication.md).
 
