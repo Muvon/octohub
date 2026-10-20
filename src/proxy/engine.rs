@@ -9,9 +9,9 @@ use crate::api::types::{CreateEvaluationRequest, CreateEvaluationResponse};
 use crate::storage::StoredEvaluation;
 use octolib::llm::reference_models::reference_model_id;
 use octolib::llm::{
-    chat_completion_enforced, ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData,
-    Message, OutputFormat, ProviderFactory, ReasoningEffort, ResponseMode, SourceType,
-    StructuredOutputRequest, ThinkingBlock, VideoAttachment, VideoData,
+	chat_completion_enforced, ChatCompletionParams, FunctionDefinition, ImageAttachment, ImageData, Message,
+	OutputFormat, ProviderFactory, ReasoningEffort, ResponseMode, SourceType, StructuredOutputRequest, ThinkingBlock,
+	VideoAttachment, VideoData,
 };
 use uuid::Uuid;
 
@@ -28,33 +28,33 @@ pub const OWNER_LIMIT_MARKER: &str = "owner_concurrency_exhausted";
 
 #[derive(Debug)]
 pub enum ProxyTimeoutError {
-    ProviderQueue {
-        provider: String,
-        timeout: std::time::Duration,
-    },
-    Upstream {
-        provider: String,
-        timeout: std::time::Duration,
-    },
+	ProviderQueue {
+		provider: String,
+		timeout: std::time::Duration,
+	},
+	Upstream {
+		provider: String,
+		timeout: std::time::Duration,
+	},
 }
 
 impl std::fmt::Display for ProxyTimeoutError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ProviderQueue { provider, timeout } => write!(
-                f,
-                "timed out after {}s waiting for provider '{}' capacity",
-                timeout.as_secs(),
-                provider
-            ),
-            Self::Upstream { provider, timeout } => write!(
-                f,
-                "provider '{}' exceeded the {}s operation deadline",
-                provider,
-                timeout.as_secs()
-            ),
-        }
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::ProviderQueue { provider, timeout } => write!(
+				f,
+				"timed out after {}s waiting for provider '{}' capacity",
+				timeout.as_secs(),
+				provider
+			),
+			Self::Upstream { provider, timeout } => write!(
+				f,
+				"provider '{}' exceeded the {}s operation deadline",
+				provider,
+				timeout.as_secs()
+			),
+		}
+	}
 }
 
 impl std::error::Error for ProxyTimeoutError {}
@@ -64,19 +64,19 @@ impl std::error::Error for ProxyTimeoutError {}
 /// `retry_after` — the soonest any candidate's window frees up.
 #[derive(Debug)]
 pub struct RateLimitedError {
-    pub model: String,
-    pub retry_after: std::time::Duration,
+	pub model: String,
+	pub retry_after: std::time::Duration,
 }
 
 impl std::fmt::Display for RateLimitedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "rate limit reached for model '{}' on all providers — retry in {}s",
-            self.model,
-            self.retry_after.as_secs().max(1)
-        )
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"rate limit reached for model '{}' on all providers — retry in {}s",
+			self.model,
+			self.retry_after.as_secs().max(1)
+		)
+	}
 }
 
 impl std::error::Error for RateLimitedError {}
@@ -87,19 +87,19 @@ impl std::error::Error for RateLimitedError {}
 /// health penalties or cooldowns.
 #[derive(Debug)]
 pub struct ModalityNotSupportedError {
-    pub provider: String,
-    pub model: String,
-    pub modality: String,
+	pub provider: String,
+	pub model: String,
+	pub modality: String,
 }
 
 impl std::fmt::Display for ModalityNotSupportedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Provider '{}' model '{}' does not support {} attachments",
-            self.provider, self.model, self.modality
-        )
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"Provider '{}' model '{}' does not support {} attachments",
+			self.provider, self.model, self.modality
+		)
+	}
 }
 
 impl std::error::Error for ModalityNotSupportedError {}
@@ -109,17 +109,13 @@ impl std::error::Error for ModalityNotSupportedError {}
 /// filtered out before any upstream call.
 #[derive(Debug)]
 pub struct SchemaNotEnforcedError {
-    pub model: String,
+	pub model: String,
 }
 
 impl std::fmt::Display for SchemaNotEnforcedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "no provider for model '{}' enforces a JSON schema",
-            self.model
-        )
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "no provider for model '{}' enforces a JSON schema", self.model)
+	}
 }
 
 impl std::error::Error for SchemaNotEnforcedError {}
@@ -128,13 +124,10 @@ impl std::error::Error for SchemaNotEnforcedError {}
 /// octolib formats provider failures as "... API error <code> <message>", e.g.
 /// "ollama API error 400 Bad Request: ...". Returns the first such code, if any.
 pub(crate) fn upstream_status_code(msg: &str) -> Option<u16> {
-    const MARKER: &str = "API error ";
-    let start = msg.find(MARKER)? + MARKER.len();
-    let digits: String = msg[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
+	const MARKER: &str = "API error ";
+	let start = msg.find(MARKER)? + MARKER.len();
+	let digits: String = msg[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+	digits.parse().ok()
 }
 
 /// Whether a dispatch failure is the PROVIDER's fault (worth failing over
@@ -146,26 +139,26 @@ pub(crate) fn upstream_status_code(msg: &str) -> Option<u16> {
 /// (connect/transport/unavailable provider). Our own queue timeout is a local
 /// capacity failure, never the provider's.
 pub(crate) fn is_provider_fault(error: &anyhow::Error) -> bool {
-    match error.downcast_ref::<ProxyTimeoutError>() {
-        Some(ProxyTimeoutError::Upstream { .. }) => true,
-        Some(ProxyTimeoutError::ProviderQueue { .. }) => false,
-        None => {
-            if let Some(evaluation) = evaluation_error(error) {
-                return !matches!(
-                    evaluation,
-                    EvaluationError::InvalidRequest(_) | EvaluationError::Api { status: 400, .. }
-                );
-            }
-            upstream_status_code(&format!("{:#}", error)) != Some(400)
-        }
-    }
+	match error.downcast_ref::<ProxyTimeoutError>() {
+		Some(ProxyTimeoutError::Upstream { .. }) => true,
+		Some(ProxyTimeoutError::ProviderQueue { .. }) => false,
+		None => {
+			if let Some(evaluation) = evaluation_error(error) {
+				return !matches!(
+					evaluation,
+					EvaluationError::InvalidRequest(_) | EvaluationError::Api { status: 400, .. }
+				);
+			}
+			upstream_status_code(&format!("{:#}", error)) != Some(400)
+		}
+	}
 }
 
 /// The typed octolib evaluation error inside an anyhow chain, if any. The
 /// evaluation adapters keep their errors typed instead of embedding "API
 /// error <code>" text, so classification reads the variant.
 pub(crate) fn evaluation_error(error: &anyhow::Error) -> Option<&EvaluationError> {
-    error.chain().find_map(|cause| cause.downcast_ref())
+	error.chain().find_map(|cause| cause.downcast_ref())
 }
 
 /// Result of `process_embedding`. Carries telemetry alongside the response so
@@ -173,19 +166,19 @@ pub(crate) fn evaluation_error(error: &anyhow::Error) -> Option<&EvaluationError
 /// provider name and the approximate input token count — neither of which is
 /// part of the user-facing response struct.
 pub struct EmbeddingOutcome {
-    pub response: CreateEmbeddingResponse,
-    pub provider: String,
-    pub upstream_duration: std::time::Duration,
-    pub input_tokens: u64,
+	pub response: CreateEmbeddingResponse,
+	pub provider: String,
+	pub upstream_duration: std::time::Duration,
+	pub input_tokens: u64,
 }
 
 /// Result of `process_evaluation`, mirroring [`EmbeddingOutcome`].
 pub struct EvaluationOutcome {
-    pub response: CreateEvaluationResponse,
-    pub provider: String,
-    pub upstream_duration: std::time::Duration,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+	pub response: CreateEvaluationResponse,
+	pub provider: String,
+	pub upstream_duration: std::time::Duration,
+	pub input_tokens: u64,
+	pub output_tokens: u64,
 }
 
 /// Core proxy engine that processes requests through octolib providers.
@@ -194,1068 +187,1024 @@ pub struct EvaluationOutcome {
 /// `main`), so each request reads a fresh snapshot instead of a value frozen
 /// at startup.
 pub struct ProxyEngine {
-    pub(crate) storage: Arc<dyn Storage>,
-    /// Startup config load time stays fixed even when SIGHUP replaces the model map.
-    pub(crate) config_loaded_at: u64,
-    config: crate::Live<Config>,
-    limiter: crate::Live<ProviderLimiter>,
-    /// Per-owner in-flight budgets (keys sharing `ApiKey::owner`). Plain Arc,
-    /// not `Live`: state comes from the key rows, not config, and must survive
-    /// SIGHUP so in-flight accounting is never reset by a reload.
-    owner_limiter: Arc<OwnerLimiter>,
-    /// Per-provider request/token windows. Plain Arc for the same reason as
-    /// `owner_limiter`: a SIGHUP reload must update the LIMITS (read from the
-    /// live config at admission) without zeroing the day's counters.
-    pub(crate) rate_tracker: Arc<ProviderRateTracker>,
-    /// Per-provider failure streaks + cooldowns (SIGHUP-safe, like the
-    /// trackers above). Only active when `provider_error_cooldown_secs` > 0.
-    pub(crate) provider_health: Arc<ProviderHealth>,
+	pub(crate) storage: Arc<dyn Storage>,
+	/// Startup config load time stays fixed even when SIGHUP replaces the model map.
+	pub(crate) config_loaded_at: u64,
+	config: crate::Live<Config>,
+	limiter: crate::Live<ProviderLimiter>,
+	/// Per-owner in-flight budgets (keys sharing `ApiKey::owner`). Plain Arc,
+	/// not `Live`: state comes from the key rows, not config, and must survive
+	/// SIGHUP so in-flight accounting is never reset by a reload.
+	owner_limiter: Arc<OwnerLimiter>,
+	/// Per-provider request/token windows. Plain Arc for the same reason as
+	/// `owner_limiter`: a SIGHUP reload must update the LIMITS (read from the
+	/// live config at admission) without zeroing the day's counters.
+	pub(crate) rate_tracker: Arc<ProviderRateTracker>,
+	/// Per-provider failure streaks + cooldowns (SIGHUP-safe, like the
+	/// trackers above). Only active when `provider_error_cooldown_secs` > 0.
+	pub(crate) provider_health: Arc<ProviderHealth>,
 }
 
 impl ProxyEngine {
-    pub fn new(
-        storage: Arc<dyn Storage>,
-        config: crate::Live<Config>,
-        limiter: crate::Live<ProviderLimiter>,
-        config_loaded_at: u64,
-    ) -> Self {
-        Self {
-            storage,
-            config_loaded_at,
-            config,
-            limiter,
-            owner_limiter: Arc::new(OwnerLimiter::new()),
-            rate_tracker: Arc::new(ProviderRateTracker::new()),
-            provider_health: Arc::new(ProviderHealth::new()),
-        }
-    }
-
-    /// Take a slot in the key's shared owner budget, or fail with the 429
-    /// marker after `[server].owner_queue_timeout_secs`. `None` = key is ungrouped/unlimited —
-    /// hold the returned permit (if any) for the whole upstream call.
-    pub(crate) async fn acquire_owner_slot(
-        &self,
-        api_key: &ApiKey,
-    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
-        let (Some(owner), Some(capacity)) = (&api_key.owner, api_key.owner_concurrency) else {
-            return Ok(None);
-        };
-        if capacity == 0 {
-            return Ok(None); // 0 = unlimited, same contract as absent
-        }
-        match self
-            .owner_limiter
-            .acquire(
-                owner,
-                capacity,
-                std::time::Duration::from_secs(self.config().server.owner_queue_timeout_secs),
-            )
-            .await
-        {
-            Ok(permit) => Ok(Some(permit)),
-            Err(()) => Err(anyhow!(
-                "{}: owner concurrency limit ({}) exhausted — retry shortly",
-                OWNER_LIMIT_MARKER,
-                capacity
-            )),
-        }
-    }
-
-    /// Current config snapshot. The reload writer only swaps an `Arc` and never
-    /// panics while holding the lock, so it can't be poisoned — unwrap is safe.
-    pub fn config(&self) -> Arc<Config> {
-        self.config.read().unwrap().clone()
-    }
-
-    /// Current limiter snapshot. Same poison-free reasoning as `config`.
-    pub(crate) fn limiter(&self) -> Arc<ProviderLimiter> {
-        self.limiter.read().unwrap().clone()
-    }
-
-    /// Process a create completion request, attributing usage to the given API key.
-    /// Returns the response plus the upstream provider call duration — the latter
-    /// drives `octohub_completion_duration_seconds` so the histogram reflects
-    /// provider latency only, excluding our own auth/parse/storage overhead.
-    ///
-    /// `purpose` is the request's `X-Model-Purpose` header, meaningful only when
-    /// the model is the virtual `auto` — it steers which alias `auto` resolves to.
-    ///
-    /// `extra_headers` are client attribution headers (X-Title / HTTP-Referer)
-    /// forwarded verbatim to the upstream call — octohub is a proxy, so the
-    /// originating app's identity goes upstream, not ours.
-    pub async fn process(
-        &self,
-        req: CreateCompletionRequest,
-        api_key: &ApiKey,
-        purpose: Option<String>,
-        extra_headers: Option<std::collections::HashMap<String, String>>,
-    ) -> Result<(CreateCompletionResponse, std::time::Duration)> {
-        // Snapshot config + limiter once so this request keeps a consistent view
-        // even if SIGHUP swaps them mid-flight.
-        let config = self.config();
-
-        // The as-sent model must be allowed — for `auto` that means the key was
-        // explicitly granted "auto". The RESOLVED alias is checked again below,
-        // so `auto` can never smuggle in a model the key's roster bans.
-        ensure_model_allowed(api_key, &req.model)?;
-
-        // Virtual `auto`: pick the real alias from the owner's stored map, then
-        // the [auto] config floor (see proxy::auto for the chain). `req.model`
-        // deliberately stays "auto" — it is what the client sent, and it lands
-        // in `input_model` for observability; `routed_model` feeds routing.
-        let routed_model = if config.is_auto(&req.model) {
-            let owner_map = match api_key.owner.clone() {
-                Some(owner) => {
-                    let storage = self.storage.clone();
-                    tokio::task::spawn_blocking(move || storage.get_owner_auto_map(&owner))
-                        .await??
-                }
-                None => None,
-            };
-            let resolved =
-                super::auto::resolve(purpose.as_deref(), owner_map.as_ref(), &config.auto, |m| {
-                    config.models.contains_key(m)
-                })
-                .with_context(|| {
-                    format!(
-                        "Failed to resolve model 'auto' (purpose '{}'): no usable [auto] mapping",
-                        purpose.as_deref().unwrap_or("")
-                    )
-                })?;
-            ensure_model_allowed(api_key, &resolved)?;
-            tracing::Span::current().record("model", resolved.as_str());
-            tracing::info!(
-                purpose = purpose.as_deref().unwrap_or(""),
-                resolved = %resolved,
-                "auto model resolved"
-            );
-            resolved
-        } else {
-            req.model.clone()
-        };
-
-        // Owner budget slot — held for the WHOLE request (queue + upstream +
-        // storage), completions and embeddings drain the same budget.
-        let _owner_slot = self.acquire_owner_slot(api_key).await?;
-
-        let limiter = self.limiter();
-
-        // 1. Build conversation history from chain
-        let mut messages: Vec<Message> = Vec::new();
-
-        // Live system message from req.instructions has priority over chain-stored
-        // instructions because the request carries the current cache_control marker.
-        let mut system_msg: Option<Message> = req.instructions.as_ref().map(content_to_system);
-
-        // Tracks whether the supplied previous_completion_id actually resolved.
-        // Unknown IDs are accepted (stateless-provider migration path) but must
-        // not be persisted — that would create dangling chains forever.
-        let mut resolved_prev_id: Option<String> = None;
-        // session_id inherited from the tail of the resolved chain.
-        let mut inherited_session_id: Option<String> = None;
-        // Provider that served the previous turn — preferred at resolution so
-        // multi-turn sessions keep hitting the same provider-side prompt cache.
-        let mut sticky_provider: Option<String> = None;
-
-        if let Some(ref prev_cmpl_id) = req.previous_completion_id {
-            // Unknown IDs are tolerated — the client may be migrating from a stateless
-            // provider (Anthropic, etc.) where they pass the full history inline in
-            // `input`. Hard-failing would break that workflow. Mirrors OpenAI's
-            // guidance: "retry with full input context and previous_response_id null."
-            let chain_start = std::time::Instant::now();
-            let storage = self.storage.clone();
-            let prev_id = prev_cmpl_id.clone();
-            let chain_result =
-                tokio::task::spawn_blocking(move || storage.walk_chain(&prev_id)).await?;
-            let chain_ms = chain_start.elapsed().as_millis() as u64;
-            tracing::Span::current().record("chain_ms", chain_ms);
-
-            let chain = match chain_result {
-                Ok(chain) => {
-                    resolved_prev_id = Some(prev_cmpl_id.clone());
-                    chain
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        previous_completion_id = %prev_cmpl_id,
-                        error = %err,
-                        "Unknown previous_completion_id — falling back to inline input only",
-                    );
-                    Vec::new()
-                }
-            };
-
-            // Inherit session_id and the serving provider from the most
-            // recent (last) chain entry.
-            inherited_session_id = chain.last().map(|c| c.session_id.clone());
-            sticky_provider = chain.last().map(|c| c.provider.clone());
-
-            for stored in &chain {
-                // Fall back to chain-stored instructions only if the request didn't
-                // supply any (cache markers are not preserved on this path).
-                if system_msg.is_none() {
-                    if let Some(ref instr) = stored.instructions {
-                        system_msg = Some(Message::system(instr));
-                    }
-                }
-
-                // Reconstruct input messages
-                self.reconstruct_input(&stored.input, &mut messages);
-
-                // Reconstruct output as assistant message
-                self.reconstruct_output(&stored.output, &mut messages);
-            }
-        }
-
-        // 2. Prepend resolved system message (if any) at the head of history
-        if let Some(sys) = system_msg {
-            messages.insert(0, sys);
-        }
-
-        // 3. Append new input
-        match &req.input {
-            Input::Text(text) => {
-                messages.push(Message::user(text));
-            }
-            Input::Items(items) => {
-                push_items(items, &mut messages);
-            }
-        }
-
-        // 4. Resolve provider and model via config. The chain's previous
-        //    provider is preferred (provider-side prompt caches are per
-        //    provider); candidates whose rate windows are exhausted are
-        //    skipped; all exhausted → 429 with Retry-After (`pick_admitted`).
-        //    With `failover_on_error`, a provider-side failure moves to the
-        //    next candidate instead of surfacing to the client.
-        let mut candidates = config
-            .model_candidates(&routed_model)
-            .with_context(|| format!("Failed to resolve model '{}'", routed_model))?;
-        if let Some(ref sticky) = sticky_provider {
-            prefer_provider(&mut candidates, sticky);
-        }
-        // A JSON-schema request only goes to lanes that guarantee the shape;
-        // the rest would approximate it with a forced tool call that can miss
-        // required fields. No such lane is an error, never an unenforced answer.
-        if req
-            .text
-            .as_ref()
-            .is_some_and(|t| matches!(t.format, TextFormat::JsonSchema { .. }))
-        {
-            retain_schema_enforcing_candidates(&mut candidates);
-            if candidates.is_empty() {
-                return Err(anyhow!(SchemaNotEnforcedError {
-                    model: routed_model.clone(),
-                }));
-            }
-        }
-
-        let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
-        let (provider_name, resolved_model, provider, provider_response, upstream_duration) = loop {
-            let (provider_name, resolved_model) = pick_admitted(
-                &self.rate_tracker,
-                &self.provider_health,
-                &config,
-                candidates.clone(),
-                &routed_model,
-            )?;
-
-            // Record provider in request span
-            tracing::Span::current().record("provider", provider_name.as_str());
-
-            let attempt = async {
-                // 5. Get provider instance
-                let provider = ProviderFactory::create_provider(&provider_name)
-                    .with_context(|| format!("Provider '{}' not available", provider_name))?;
-
-                // Modality compatibility: fail fast so the outer loop can skip
-                // this candidate without counting it as a provider fault.
-                let has_videos = messages.iter().any(|m| {
-                    m.videos.as_ref().is_some_and(|v| !v.is_empty())
-                });
-                if has_videos && !provider.supports_video(&resolved_model) {
-                    return Err(anyhow!(ModalityNotSupportedError {
-                        provider: provider_name.clone(),
-                        model: resolved_model.clone(),
-                        modality: "video".to_string(),
-                    }));
-                }
-
-                let has_images = messages.iter().any(|m| {
-                    m.images.as_ref().is_some_and(|i| !i.is_empty())
-                });
-                if has_images && !provider.supports_vision(&resolved_model) {
-                    return Err(anyhow!(ModalityNotSupportedError {
-                        provider: provider_name.clone(),
-                        model: resolved_model.clone(),
-                        modality: "image".to_string(),
-                    }));
-                }
-
-                // 6. Build ChatCompletionParams
-                let tools = req.tools.as_ref().map(|tools| {
-                    tools
-                        .iter()
-                        .map(|t| FunctionDefinition {
-                            name: t.name.clone(),
-                            description: t.description.clone().unwrap_or_default(),
-                            parameters: t.parameters.clone().unwrap_or(serde_json::json!({})),
-                            // Pass-through: octohub is a proxy. Whatever cache marker
-                            // the client attached to this tool goes upstream unchanged.
-                            cache_control: t.cache_control.clone(),
-                        })
-                        .collect::<Vec<_>>()
-                });
-                // top_k is not part of the Responses-API wire shape (octolib client
-                // never sends it), so we leave it at a neutral default; upstream
-                // providers that don't honor it ignore it harmlessly.
-                let mut params = ChatCompletionParams::new(
-                    &messages,
-                    &resolved_model,
-                    req.temperature,
-                    req.top_p,
-                    50,
-                    req.max_output_tokens,
-                );
-
-                if let Some(tools) = tools {
-                    params.tools = Some(tools);
-                }
-
-                // Forwarded client attribution; octolib applies these last with
-                // override semantics, beating its own env-based defaults.
-                params.extra_headers = extra_headers.clone();
-
-                // Reasoning effort: parse client string into octolib enum and pass
-                // through. Unknown values silently fall back to provider default —
-                // we never want a malformed effort hint to fail the whole request.
-                if let Some(ref eff) = req.reasoning_effort {
-                    params.reasoning_effort = match eff.to_lowercase().as_str() {
-                        "low" => Some(ReasoningEffort::Low),
-                        "medium" => Some(ReasoningEffort::Medium),
-                        "high" => Some(ReasoningEffort::High),
-                        "xhigh" => Some(ReasoningEffort::XHigh),
-                        "max" => Some(ReasoningEffort::Max),
-                        _ => None,
-                    };
-                }
-
-                // Structured output: map the Responses-API `text.format` shape onto
-                // octolib's StructuredOutputRequest so the upstream provider receives
-                // the schema (or json_object request) the client asked for. Without
-                // this, JSON-mode and JSON-Schema requests through the proxy silently
-                // fall back to free-form text.
-                if let Some(ref text) = req.text {
-                    params.response_format = Some(match &text.format {
-                        TextFormat::JsonObject => StructuredOutputRequest {
-                            format: OutputFormat::Json,
-                            mode: ResponseMode::Auto,
-                            schema: None,
-                        },
-                        TextFormat::JsonSchema { schema, strict } => StructuredOutputRequest {
-                            format: OutputFormat::JsonSchema,
-                            mode: if *strict {
-                                ResponseMode::Strict
-                            } else {
-                                ResponseMode::Auto
-                            },
-                            schema: Some(schema.clone()),
-                        },
-                    });
-                }
-
-                // 7. Call provider — hold a concurrency permit (if configured) for the
-                //    full duration of the upstream call. Dropping `_permit` after the
-                //    `.await` resolves wakes the next queued request.
-                let queue_start = std::time::Instant::now();
-                let queue_timeout =
-                    std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
-                let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
-                    .await
-                    .map_err(|_| {
-                        anyhow!(ProxyTimeoutError::ProviderQueue {
-                            provider: provider_name.clone(),
-                            timeout: queue_timeout,
-                        })
-                    })?;
-                let queue_wait = queue_start.elapsed();
-                if queue_wait.as_millis() > 0 {
-                    tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
-                }
-                if queue_wait.as_millis() > 100 {
-                    tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
-                }
-                crate::metrics::record_queue_wait(&provider_name, queue_wait);
-
-                let upstream_start = std::time::Instant::now();
-                let upstream_timeout =
-                    std::time::Duration::from_secs(config.server.upstream_timeout_secs);
-                // Route through the schema-enforcement fallback: a transparent
-                // passthrough unless the client requested a JSON schema that the
-                // resolved provider can't natively guarantee (see
-                // `octolib::llm::chat_completion_enforced`).
-                let provider_response = tokio::time::timeout(
-                    upstream_timeout,
-                    chat_completion_enforced(provider.as_ref(), params),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow!(ProxyTimeoutError::Upstream {
-                        provider: provider.name().to_string(),
-                        timeout: upstream_timeout,
-                    })
-                })?
-                .with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
-                let upstream_duration = upstream_start.elapsed();
-                tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
-                anyhow::Ok((provider, provider_response, upstream_duration))
-            }
-            .await;
-
-            match attempt {
-                Ok((provider, response, duration)) => {
-                    self.provider_health.record_success(&provider_name);
-                    break (provider_name, resolved_model, provider, response, duration);
-                }
-                Err(err) => {
-                    // Modality mismatch is a candidate filter, not a provider fault.
-                    if let Some(modality_err) = err.downcast_ref::<ModalityNotSupportedError>() {
-                        retain_same_model_failover_candidates(&mut candidates, modality_err);
-                        if candidates.is_empty() {
-                            return Err(err);
-                        }
-                        tracing::info!(
-                            provider = %modality_err.provider,
-                            model = %modality_err.model,
-                            modality = %modality_err.modality,
-                            "provider does not support modality — skipping to next candidate"
-                        );
-                        continue;
-                    }
-
-                    let provider_fault = is_provider_fault(&err);
-                    if provider_fault {
-                        self.provider_health
-                            .record_failure(&provider_name, cooldown);
-                    }
-                    // The failed provider is out for THIS request either way —
-                    // never re-picked within one failover loop.
-                    candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
-                    if !(config.server.failover_on_error && provider_fault) || candidates.is_empty()
-                    {
-                        return Err(err);
-                    }
-                    crate::metrics::record_failover(&provider_name);
-                    tracing::warn!(
-                        provider = %provider_name,
-                        error = %err,
-                        "provider failed — failing over to next candidate"
-                    );
-                }
-            }
-        };
-
-        // 8. Build our response
-        let completion_id = format!("cmpl_{}", Uuid::new_v4().simple());
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut output = Vec::new();
-
-        // Emit reasoning FIRST so it's replayed before assistant message/tool_calls.
-        // DeepSeek requires `reasoning_content` to accompany assistant turns that
-        // produced tool_calls; without it the API returns 400.
-        if let Some(ref thinking) = provider_response.thinking {
-            if !thinking.content.is_empty() {
-                output.push(OutputItem::Reasoning {
-                    id: format!("rsn_{}", Uuid::new_v4().simple()),
-                    content: vec![ContentPart::OutputText {
-                        text: thinking.content.clone(),
-                    }],
-                });
-            }
-        }
-
-        // Add function calls if present
-        if let Some(ref tool_calls) = provider_response.tool_calls {
-            for tc in tool_calls {
-                output.push(OutputItem::FunctionCall {
-                    id: format!("fc_{}", Uuid::new_v4().simple()),
-                    call_id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    arguments: tc.arguments.to_string(),
-                });
-            }
-        }
-
-        // Add message content if present
-        if !provider_response.content.is_empty() {
-            output.push(OutputItem::Message {
-                id: format!("msg_{}", Uuid::new_v4().simple()),
-                role: "assistant".to_string(),
-                content: vec![ContentPart::OutputText {
-                    text: provider_response.content.clone(),
-                }],
-            });
-        }
-
-        let exchange_usage = &provider_response.exchange.usage;
-        let usage = Usage {
-            input_tokens: exchange_usage.as_ref().map(|u| u.input_tokens).unwrap_or(0),
-            output_tokens: exchange_usage
-                .as_ref()
-                .map(|u| u.output_tokens)
-                .unwrap_or(0),
-            cache_read_tokens: exchange_usage.as_ref().and_then(|u| {
-                if u.cache_read_tokens > 0 {
-                    Some(u.cache_read_tokens)
-                } else {
-                    None
-                }
-            }),
-            cache_write_tokens: exchange_usage.as_ref().and_then(|u| {
-                if u.cache_write_tokens > 0 {
-                    Some(u.cache_write_tokens)
-                } else {
-                    None
-                }
-            }),
-            total_tokens: exchange_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0),
-            reasoning_tokens: exchange_usage.as_ref().and_then(|u| {
-                if u.reasoning_tokens > 0 {
-                    Some(u.reasoning_tokens)
-                } else {
-                    None
-                }
-            }),
-            cost: exchange_usage.as_ref().and_then(|u| u.cost),
-            request_time_ms: exchange_usage.as_ref().and_then(|u| u.request_time_ms),
-        };
-
-        // Feed actual usage back into the provider's rate windows — the
-        // request itself was counted at admission, tokens only now that the
-        // provider reported them. `max` covers providers whose total_tokens
-        // is absent (0) but that still report the split counts.
-        self.rate_tracker.record_tokens(
-            &provider_name,
-            usage
-                .total_tokens
-                .max(usage.input_tokens + usage.output_tokens),
-        );
-
-        let response = CreateCompletionResponse {
-            id: completion_id.clone(),
-            object: "completion",
-            model: resolved_model.clone(),
-            provider: provider.name().to_string(),
-            output: output.clone(),
-            usage: usage.clone(),
-            // Mirror everything the upstream provider returned: clients must
-            // not have to re-parse text to recover schema-validated JSON or
-            // know why generation stopped.
-            structured_output: provider_response.structured_output.clone(),
-            finish_reason: provider_response.finish_reason.clone(),
-            created_at: now,
-        };
-
-        // 9. Store for observability. Use resolved_prev_id (None if chain didn't
-        // resolve) so we never persist a link to an unknown ID.
-        // session_id comes from the chain tail — no extra DB query needed.
-        let session_id =
-            inherited_session_id.unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()));
-
-        let stored = StoredCompletion {
-            id: completion_id,
-            api_key_id: api_key.id,
-            session_id,
-            previous_completion_id: resolved_prev_id,
-            input_model: req.model.clone(),
-            resolved_model,
-            provider: provider.name().to_string(),
-            input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
-            output: serde_json::to_value(&output).unwrap_or(serde_json::Value::Null),
-            instructions: req.instructions.as_ref().map(|i| i.text()),
-            exchange: serde_json::json!({
-                "request": provider_response.exchange.request,
-                "response": provider_response.exchange.response,
-            }),
-            usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
-            created_at: now,
-        };
-        let store_start = std::time::Instant::now();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || storage.store_completion(&stored)).await??;
-        tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
-
-        Ok((response, upstream_duration))
-    }
-
-    /// Process an embedding request, attributing usage to the given API key.
-    /// Returns the response, the upstream call duration (for the histogram),
-    /// the resolved provider name (so callers can label metrics correctly),
-    /// and the approximate input token count.
-    pub async fn process_embedding(
-        &self,
-        req: CreateEmbeddingRequest,
-        api_key: &ApiKey,
-    ) -> Result<EmbeddingOutcome> {
-        ensure_model_allowed(api_key, &req.model)?;
-        // Same shared owner budget as completions (see `process`).
-        let _owner_slot = self.acquire_owner_slot(api_key).await?;
-
-        // Snapshot config + limiter once (see `process`).
-        let config = self.config();
-        let limiter = self.limiter();
-
-        let start = std::time::Instant::now();
-
-        // 1. Resolve provider and model — same rate-window admission and
-        //    failover policy as completions (both drain the same provider
-        //    windows and share the health tracker).
-        let mut candidates = config
-            .embedding_model_candidates(&req.model)
-            .with_context(|| format!("Failed to resolve embedding model '{}'", req.model))?;
-
-        let texts: Vec<String> = match &req.input {
-            EmbeddingInput::Single(s) => vec![s.clone()],
-            EmbeddingInput::Batch(v) => v.clone(),
-        };
-
-        let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
-        let (provider_name, resolved_model, embeddings, usage_calc, upstream_duration) = loop {
-            let (provider_name, resolved_model) = pick_admitted(
-                &self.rate_tracker,
-                &self.provider_health,
-                &config,
-                candidates.clone(),
-                &req.model,
-            )?;
-
-            // Record provider in request span
-            tracing::Span::current().record("provider", provider_name.as_str());
-
-            let attempt = async {
-                // 2. Parse provider type and create provider
-                let provider_model = format!("{}:{}", provider_name, resolved_model);
-                let (provider_type, model_name) =
-                    octolib::embedding::parse_provider_model(&provider_model)?;
-                let provider =
-                    create_embedding_provider_from_parts(&provider_type, &model_name).await?;
-
-                // 3. Generate embeddings — gated by the same per-provider concurrency
-                // limit as completions. Permit released as soon as the call returns.
-                let queue_start = std::time::Instant::now();
-                let queue_timeout =
-                    std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
-                let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
-                    .await
-                    .map_err(|_| {
-                        anyhow!(ProxyTimeoutError::ProviderQueue {
-                            provider: provider_name.clone(),
-                            timeout: queue_timeout,
-                        })
-                    })?;
-                let queue_wait = queue_start.elapsed();
-                if queue_wait.as_millis() > 0 {
-                    tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
-                }
-                if queue_wait.as_millis() > 100 {
-                    tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
-                }
-                crate::metrics::record_queue_wait(&provider_name, queue_wait);
-
-                let upstream_start = std::time::Instant::now();
-                let upstream_timeout =
-                    std::time::Duration::from_secs(config.server.upstream_timeout_secs);
-                let (embeddings, usage_calc) = tokio::time::timeout(
-                    upstream_timeout,
-                    provider.generate_embeddings_batch(texts.clone(), InputType::None),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow!(ProxyTimeoutError::Upstream {
-                        provider: provider_name.clone(),
-                        timeout: upstream_timeout,
-                    })
-                })?
-                .with_context(|| {
-                    format!(
-                        "Embedding provider '{}' failed for model '{}'",
-                        provider_name, resolved_model
-                    )
-                })?;
-                let upstream_duration = upstream_start.elapsed();
-                tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
-                anyhow::Ok((embeddings, usage_calc, upstream_duration))
-            }
-            .await;
-
-            match attempt {
-                Ok((embeddings, usage_calc, duration)) => {
-                    self.provider_health.record_success(&provider_name);
-                    break (
-                        provider_name,
-                        resolved_model,
-                        embeddings,
-                        usage_calc,
-                        duration,
-                    );
-                }
-                Err(err) => {
-                    let provider_fault = is_provider_fault(&err);
-                    if provider_fault {
-                        self.provider_health
-                            .record_failure(&provider_name, cooldown);
-                    }
-                    candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
-                    if !(config.server.failover_on_error && provider_fault) || candidates.is_empty()
-                    {
-                        return Err(err);
-                    }
-                    crate::metrics::record_failover(&provider_name);
-                    tracing::warn!(
-                        provider = %provider_name,
-                        error = %err,
-                        "embedding provider failed — failing over to next candidate"
-                    );
-                }
-            }
-        };
-
-        // Embeddings drain the same provider token windows as completions.
-        self.rate_tracker
-            .record_tokens(&provider_name, usage_calc.input_tokens);
-
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-
-        // 4. Build response (simple: just the embedding(s))
-        let response = match &req.input {
-            EmbeddingInput::Single(_) => {
-                CreateEmbeddingResponse::Single(embeddings.into_iter().next().unwrap_or_default())
-            }
-            EmbeddingInput::Batch(_) => CreateEmbeddingResponse::Batch(embeddings),
-        };
-
-        // Usage comes straight from octolib's embedding provider: the real
-        // provider-reported token count (or a tiktoken estimate for providers that
-        // report none) plus the reference cost (`None` for local/unpriced models).
-        // Cost rides in the `usage` JSON, exactly as completions carry it
-        // (`usage.cost`), so the billing layer reads it the same way for both.
-        let usage = serde_json::json!({
-            "input_tokens": usage_calc.input_tokens,
-            "total_tokens": usage_calc.input_tokens,
-            "cost": usage_calc.cost,
-            "request_time_ms": elapsed_ms,
-        });
-
-        // 5. Store for observability
-        let embedding_id = format!("embd_{}", Uuid::new_v4().simple());
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let stored = StoredEmbedding {
-            id: embedding_id,
-            api_key_id: api_key.id,
-            input_model: req.model.clone(),
-            resolved_model,
-            provider: provider_name.clone(),
-            input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
-            usage: usage.clone(),
-            created_at: now,
-        };
-        let store_start = std::time::Instant::now();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || storage.store_embedding(&stored)).await??;
-        tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
-
-        Ok(EmbeddingOutcome {
-            response,
-            provider: provider_name,
-            upstream_duration,
-            input_tokens: usage_calc.input_tokens,
-        })
-    }
-
-    /// Process an evaluation request: same admission, failover and
-    /// accounting as embeddings, against octolib's evaluation adapters.
-    pub async fn process_evaluation(
-        &self,
-        req: CreateEvaluationRequest,
-        api_key: &ApiKey,
-    ) -> Result<EvaluationOutcome> {
-        ensure_model_allowed(api_key, &req.model)?;
-        if req.questions.is_empty() {
-            anyhow::bail!("Invalid request: at least one question is required");
-        }
-        let _owner_slot = self.acquire_owner_slot(api_key).await?;
-
-        let config = self.config();
-        let limiter = self.limiter();
-        let start = std::time::Instant::now();
-
-        // Virtual `auto`: the owner's `evaluation` entry, then the [auto]
-        // floor's. As for completions, `req.model` stays "auto" and lands in
-        // `input_model`; the resolved alias must pass the key's roster too.
-        let routed_model = if config.is_auto(&req.model) {
-            let owner_map = match api_key.owner.clone() {
-                Some(owner) => {
-                    let storage = self.storage.clone();
-                    tokio::task::spawn_blocking(move || storage.get_owner_auto_map(&owner))
-                        .await??
-                }
-                None => None,
-            };
-            let resolved =
-                super::auto::resolve_evaluation(owner_map.as_ref(), &config.auto, |m| {
-                    config.evaluation_models.contains_key(m)
-                })
-                .context(
-                    "Failed to resolve model 'auto' for an evaluation: no usable [auto].evaluation mapping",
-                )?;
-            ensure_model_allowed(api_key, &resolved)?;
-            tracing::info!(resolved = %resolved, "auto evaluation model resolved");
-            resolved
-        } else {
-            req.model.clone()
-        };
-
-        let mut candidates = config
-            .evaluation_model_candidates(&routed_model)
-            .with_context(|| format!("Failed to resolve evaluation model '{}'", routed_model))?;
-
-        let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
-        let (provider_name, resolved_model, result, upstream_duration) = loop {
-            let (provider_name, resolved_model) = pick_admitted(
-                &self.rate_tracker,
-                &self.provider_health,
-                &config,
-                candidates.clone(),
-                &routed_model,
-            )?;
-            tracing::Span::current().record("provider", provider_name.as_str());
-
-            let attempt = async {
-                let provider = EvaluationProviderFactory::create_provider(&provider_name)?;
-                if !provider.supports_model(&resolved_model) {
-                    return Err(anyhow!(EvaluationError::UnsupportedModel {
-                        provider: provider_name.clone(),
-                        model: resolved_model.clone(),
-                    }));
-                }
-                let mut request =
-                    EvaluationRequest::new(req.state.clone()).with_model(resolved_model.clone());
-                request.questions = req.questions.clone();
-
-                let queue_start = std::time::Instant::now();
-                let queue_timeout =
-                    std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
-                let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
-                    .await
-                    .map_err(|_| {
-                        anyhow!(ProxyTimeoutError::ProviderQueue {
-                            provider: provider_name.clone(),
-                            timeout: queue_timeout,
-                        })
-                    })?;
-                let queue_wait = queue_start.elapsed();
-                if queue_wait.as_millis() > 0 {
-                    tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
-                }
-                crate::metrics::record_queue_wait(&provider_name, queue_wait);
-
-                let upstream_start = std::time::Instant::now();
-                let upstream_timeout =
-                    std::time::Duration::from_secs(config.server.upstream_timeout_secs);
-                let result = tokio::time::timeout(upstream_timeout, provider.evaluate(request))
-                    .await
-                    .map_err(|_| {
-                        anyhow!(ProxyTimeoutError::Upstream {
-                            provider: provider_name.clone(),
-                            timeout: upstream_timeout,
-                        })
-                    })?
-                    .with_context(|| {
-                        format!(
-                            "Evaluation provider '{}' failed for model '{}'",
-                            provider_name, resolved_model
-                        )
-                    })?;
-                let upstream_duration = upstream_start.elapsed();
-                tracing::Span::current()
-                    .record("upstream_ms", upstream_duration.as_millis() as u64);
-                anyhow::Ok((result, upstream_duration))
-            }
-            .await;
-
-            match attempt {
-                Ok((result, duration)) => {
-                    self.provider_health.record_success(&provider_name);
-                    break (provider_name, resolved_model, result, duration);
-                }
-                Err(err) => {
-                    let provider_fault = is_provider_fault(&err);
-                    if provider_fault {
-                        self.provider_health
-                            .record_failure(&provider_name, cooldown);
-                    }
-                    candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
-                    if !(config.server.failover_on_error && provider_fault) || candidates.is_empty()
-                    {
-                        return Err(err);
-                    }
-                    crate::metrics::record_failover(&provider_name);
-                    tracing::warn!(
-                        provider = %provider_name,
-                        error = %err,
-                        "evaluation provider failed — failing over to next candidate"
-                    );
-                }
-            }
-        };
-
-        // Evaluations drain the same provider token windows as completions.
-        self.rate_tracker.record_tokens(
-            &provider_name,
-            result.usage.input_tokens + result.usage.output_tokens,
-        );
-
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        let usage = serde_json::json!({
-            "input_tokens": result.usage.input_tokens,
-            "output_tokens": result.usage.output_tokens,
-            "cost": result.usage.cost,
-            "request_time_ms": elapsed_ms,
-        });
-
-        let evaluation_id = format!("eval_{}", Uuid::new_v4().simple());
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let stored = StoredEvaluation {
-            id: evaluation_id.clone(),
-            api_key_id: api_key.id,
-            input_model: req.model.clone(),
-            resolved_model,
-            provider: provider_name.clone(),
-            request: serde_json::json!({"state": req.state, "questions": req.questions}),
-            answers: serde_json::to_value(&result.answers).unwrap_or(serde_json::Value::Null),
-            usage,
-            created_at: now,
-        };
-        let store_start = std::time::Instant::now();
-        let storage = self.storage.clone();
-        tokio::task::spawn_blocking(move || storage.store_evaluation(&stored)).await??;
-        tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
-
-        Ok(EvaluationOutcome {
-            response: CreateEvaluationResponse {
-                id: evaluation_id,
-                model: result.model,
-                answers: result.answers,
-                usage: result.usage.clone(),
-            },
-            provider: provider_name,
-            upstream_duration,
-            input_tokens: result.usage.input_tokens,
-            output_tokens: result.usage.output_tokens,
-        })
-    }
-
-    /// Reconstruct input messages from stored JSON
-    fn reconstruct_input(&self, input: &serde_json::Value, messages: &mut Vec<Message>) {
-        // Input can be a string or array of items
-        if let Some(text) = input.as_str() {
-            messages.push(Message::user(text));
-        } else if let Some(items) = input.as_array() {
-            push_stored_items(items, messages);
-        }
-        // Handle {"Text": "..."} from serde serialization of Input::Text
-        else if let Some(text) = input.get("Text").and_then(|v| v.as_str()) {
-            messages.push(Message::user(text));
-        }
-        // Handle {"Items": [...]} from serde serialization of Input::Items
-        else if let Some(items) = input.get("Items").and_then(|v| v.as_array()) {
-            push_stored_items(items, messages);
-        }
-    }
-
-    /// Reconstruct output as assistant message(s) from stored JSON
-    ///
-    /// Collects all function calls into a single assistant message with
-    /// tool_calls in the unified GenericToolCall format that octolib expects.
-    fn reconstruct_output(&self, output: &serde_json::Value, messages: &mut Vec<Message>) {
-        if let Some(items) = output.as_array() {
-            let mut text_parts: Vec<String> = Vec::new();
-            let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-            let mut reasoning_text: Option<String> = None;
-
-            for item in items {
-                if let Ok(output_item) = serde_json::from_value::<OutputItem>(item.clone()) {
-                    match output_item {
-                        OutputItem::Message { content, .. } => {
-                            let text: String = content
-                                .iter()
-                                .map(|c| match c {
-                                    ContentPart::OutputText { text } => text.as_str(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            if !text.is_empty() {
-                                text_parts.push(text);
-                            }
-                        }
-                        OutputItem::FunctionCall {
-                            call_id,
-                            name,
-                            arguments,
-                            ..
-                        } => {
-                            // Parse arguments string back to JSON value
-                            let args_value: serde_json::Value =
-                                serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
-                            tool_calls.push(serde_json::json!({
-                                "id": call_id,
-                                "name": name,
-                                "arguments": args_value,
-                            }));
-                        }
-                        OutputItem::Reasoning { content, .. } => {
-                            let text: String = content
-                                .iter()
-                                .map(|c| match c {
-                                    ContentPart::OutputText { text } => text.as_str(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            if !text.is_empty() {
-                                reasoning_text = Some(text);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Emit a single assistant message with text + tool_calls + thinking.
-            // Thinking must accompany tool_calls for providers like DeepSeek that
-            // require `reasoning_content` continuity in subsequent turns.
-            if !tool_calls.is_empty() || !text_parts.is_empty() || reasoning_text.is_some() {
-                let content = text_parts.join("\n");
-                let mut msg = Message::assistant(&content);
-                if !tool_calls.is_empty() {
-                    msg.tool_calls = Some(serde_json::Value::Array(tool_calls));
-                }
-                if let Some(rt) = reasoning_text {
-                    msg.thinking = Some(ThinkingBlock::new(&rt));
-                }
-                messages.push(msg);
-            }
-        }
-    }
+	pub fn new(
+		storage: Arc<dyn Storage>,
+		config: crate::Live<Config>,
+		limiter: crate::Live<ProviderLimiter>,
+		config_loaded_at: u64,
+	) -> Self {
+		Self {
+			storage,
+			config_loaded_at,
+			config,
+			limiter,
+			owner_limiter: Arc::new(OwnerLimiter::new()),
+			rate_tracker: Arc::new(ProviderRateTracker::new()),
+			provider_health: Arc::new(ProviderHealth::new()),
+		}
+	}
+
+	/// Take a slot in the key's shared owner budget, or fail with the 429
+	/// marker after `[server].owner_queue_timeout_secs`. `None` = key is ungrouped/unlimited —
+	/// hold the returned permit (if any) for the whole upstream call.
+	pub(crate) async fn acquire_owner_slot(
+		&self,
+		api_key: &ApiKey,
+	) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+		let (Some(owner), Some(capacity)) = (&api_key.owner, api_key.owner_concurrency) else {
+			return Ok(None);
+		};
+		if capacity == 0 {
+			return Ok(None); // 0 = unlimited, same contract as absent
+		}
+		match self
+			.owner_limiter
+			.acquire(
+				owner,
+				capacity,
+				std::time::Duration::from_secs(self.config().server.owner_queue_timeout_secs),
+			)
+			.await
+		{
+			Ok(permit) => Ok(Some(permit)),
+			Err(()) => Err(anyhow!(
+				"{}: owner concurrency limit ({}) exhausted — retry shortly",
+				OWNER_LIMIT_MARKER,
+				capacity
+			)),
+		}
+	}
+
+	/// Current config snapshot. The reload writer only swaps an `Arc` and never
+	/// panics while holding the lock, so it can't be poisoned — unwrap is safe.
+	pub fn config(&self) -> Arc<Config> {
+		self.config.read().unwrap().clone()
+	}
+
+	/// Current limiter snapshot. Same poison-free reasoning as `config`.
+	pub(crate) fn limiter(&self) -> Arc<ProviderLimiter> {
+		self.limiter.read().unwrap().clone()
+	}
+
+	/// Process a create completion request, attributing usage to the given API key.
+	/// Returns the response plus the upstream provider call duration — the latter
+	/// drives `octohub_completion_duration_seconds` so the histogram reflects
+	/// provider latency only, excluding our own auth/parse/storage overhead.
+	///
+	/// `purpose` is the request's `X-Model-Purpose` header, meaningful only when
+	/// the model is the virtual `auto` — it steers which alias `auto` resolves to.
+	///
+	/// `extra_headers` are client attribution headers (X-Title / HTTP-Referer)
+	/// forwarded verbatim to the upstream call — octohub is a proxy, so the
+	/// originating app's identity goes upstream, not ours.
+	pub async fn process(
+		&self,
+		req: CreateCompletionRequest,
+		api_key: &ApiKey,
+		purpose: Option<String>,
+		extra_headers: Option<std::collections::HashMap<String, String>>,
+	) -> Result<(CreateCompletionResponse, std::time::Duration)> {
+		// Snapshot config + limiter once so this request keeps a consistent view
+		// even if SIGHUP swaps them mid-flight.
+		let config = self.config();
+
+		// The as-sent model must be allowed — for `auto` that means the key was
+		// explicitly granted "auto". The RESOLVED alias is checked again below,
+		// so `auto` can never smuggle in a model the key's roster bans.
+		ensure_model_allowed(api_key, &req.model)?;
+
+		// Virtual `auto`: pick the real alias from the owner's stored map, then
+		// the [auto] config floor (see proxy::auto for the chain). `req.model`
+		// deliberately stays "auto" — it is what the client sent, and it lands
+		// in `input_model` for observability; `routed_model` feeds routing.
+		let routed_model = if config.is_auto(&req.model) {
+			let owner_map = match api_key.owner.clone() {
+				Some(owner) => {
+					let storage = self.storage.clone();
+					tokio::task::spawn_blocking(move || storage.get_owner_auto_map(&owner)).await??
+				}
+				None => None,
+			};
+			let resolved = super::auto::resolve(purpose.as_deref(), owner_map.as_ref(), &config.auto, |m| {
+				config.models.contains_key(m)
+			})
+			.with_context(|| {
+				format!(
+					"Failed to resolve model 'auto' (purpose '{}'): no usable [auto] mapping",
+					purpose.as_deref().unwrap_or("")
+				)
+			})?;
+			ensure_model_allowed(api_key, &resolved)?;
+			tracing::Span::current().record("model", resolved.as_str());
+			tracing::info!(
+				purpose = purpose.as_deref().unwrap_or(""),
+				resolved = %resolved,
+				"auto model resolved"
+			);
+			resolved
+		} else {
+			req.model.clone()
+		};
+
+		// Owner budget slot — held for the WHOLE request (queue + upstream +
+		// storage), completions and embeddings drain the same budget.
+		let _owner_slot = self.acquire_owner_slot(api_key).await?;
+
+		let limiter = self.limiter();
+
+		// 1. Build conversation history from chain
+		let mut messages: Vec<Message> = Vec::new();
+
+		// Live system message from req.instructions has priority over chain-stored
+		// instructions because the request carries the current cache_control marker.
+		let mut system_msg: Option<Message> = req.instructions.as_ref().map(content_to_system);
+
+		// Tracks whether the supplied previous_completion_id actually resolved.
+		// Unknown IDs are accepted (stateless-provider migration path) but must
+		// not be persisted — that would create dangling chains forever.
+		let mut resolved_prev_id: Option<String> = None;
+		// session_id inherited from the tail of the resolved chain.
+		let mut inherited_session_id: Option<String> = None;
+		// Provider that served the previous turn — preferred at resolution so
+		// multi-turn sessions keep hitting the same provider-side prompt cache.
+		let mut sticky_provider: Option<String> = None;
+
+		if let Some(ref prev_cmpl_id) = req.previous_completion_id {
+			// Unknown IDs are tolerated — the client may be migrating from a stateless
+			// provider (Anthropic, etc.) where they pass the full history inline in
+			// `input`. Hard-failing would break that workflow. Mirrors OpenAI's
+			// guidance: "retry with full input context and previous_response_id null."
+			let chain_start = std::time::Instant::now();
+			let storage = self.storage.clone();
+			let prev_id = prev_cmpl_id.clone();
+			let chain_result = tokio::task::spawn_blocking(move || storage.walk_chain(&prev_id)).await?;
+			let chain_ms = chain_start.elapsed().as_millis() as u64;
+			tracing::Span::current().record("chain_ms", chain_ms);
+
+			let chain = match chain_result {
+				Ok(chain) => {
+					resolved_prev_id = Some(prev_cmpl_id.clone());
+					chain
+				}
+				Err(err) => {
+					tracing::warn!(
+						previous_completion_id = %prev_cmpl_id,
+						error = %err,
+						"Unknown previous_completion_id — falling back to inline input only",
+					);
+					Vec::new()
+				}
+			};
+
+			// Inherit session_id and the serving provider from the most
+			// recent (last) chain entry.
+			inherited_session_id = chain.last().map(|c| c.session_id.clone());
+			sticky_provider = chain.last().map(|c| c.provider.clone());
+
+			for stored in &chain {
+				// Fall back to chain-stored instructions only if the request didn't
+				// supply any (cache markers are not preserved on this path).
+				if system_msg.is_none() {
+					if let Some(ref instr) = stored.instructions {
+						system_msg = Some(Message::system(instr));
+					}
+				}
+
+				// Reconstruct input messages
+				self.reconstruct_input(&stored.input, &mut messages);
+
+				// Reconstruct output as assistant message
+				self.reconstruct_output(&stored.output, &mut messages);
+			}
+		}
+
+		// 2. Prepend resolved system message (if any) at the head of history
+		if let Some(sys) = system_msg {
+			messages.insert(0, sys);
+		}
+
+		// 3. Append new input
+		match &req.input {
+			Input::Text(text) => {
+				messages.push(Message::user(text));
+			}
+			Input::Items(items) => {
+				push_items(items, &mut messages);
+			}
+		}
+
+		// 4. Resolve provider and model via config. The chain's previous
+		//    provider is preferred (provider-side prompt caches are per
+		//    provider); candidates whose rate windows are exhausted are
+		//    skipped; all exhausted → 429 with Retry-After (`pick_admitted`).
+		//    With `failover_on_error`, a provider-side failure moves to the
+		//    next candidate instead of surfacing to the client.
+		let mut candidates = config
+			.model_candidates(&routed_model)
+			.with_context(|| format!("Failed to resolve model '{}'", routed_model))?;
+		if let Some(ref sticky) = sticky_provider {
+			prefer_provider(&mut candidates, sticky);
+		}
+		// A JSON-schema request only goes to lanes that guarantee the shape;
+		// the rest would approximate it with a forced tool call that can miss
+		// required fields. No such lane is an error, never an unenforced answer.
+		if req
+			.text
+			.as_ref()
+			.is_some_and(|t| matches!(t.format, TextFormat::JsonSchema { .. }))
+		{
+			retain_schema_enforcing_candidates(&mut candidates);
+			if candidates.is_empty() {
+				return Err(anyhow!(SchemaNotEnforcedError {
+					model: routed_model.clone(),
+				}));
+			}
+		}
+
+		let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
+		let (provider_name, resolved_model, provider, provider_response, upstream_duration) = loop {
+			let (provider_name, resolved_model) = pick_admitted(
+				&self.rate_tracker,
+				&self.provider_health,
+				&config,
+				candidates.clone(),
+				&routed_model,
+			)?;
+
+			// Record provider in request span
+			tracing::Span::current().record("provider", provider_name.as_str());
+
+			let attempt = async {
+				// 5. Get provider instance
+				let provider = ProviderFactory::create_provider(&provider_name)
+					.with_context(|| format!("Provider '{}' not available", provider_name))?;
+
+				// Modality compatibility: fail fast so the outer loop can skip
+				// this candidate without counting it as a provider fault.
+				let has_videos = messages
+					.iter()
+					.any(|m| m.videos.as_ref().is_some_and(|v| !v.is_empty()));
+				if has_videos && !provider.supports_video(&resolved_model) {
+					return Err(anyhow!(ModalityNotSupportedError {
+						provider: provider_name.clone(),
+						model: resolved_model.clone(),
+						modality: "video".to_string(),
+					}));
+				}
+
+				let has_images = messages
+					.iter()
+					.any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()));
+				if has_images && !provider.supports_vision(&resolved_model) {
+					return Err(anyhow!(ModalityNotSupportedError {
+						provider: provider_name.clone(),
+						model: resolved_model.clone(),
+						modality: "image".to_string(),
+					}));
+				}
+
+				// 6. Build ChatCompletionParams
+				let tools = req.tools.as_ref().map(|tools| {
+					tools
+						.iter()
+						.map(|t| FunctionDefinition {
+							name: t.name.clone(),
+							description: t.description.clone().unwrap_or_default(),
+							parameters: t.parameters.clone().unwrap_or(serde_json::json!({})),
+							// Pass-through: octohub is a proxy. Whatever cache marker
+							// the client attached to this tool goes upstream unchanged.
+							cache_control: t.cache_control.clone(),
+						})
+						.collect::<Vec<_>>()
+				});
+				// top_k is not part of the Responses-API wire shape (octolib client
+				// never sends it), so we leave it at a neutral default; upstream
+				// providers that don't honor it ignore it harmlessly.
+				let mut params = ChatCompletionParams::new(
+					&messages,
+					&resolved_model,
+					req.temperature,
+					req.top_p,
+					50,
+					req.max_output_tokens,
+				);
+
+				if let Some(tools) = tools {
+					params.tools = Some(tools);
+				}
+
+				// Forwarded client attribution; octolib applies these last with
+				// override semantics, beating its own env-based defaults.
+				params.extra_headers = extra_headers.clone();
+
+				// Reasoning effort: parse client string into octolib enum and pass
+				// through. Unknown values silently fall back to provider default —
+				// we never want a malformed effort hint to fail the whole request.
+				if let Some(ref eff) = req.reasoning_effort {
+					params.reasoning_effort = match eff.to_lowercase().as_str() {
+						"low" => Some(ReasoningEffort::Low),
+						"medium" => Some(ReasoningEffort::Medium),
+						"high" => Some(ReasoningEffort::High),
+						"xhigh" => Some(ReasoningEffort::XHigh),
+						"max" => Some(ReasoningEffort::Max),
+						_ => None,
+					};
+				}
+
+				// Structured output: map the Responses-API `text.format` shape onto
+				// octolib's StructuredOutputRequest so the upstream provider receives
+				// the schema (or json_object request) the client asked for. Without
+				// this, JSON-mode and JSON-Schema requests through the proxy silently
+				// fall back to free-form text.
+				if let Some(ref text) = req.text {
+					params.response_format = Some(match &text.format {
+						TextFormat::JsonObject => StructuredOutputRequest {
+							format: OutputFormat::Json,
+							mode: ResponseMode::Auto,
+							schema: None,
+						},
+						TextFormat::JsonSchema { schema, strict } => StructuredOutputRequest {
+							format: OutputFormat::JsonSchema,
+							mode: if *strict {
+								ResponseMode::Strict
+							} else {
+								ResponseMode::Auto
+							},
+							schema: Some(schema.clone()),
+						},
+					});
+				}
+
+				// 7. Call provider — hold a concurrency permit (if configured) for the
+				//    full duration of the upstream call. Dropping `_permit` after the
+				//    `.await` resolves wakes the next queued request.
+				let queue_start = std::time::Instant::now();
+				let queue_timeout = std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
+				let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
+					.await
+					.map_err(|_| {
+						anyhow!(ProxyTimeoutError::ProviderQueue {
+							provider: provider_name.clone(),
+							timeout: queue_timeout,
+						})
+					})?;
+				let queue_wait = queue_start.elapsed();
+				if queue_wait.as_millis() > 0 {
+					tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
+				}
+				if queue_wait.as_millis() > 100 {
+					tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
+				}
+				crate::metrics::record_queue_wait(&provider_name, queue_wait);
+
+				let upstream_start = std::time::Instant::now();
+				let upstream_timeout = std::time::Duration::from_secs(config.server.upstream_timeout_secs);
+				// Route through the schema-enforcement fallback: a transparent
+				// passthrough unless the client requested a JSON schema that the
+				// resolved provider can't natively guarantee (see
+				// `octolib::llm::chat_completion_enforced`).
+				let provider_response =
+					tokio::time::timeout(upstream_timeout, chat_completion_enforced(provider.as_ref(), params))
+						.await
+						.map_err(|_| {
+							anyhow!(ProxyTimeoutError::Upstream {
+								provider: provider.name().to_string(),
+								timeout: upstream_timeout,
+							})
+						})?
+						.with_context(|| format!("Provider '{}' chat_completion failed", provider.name()))?;
+				let upstream_duration = upstream_start.elapsed();
+				tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
+				anyhow::Ok((provider, provider_response, upstream_duration))
+			}
+			.await;
+
+			match attempt {
+				Ok((provider, response, duration)) => {
+					self.provider_health.record_success(&provider_name);
+					break (provider_name, resolved_model, provider, response, duration);
+				}
+				Err(err) => {
+					// Modality mismatch is a candidate filter, not a provider fault.
+					if let Some(modality_err) = err.downcast_ref::<ModalityNotSupportedError>() {
+						retain_same_model_failover_candidates(&mut candidates, modality_err);
+						if candidates.is_empty() {
+							return Err(err);
+						}
+						tracing::info!(
+							provider = %modality_err.provider,
+							model = %modality_err.model,
+							modality = %modality_err.modality,
+							"provider does not support modality — skipping to next candidate"
+						);
+						continue;
+					}
+
+					let provider_fault = is_provider_fault(&err);
+					if provider_fault {
+						self.provider_health.record_failure(&provider_name, cooldown);
+					}
+					// The failed provider is out for THIS request either way —
+					// never re-picked within one failover loop.
+					candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
+					if !(config.server.failover_on_error && provider_fault) || candidates.is_empty() {
+						return Err(err);
+					}
+					crate::metrics::record_failover(&provider_name);
+					tracing::warn!(
+						provider = %provider_name,
+						error = %err,
+						"provider failed — failing over to next candidate"
+					);
+				}
+			}
+		};
+
+		// 8. Build our response
+		let completion_id = format!("cmpl_{}", Uuid::new_v4().simple());
+		let now = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs();
+
+		let mut output = Vec::new();
+
+		// Emit reasoning FIRST so it's replayed before assistant message/tool_calls.
+		// DeepSeek requires `reasoning_content` to accompany assistant turns that
+		// produced tool_calls; without it the API returns 400.
+		if let Some(ref thinking) = provider_response.thinking {
+			if !thinking.content.is_empty() {
+				output.push(OutputItem::Reasoning {
+					id: format!("rsn_{}", Uuid::new_v4().simple()),
+					content: vec![ContentPart::OutputText {
+						text: thinking.content.clone(),
+					}],
+				});
+			}
+		}
+
+		// Add function calls if present
+		if let Some(ref tool_calls) = provider_response.tool_calls {
+			for tc in tool_calls {
+				output.push(OutputItem::FunctionCall {
+					id: format!("fc_{}", Uuid::new_v4().simple()),
+					call_id: tc.id.clone(),
+					name: tc.name.clone(),
+					arguments: tc.arguments.to_string(),
+				});
+			}
+		}
+
+		// Add message content if present
+		if !provider_response.content.is_empty() {
+			output.push(OutputItem::Message {
+				id: format!("msg_{}", Uuid::new_v4().simple()),
+				role: "assistant".to_string(),
+				content: vec![ContentPart::OutputText {
+					text: provider_response.content.clone(),
+				}],
+			});
+		}
+
+		let exchange_usage = &provider_response.exchange.usage;
+		let usage = Usage {
+			input_tokens: exchange_usage.as_ref().map(|u| u.input_tokens).unwrap_or(0),
+			output_tokens: exchange_usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
+			cache_read_tokens: exchange_usage.as_ref().and_then(|u| {
+				if u.cache_read_tokens > 0 {
+					Some(u.cache_read_tokens)
+				} else {
+					None
+				}
+			}),
+			cache_write_tokens: exchange_usage.as_ref().and_then(|u| {
+				if u.cache_write_tokens > 0 {
+					Some(u.cache_write_tokens)
+				} else {
+					None
+				}
+			}),
+			total_tokens: exchange_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0),
+			reasoning_tokens: exchange_usage.as_ref().and_then(|u| {
+				if u.reasoning_tokens > 0 {
+					Some(u.reasoning_tokens)
+				} else {
+					None
+				}
+			}),
+			cost: exchange_usage.as_ref().and_then(|u| u.cost),
+			request_time_ms: exchange_usage.as_ref().and_then(|u| u.request_time_ms),
+		};
+
+		// Feed actual usage back into the provider's rate windows — the
+		// request itself was counted at admission, tokens only now that the
+		// provider reported them. `max` covers providers whose total_tokens
+		// is absent (0) but that still report the split counts.
+		self.rate_tracker.record_tokens(
+			&provider_name,
+			usage.total_tokens.max(usage.input_tokens + usage.output_tokens),
+		);
+
+		let response = CreateCompletionResponse {
+			id: completion_id.clone(),
+			object: "completion",
+			model: resolved_model.clone(),
+			provider: provider.name().to_string(),
+			output: output.clone(),
+			usage: usage.clone(),
+			// Mirror everything the upstream provider returned: clients must
+			// not have to re-parse text to recover schema-validated JSON or
+			// know why generation stopped.
+			structured_output: provider_response.structured_output.clone(),
+			finish_reason: provider_response.finish_reason.clone(),
+			created_at: now,
+		};
+
+		// 9. Store for observability. Use resolved_prev_id (None if chain didn't
+		// resolve) so we never persist a link to an unknown ID.
+		// session_id comes from the chain tail — no extra DB query needed.
+		let session_id = inherited_session_id.unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()));
+
+		let stored = StoredCompletion {
+			id: completion_id,
+			api_key_id: api_key.id,
+			session_id,
+			previous_completion_id: resolved_prev_id,
+			input_model: req.model.clone(),
+			resolved_model,
+			provider: provider.name().to_string(),
+			input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
+			output: serde_json::to_value(&output).unwrap_or(serde_json::Value::Null),
+			instructions: req.instructions.as_ref().map(|i| i.text()),
+			exchange: serde_json::json!({
+				"request": provider_response.exchange.request,
+				"response": provider_response.exchange.response,
+			}),
+			usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+			created_at: now,
+		};
+		let store_start = std::time::Instant::now();
+		let storage = self.storage.clone();
+		tokio::task::spawn_blocking(move || storage.store_completion(&stored)).await??;
+		tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
+
+		Ok((response, upstream_duration))
+	}
+
+	/// Process an embedding request, attributing usage to the given API key.
+	/// Returns the response, the upstream call duration (for the histogram),
+	/// the resolved provider name (so callers can label metrics correctly),
+	/// and the approximate input token count.
+	pub async fn process_embedding(&self, req: CreateEmbeddingRequest, api_key: &ApiKey) -> Result<EmbeddingOutcome> {
+		ensure_model_allowed(api_key, &req.model)?;
+		// Same shared owner budget as completions (see `process`).
+		let _owner_slot = self.acquire_owner_slot(api_key).await?;
+
+		// Snapshot config + limiter once (see `process`).
+		let config = self.config();
+		let limiter = self.limiter();
+
+		let start = std::time::Instant::now();
+
+		// 1. Resolve provider and model — same rate-window admission and
+		//    failover policy as completions (both drain the same provider
+		//    windows and share the health tracker).
+		let mut candidates = config
+			.embedding_model_candidates(&req.model)
+			.with_context(|| format!("Failed to resolve embedding model '{}'", req.model))?;
+
+		let texts: Vec<String> = match &req.input {
+			EmbeddingInput::Single(s) => vec![s.clone()],
+			EmbeddingInput::Batch(v) => v.clone(),
+		};
+
+		let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
+		let (provider_name, resolved_model, embeddings, usage_calc, upstream_duration) = loop {
+			let (provider_name, resolved_model) = pick_admitted(
+				&self.rate_tracker,
+				&self.provider_health,
+				&config,
+				candidates.clone(),
+				&req.model,
+			)?;
+
+			// Record provider in request span
+			tracing::Span::current().record("provider", provider_name.as_str());
+
+			let attempt = async {
+				// 2. Parse provider type and create provider
+				let provider_model = format!("{}:{}", provider_name, resolved_model);
+				let (provider_type, model_name) = octolib::embedding::parse_provider_model(&provider_model)?;
+				let provider = create_embedding_provider_from_parts(&provider_type, &model_name).await?;
+
+				// 3. Generate embeddings — gated by the same per-provider concurrency
+				// limit as completions. Permit released as soon as the call returns.
+				let queue_start = std::time::Instant::now();
+				let queue_timeout = std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
+				let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
+					.await
+					.map_err(|_| {
+						anyhow!(ProxyTimeoutError::ProviderQueue {
+							provider: provider_name.clone(),
+							timeout: queue_timeout,
+						})
+					})?;
+				let queue_wait = queue_start.elapsed();
+				if queue_wait.as_millis() > 0 {
+					tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
+				}
+				if queue_wait.as_millis() > 100 {
+					tracing::info!(provider = %provider_name, waited_ms = queue_wait.as_millis() as u64, "queued for provider permit");
+				}
+				crate::metrics::record_queue_wait(&provider_name, queue_wait);
+
+				let upstream_start = std::time::Instant::now();
+				let upstream_timeout = std::time::Duration::from_secs(config.server.upstream_timeout_secs);
+				let (embeddings, usage_calc) = tokio::time::timeout(
+					upstream_timeout,
+					provider.generate_embeddings_batch(texts.clone(), InputType::None),
+				)
+				.await
+				.map_err(|_| {
+					anyhow!(ProxyTimeoutError::Upstream {
+						provider: provider_name.clone(),
+						timeout: upstream_timeout,
+					})
+				})?
+				.with_context(|| {
+					format!(
+						"Embedding provider '{}' failed for model '{}'",
+						provider_name, resolved_model
+					)
+				})?;
+				let upstream_duration = upstream_start.elapsed();
+				tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
+				anyhow::Ok((embeddings, usage_calc, upstream_duration))
+			}
+			.await;
+
+			match attempt {
+				Ok((embeddings, usage_calc, duration)) => {
+					self.provider_health.record_success(&provider_name);
+					break (provider_name, resolved_model, embeddings, usage_calc, duration);
+				}
+				Err(err) => {
+					let provider_fault = is_provider_fault(&err);
+					if provider_fault {
+						self.provider_health.record_failure(&provider_name, cooldown);
+					}
+					candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
+					if !(config.server.failover_on_error && provider_fault) || candidates.is_empty() {
+						return Err(err);
+					}
+					crate::metrics::record_failover(&provider_name);
+					tracing::warn!(
+						provider = %provider_name,
+						error = %err,
+						"embedding provider failed — failing over to next candidate"
+					);
+				}
+			}
+		};
+
+		// Embeddings drain the same provider token windows as completions.
+		self.rate_tracker.record_tokens(&provider_name, usage_calc.input_tokens);
+
+		let elapsed_ms = start.elapsed().as_millis() as u64;
+
+		// 4. Build response (simple: just the embedding(s))
+		let response = match &req.input {
+			EmbeddingInput::Single(_) => {
+				CreateEmbeddingResponse::Single(embeddings.into_iter().next().unwrap_or_default())
+			}
+			EmbeddingInput::Batch(_) => CreateEmbeddingResponse::Batch(embeddings),
+		};
+
+		// Usage comes straight from octolib's embedding provider: the real
+		// provider-reported token count (or a tiktoken estimate for providers that
+		// report none) plus the reference cost (`None` for local/unpriced models).
+		// Cost rides in the `usage` JSON, exactly as completions carry it
+		// (`usage.cost`), so the billing layer reads it the same way for both.
+		let usage = serde_json::json!({
+			"input_tokens": usage_calc.input_tokens,
+			"total_tokens": usage_calc.input_tokens,
+			"cost": usage_calc.cost,
+			"request_time_ms": elapsed_ms,
+		});
+
+		// 5. Store for observability
+		let embedding_id = format!("embd_{}", Uuid::new_v4().simple());
+		let now = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs();
+
+		let stored = StoredEmbedding {
+			id: embedding_id,
+			api_key_id: api_key.id,
+			input_model: req.model.clone(),
+			resolved_model,
+			provider: provider_name.clone(),
+			input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
+			usage: usage.clone(),
+			created_at: now,
+		};
+		let store_start = std::time::Instant::now();
+		let storage = self.storage.clone();
+		tokio::task::spawn_blocking(move || storage.store_embedding(&stored)).await??;
+		tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
+
+		Ok(EmbeddingOutcome {
+			response,
+			provider: provider_name,
+			upstream_duration,
+			input_tokens: usage_calc.input_tokens,
+		})
+	}
+
+	/// Process an evaluation request: same admission, failover and
+	/// accounting as embeddings, against octolib's evaluation adapters.
+	pub async fn process_evaluation(
+		&self,
+		req: CreateEvaluationRequest,
+		api_key: &ApiKey,
+	) -> Result<EvaluationOutcome> {
+		ensure_model_allowed(api_key, &req.model)?;
+		if req.questions.is_empty() {
+			anyhow::bail!("Invalid request: at least one question is required");
+		}
+		let _owner_slot = self.acquire_owner_slot(api_key).await?;
+
+		let config = self.config();
+		let limiter = self.limiter();
+		let start = std::time::Instant::now();
+
+		// Virtual `auto`: the owner's `evaluation` entry, then the [auto]
+		// floor's. As for completions, `req.model` stays "auto" and lands in
+		// `input_model`; the resolved alias must pass the key's roster too.
+		let routed_model = if config.is_auto(&req.model) {
+			let owner_map = match api_key.owner.clone() {
+				Some(owner) => {
+					let storage = self.storage.clone();
+					tokio::task::spawn_blocking(move || storage.get_owner_auto_map(&owner)).await??
+				}
+				None => None,
+			};
+			let resolved = super::auto::resolve_evaluation(owner_map.as_ref(), &config.auto, |m| {
+				config.evaluation_models.contains_key(m)
+			})
+			.context("Failed to resolve model 'auto' for an evaluation: no usable [auto].evaluation mapping")?;
+			ensure_model_allowed(api_key, &resolved)?;
+			tracing::info!(resolved = %resolved, "auto evaluation model resolved");
+			resolved
+		} else {
+			req.model.clone()
+		};
+
+		let mut candidates = config
+			.evaluation_model_candidates(&routed_model)
+			.with_context(|| format!("Failed to resolve evaluation model '{}'", routed_model))?;
+
+		let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
+		let (provider_name, resolved_model, result, upstream_duration) = loop {
+			let (provider_name, resolved_model) = pick_admitted(
+				&self.rate_tracker,
+				&self.provider_health,
+				&config,
+				candidates.clone(),
+				&routed_model,
+			)?;
+			tracing::Span::current().record("provider", provider_name.as_str());
+
+			let attempt = async {
+				let provider = EvaluationProviderFactory::create_provider(&provider_name)?;
+				if !provider.supports_model(&resolved_model) {
+					return Err(anyhow!(EvaluationError::UnsupportedModel {
+						provider: provider_name.clone(),
+						model: resolved_model.clone(),
+					}));
+				}
+				let mut request = EvaluationRequest::new(req.state.clone()).with_model(resolved_model.clone());
+				request.questions = req.questions.clone();
+
+				let queue_start = std::time::Instant::now();
+				let queue_timeout = std::time::Duration::from_secs(config.server.provider_queue_timeout_secs);
+				let _permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
+					.await
+					.map_err(|_| {
+						anyhow!(ProxyTimeoutError::ProviderQueue {
+							provider: provider_name.clone(),
+							timeout: queue_timeout,
+						})
+					})?;
+				let queue_wait = queue_start.elapsed();
+				if queue_wait.as_millis() > 0 {
+					tracing::Span::current().record("queued_ms", queue_wait.as_millis() as u64);
+				}
+				crate::metrics::record_queue_wait(&provider_name, queue_wait);
+
+				let upstream_start = std::time::Instant::now();
+				let upstream_timeout = std::time::Duration::from_secs(config.server.upstream_timeout_secs);
+				let result = tokio::time::timeout(upstream_timeout, provider.evaluate(request))
+					.await
+					.map_err(|_| {
+						anyhow!(ProxyTimeoutError::Upstream {
+							provider: provider_name.clone(),
+							timeout: upstream_timeout,
+						})
+					})?
+					.with_context(|| {
+						format!(
+							"Evaluation provider '{}' failed for model '{}'",
+							provider_name, resolved_model
+						)
+					})?;
+				let upstream_duration = upstream_start.elapsed();
+				tracing::Span::current().record("upstream_ms", upstream_duration.as_millis() as u64);
+				anyhow::Ok((result, upstream_duration))
+			}
+			.await;
+
+			match attempt {
+				Ok((result, duration)) => {
+					self.provider_health.record_success(&provider_name);
+					break (provider_name, resolved_model, result, duration);
+				}
+				Err(err) => {
+					let provider_fault = is_provider_fault(&err);
+					if provider_fault {
+						self.provider_health.record_failure(&provider_name, cooldown);
+					}
+					candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
+					if !(config.server.failover_on_error && provider_fault) || candidates.is_empty() {
+						return Err(err);
+					}
+					crate::metrics::record_failover(&provider_name);
+					tracing::warn!(
+						provider = %provider_name,
+						error = %err,
+						"evaluation provider failed — failing over to next candidate"
+					);
+				}
+			}
+		};
+
+		// Evaluations drain the same provider token windows as completions.
+		self.rate_tracker
+			.record_tokens(&provider_name, result.usage.input_tokens + result.usage.output_tokens);
+
+		let elapsed_ms = start.elapsed().as_millis() as u64;
+		let usage = serde_json::json!({
+			"input_tokens": result.usage.input_tokens,
+			"output_tokens": result.usage.output_tokens,
+			"cost": result.usage.cost,
+			"request_time_ms": elapsed_ms,
+		});
+
+		let evaluation_id = format!("eval_{}", Uuid::new_v4().simple());
+		let now = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs();
+		let stored = StoredEvaluation {
+			id: evaluation_id.clone(),
+			api_key_id: api_key.id,
+			input_model: req.model.clone(),
+			resolved_model,
+			provider: provider_name.clone(),
+			request: serde_json::json!({"state": req.state, "questions": req.questions}),
+			answers: serde_json::to_value(&result.answers).unwrap_or(serde_json::Value::Null),
+			usage,
+			created_at: now,
+		};
+		let store_start = std::time::Instant::now();
+		let storage = self.storage.clone();
+		tokio::task::spawn_blocking(move || storage.store_evaluation(&stored)).await??;
+		tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
+
+		Ok(EvaluationOutcome {
+			response: CreateEvaluationResponse {
+				id: evaluation_id,
+				model: result.model,
+				answers: result.answers,
+				usage: result.usage.clone(),
+			},
+			provider: provider_name,
+			upstream_duration,
+			input_tokens: result.usage.input_tokens,
+			output_tokens: result.usage.output_tokens,
+		})
+	}
+
+	/// Reconstruct input messages from stored JSON
+	fn reconstruct_input(&self, input: &serde_json::Value, messages: &mut Vec<Message>) {
+		// Input can be a string or array of items
+		if let Some(text) = input.as_str() {
+			messages.push(Message::user(text));
+		} else if let Some(items) = input.as_array() {
+			push_stored_items(items, messages);
+		}
+		// Handle {"Text": "..."} from serde serialization of Input::Text
+		else if let Some(text) = input.get("Text").and_then(|v| v.as_str()) {
+			messages.push(Message::user(text));
+		}
+		// Handle {"Items": [...]} from serde serialization of Input::Items
+		else if let Some(items) = input.get("Items").and_then(|v| v.as_array()) {
+			push_stored_items(items, messages);
+		}
+	}
+
+	/// Reconstruct output as assistant message(s) from stored JSON
+	///
+	/// Collects all function calls into a single assistant message with
+	/// tool_calls in the unified GenericToolCall format that octolib expects.
+	fn reconstruct_output(&self, output: &serde_json::Value, messages: &mut Vec<Message>) {
+		if let Some(items) = output.as_array() {
+			let mut text_parts: Vec<String> = Vec::new();
+			let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+			let mut reasoning_text: Option<String> = None;
+
+			for item in items {
+				if let Ok(output_item) = serde_json::from_value::<OutputItem>(item.clone()) {
+					match output_item {
+						OutputItem::Message { content, .. } => {
+							let text: String = content
+								.iter()
+								.map(|c| match c {
+									ContentPart::OutputText { text } => text.as_str(),
+								})
+								.collect::<Vec<_>>()
+								.join("\n");
+							if !text.is_empty() {
+								text_parts.push(text);
+							}
+						}
+						OutputItem::FunctionCall {
+							call_id,
+							name,
+							arguments,
+							..
+						} => {
+							// Parse arguments string back to JSON value
+							let args_value: serde_json::Value =
+								serde_json::from_str(&arguments).unwrap_or(serde_json::json!({}));
+							tool_calls.push(serde_json::json!({
+								"id": call_id,
+								"name": name,
+								"arguments": args_value,
+							}));
+						}
+						OutputItem::Reasoning { content, .. } => {
+							let text: String = content
+								.iter()
+								.map(|c| match c {
+									ContentPart::OutputText { text } => text.as_str(),
+								})
+								.collect::<Vec<_>>()
+								.join("\n");
+							if !text.is_empty() {
+								reasoning_text = Some(text);
+							}
+						}
+					}
+				}
+			}
+
+			// Emit a single assistant message with text + tool_calls + thinking.
+			// Thinking must accompany tool_calls for providers like DeepSeek that
+			// require `reasoning_content` continuity in subsequent turns.
+			if !tool_calls.is_empty() || !text_parts.is_empty() || reasoning_text.is_some() {
+				let content = text_parts.join("\n");
+				let mut msg = Message::assistant(&content);
+				if !tool_calls.is_empty() {
+					msg.tool_calls = Some(serde_json::Value::Array(tool_calls));
+				}
+				if let Some(rt) = reasoning_text {
+					msg.thinking = Some(ThinkingBlock::new(&rt));
+				}
+				messages.push(msg);
+			}
+		}
+	}
 }
 
 /// Build an octolib `Message` from an input message, extracting plain text
@@ -1263,41 +1212,41 @@ impl ProxyEngine {
 /// `input_image` / `input_video` parts as image/video attachments, and
 /// propagating any `cache_control` markers as `cached`/`cache_ttl` flags.
 fn content_to_message(role: &str, content: &ContentValue) -> Message {
-    let text = content.text();
-    let mut msg = match role {
-        "user" => Message::user(&text),
-        "system" => Message::system(&text),
-        "assistant" => Message::assistant(&text),
-        _ => Message::user(&text),
-    };
-    if content.is_cached() {
-        msg.cached = true;
-        // Proxy semantics: forward the full marker, including TTL. Without
-        // this the upstream provider receives `cached` but falls back to its
-        // default TTL (5m for Anthropic), so client-requested longer TTLs
-        // (e.g. "1h") were silently downgraded.
-        msg.cache_ttl = content.cache_ttl();
-    }
+	let text = content.text();
+	let mut msg = match role {
+		"user" => Message::user(&text),
+		"system" => Message::system(&text),
+		"assistant" => Message::assistant(&text),
+		_ => Message::user(&text),
+	};
+	if content.is_cached() {
+		msg.cached = true;
+		// Proxy semantics: forward the full marker, including TTL. Without
+		// this the upstream provider receives `cached` but falls back to its
+		// default TTL (5m for Anthropic), so client-requested longer TTLs
+		// (e.g. "1h") were silently downgraded.
+		msg.cache_ttl = content.cache_ttl();
+	}
 
-    let images: Vec<ImageAttachment> = content
-        .image_urls()
-        .into_iter()
-        .filter_map(|u| parse_image_url(&u))
-        .collect();
-    if !images.is_empty() {
-        msg.images = Some(images);
-    }
+	let images: Vec<ImageAttachment> = content
+		.image_urls()
+		.into_iter()
+		.filter_map(|u| parse_image_url(&u))
+		.collect();
+	if !images.is_empty() {
+		msg.images = Some(images);
+	}
 
-    let videos: Vec<VideoAttachment> = content
-        .video_urls()
-        .into_iter()
-        .filter_map(|u| parse_video_url(&u))
-        .collect();
-    if !videos.is_empty() {
-        msg.videos = Some(videos);
-    }
+	let videos: Vec<VideoAttachment> = content
+		.video_urls()
+		.into_iter()
+		.filter_map(|u| parse_video_url(&u))
+		.collect();
+	if !videos.is_empty() {
+		msg.videos = Some(videos);
+	}
 
-    msg
+	msg
 }
 
 /// Parse a Responses-API image URL into an `ImageAttachment`. Supports
@@ -1305,76 +1254,76 @@ fn content_to_message(role: &str, content: &ContentValue) -> Message {
 /// and plain `http(s)://` URLs (passed through as `ImageData::Url`). Returns
 /// `None` for malformed inputs so individual bad parts don't drop the request.
 fn parse_image_url(url: &str) -> Option<ImageAttachment> {
-    if let Some((media_type, data)) = parse_data_uri(url) {
-        Some(ImageAttachment {
-            data: ImageData::Base64(data),
-            media_type,
-            source_type: SourceType::Url,
-            dimensions: None,
-            size_bytes: None,
-        })
-    } else if url.starts_with("http://") || url.starts_with("https://") {
-        Some(ImageAttachment {
-            data: ImageData::Url(url.to_string()),
-            media_type: "image/*".to_string(),
-            source_type: SourceType::Url,
-            dimensions: None,
-            size_bytes: None,
-        })
-    } else {
-        tracing::warn!(url = %url, kind = "image", "skipping unrecognized media url");
-        None
-    }
+	if let Some((media_type, data)) = parse_data_uri(url) {
+		Some(ImageAttachment {
+			data: ImageData::Base64(data),
+			media_type,
+			source_type: SourceType::Url,
+			dimensions: None,
+			size_bytes: None,
+		})
+	} else if url.starts_with("http://") || url.starts_with("https://") {
+		Some(ImageAttachment {
+			data: ImageData::Url(url.to_string()),
+			media_type: "image/*".to_string(),
+			source_type: SourceType::Url,
+			dimensions: None,
+			size_bytes: None,
+		})
+	} else {
+		tracing::warn!(url = %url, kind = "image", "skipping unrecognized media url");
+		None
+	}
 }
 
 /// Parse a Responses-API video URL into a `VideoAttachment`. Same data-URI /
 /// http(s) handling as `parse_image_url`.
 fn parse_video_url(url: &str) -> Option<VideoAttachment> {
-    if let Some((media_type, data)) = parse_data_uri(url) {
-        Some(VideoAttachment {
-            data: VideoData::Base64(data),
-            media_type,
-            source_type: SourceType::Url,
-            dimensions: None,
-            size_bytes: None,
-            duration_secs: None,
-        })
-    } else if url.starts_with("http://") || url.starts_with("https://") {
-        Some(VideoAttachment {
-            data: VideoData::Url(url.to_string()),
-            media_type: "video/*".to_string(),
-            source_type: SourceType::Url,
-            dimensions: None,
-            size_bytes: None,
-            duration_secs: None,
-        })
-    } else {
-        tracing::warn!(url = %url, kind = "video", "skipping unrecognized media url");
-        None
-    }
+	if let Some((media_type, data)) = parse_data_uri(url) {
+		Some(VideoAttachment {
+			data: VideoData::Base64(data),
+			media_type,
+			source_type: SourceType::Url,
+			dimensions: None,
+			size_bytes: None,
+			duration_secs: None,
+		})
+	} else if url.starts_with("http://") || url.starts_with("https://") {
+		Some(VideoAttachment {
+			data: VideoData::Url(url.to_string()),
+			media_type: "video/*".to_string(),
+			source_type: SourceType::Url,
+			dimensions: None,
+			size_bytes: None,
+			duration_secs: None,
+		})
+	} else {
+		tracing::warn!(url = %url, kind = "video", "skipping unrecognized media url");
+		None
+	}
 }
 
 /// Split a `data:<media-type>;base64,<data>` URI into `(media_type, data)`.
 /// Only the `;base64` form is recognized — that's what octolib emits and what
 /// upstream providers accept after re-encoding.
 fn parse_data_uri(url: &str) -> Option<(String, String)> {
-    let rest = url.strip_prefix("data:")?;
-    let (header, data) = rest.split_once(',')?;
-    let media_type = header.strip_suffix(";base64")?;
-    if media_type.is_empty() {
-        return None;
-    }
-    Some((media_type.to_string(), data.to_string()))
+	let rest = url.strip_prefix("data:")?;
+	let (header, data) = rest.split_once(',')?;
+	let media_type = header.strip_suffix(";base64")?;
+	if media_type.is_empty() {
+		return None;
+	}
+	Some((media_type.to_string(), data.to_string()))
 }
 
 /// Build the system message from request `instructions`, preserving cache markers.
 fn content_to_system(content: &ContentValue) -> Message {
-    let mut msg = Message::system(&content.text());
-    if content.is_cached() {
-        msg.cached = true;
-        msg.cache_ttl = content.cache_ttl();
-    }
-    msg
+	let mut msg = Message::system(&content.text());
+	if content.is_cached() {
+		msg.cached = true;
+		msg.cache_ttl = content.cache_ttl();
+	}
+	msg
 }
 
 /// Convert input items into octolib `Message`s and append to the list.
@@ -1385,54 +1334,53 @@ fn content_to_system(content: &ContentValue) -> Message {
 /// thinking together — required by DeepSeek's `reasoning_content` rule and by
 /// octolib's tool_calls-attached-to-message convention.
 fn push_items(items: &[InputItem], messages: &mut Vec<Message>) {
-    for item in items {
-        match item {
-            InputItem::Message { role, content } => {
-                messages.push(content_to_message(role, content));
-            }
-            InputItem::FunctionCallOutput {
-                call_id,
-                output,
-                cache_control,
-            } => {
-                let mut msg = Message::tool(output, call_id, "function");
-                // Forward the client's cache marker so the upstream provider caches
-                // the prefix ending at this tool result — the common agent-loop tail
-                // breakpoint. Mirrors `content_to_message` for Message items.
-                if let Some(cc) = cache_control {
-                    msg.cached = true;
-                    msg.cache_ttl = cc.get("ttl").and_then(|v| v.as_str()).map(String::from);
-                }
-                messages.push(msg);
-            }
-            InputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } => {
-                let args_value: serde_json::Value =
-                    serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
-                let tool_call = serde_json::json!({
-                    "id": call_id,
-                    "name": name,
-                    "arguments": args_value,
-                });
-                attach_tool_call_to_assistant(messages, tool_call);
-            }
-            InputItem::Reasoning { content } => {
-                let text: String = content
-                    .iter()
-                    .map(|c| match c {
-                        ContentPart::OutputText { text } => text.as_str(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !text.is_empty() {
-                    attach_thinking_to_assistant(messages, text);
-                }
-            }
-        }
-    }
+	for item in items {
+		match item {
+			InputItem::Message { role, content } => {
+				messages.push(content_to_message(role, content));
+			}
+			InputItem::FunctionCallOutput {
+				call_id,
+				output,
+				cache_control,
+			} => {
+				let mut msg = Message::tool(output, call_id, "function");
+				// Forward the client's cache marker so the upstream provider caches
+				// the prefix ending at this tool result — the common agent-loop tail
+				// breakpoint. Mirrors `content_to_message` for Message items.
+				if let Some(cc) = cache_control {
+					msg.cached = true;
+					msg.cache_ttl = cc.get("ttl").and_then(|v| v.as_str()).map(String::from);
+				}
+				messages.push(msg);
+			}
+			InputItem::FunctionCall {
+				call_id,
+				name,
+				arguments,
+			} => {
+				let args_value: serde_json::Value = serde_json::from_str(arguments).unwrap_or(serde_json::json!({}));
+				let tool_call = serde_json::json!({
+					"id": call_id,
+					"name": name,
+					"arguments": args_value,
+				});
+				attach_tool_call_to_assistant(messages, tool_call);
+			}
+			InputItem::Reasoning { content } => {
+				let text: String = content
+					.iter()
+					.map(|c| match c {
+						ContentPart::OutputText { text } => text.as_str(),
+					})
+					.collect::<Vec<_>>()
+					.join("\n");
+				if !text.is_empty() {
+					attach_thinking_to_assistant(messages, text);
+				}
+			}
+		}
+	}
 }
 
 /// Deserialize stored JSON input items, skipping any that fail to parse
@@ -1446,47 +1394,47 @@ fn push_items(items: &[InputItem], messages: &mut Vec<Message>) {
 /// blocks per request. Only the live request's `instructions` + `input`
 /// (handled in `process` directly, not via this function) should carry markers.
 fn push_stored_items(items: &[serde_json::Value], messages: &mut Vec<Message>) {
-    let typed: Vec<InputItem> = items
-        .iter()
-        .filter_map(|v| serde_json::from_value(v.clone()).ok())
-        .collect();
-    let before_len = messages.len();
-    push_items(&typed, messages);
-    for msg in &mut messages[before_len..] {
-        msg.cached = false;
-        msg.cache_ttl = None;
-    }
+	let typed: Vec<InputItem> = items
+		.iter()
+		.filter_map(|v| serde_json::from_value(v.clone()).ok())
+		.collect();
+	let before_len = messages.len();
+	push_items(&typed, messages);
+	for msg in &mut messages[before_len..] {
+		msg.cached = false;
+		msg.cache_ttl = None;
+	}
 }
 
 /// Append `tool_call` to the trailing assistant Message's `tool_calls` array,
 /// or create an empty assistant Message carrying it if none precedes.
 fn attach_tool_call_to_assistant(messages: &mut Vec<Message>, tool_call: serde_json::Value) {
-    if let Some(last) = messages.last_mut() {
-        if last.role == "assistant" {
-            match last.tool_calls.as_mut() {
-                Some(serde_json::Value::Array(arr)) => arr.push(tool_call),
-                _ => last.tool_calls = Some(serde_json::Value::Array(vec![tool_call])),
-            }
-            return;
-        }
-    }
-    let mut msg = Message::assistant("");
-    msg.tool_calls = Some(serde_json::Value::Array(vec![tool_call]));
-    messages.push(msg);
+	if let Some(last) = messages.last_mut() {
+		if last.role == "assistant" {
+			match last.tool_calls.as_mut() {
+				Some(serde_json::Value::Array(arr)) => arr.push(tool_call),
+				_ => last.tool_calls = Some(serde_json::Value::Array(vec![tool_call])),
+			}
+			return;
+		}
+	}
+	let mut msg = Message::assistant("");
+	msg.tool_calls = Some(serde_json::Value::Array(vec![tool_call]));
+	messages.push(msg);
 }
 
 /// Attach `text` as a ThinkingBlock on the trailing assistant Message, or create
 /// an empty assistant Message carrying it if none precedes.
 fn attach_thinking_to_assistant(messages: &mut Vec<Message>, text: String) {
-    if let Some(last) = messages.last_mut() {
-        if last.role == "assistant" {
-            last.thinking = Some(ThinkingBlock::new(&text));
-            return;
-        }
-    }
-    let mut msg = Message::assistant("");
-    msg.thinking = Some(ThinkingBlock::new(&text));
-    messages.push(msg);
+	if let Some(last) = messages.last_mut() {
+		if last.role == "assistant" {
+			last.thinking = Some(ThinkingBlock::new(&text));
+			return;
+		}
+	}
+	let mut msg = Message::assistant("");
+	msg.thinking = Some(ThinkingBlock::new(&text));
+	messages.push(msg);
 }
 
 /// Reject the request if `api_key.allowed_models` is set and `model` isn't
@@ -1497,36 +1445,33 @@ fn attach_thinking_to_assistant(messages: &mut Vec<Message>, text: String) {
 /// and keeps the provider-side prompt cache warm. `pick_admitted` still
 /// falls through to the others when the preferred windows are exhausted.
 fn prefer_provider(candidates: &mut [(String, String)], provider: &str) {
-    candidates.sort_by_key(|(p, _)| !p.eq_ignore_ascii_case(provider));
+	candidates.sort_by_key(|(p, _)| !p.eq_ignore_ascii_case(provider));
 }
 
 /// After a modality mismatch, only another host for the same resolved model is
 /// a valid failover. A different model under the alias must never receive the
 /// request implicitly.
-fn retain_same_model_failover_candidates(
-    candidates: &mut Vec<(String, String)>,
-    mismatch: &ModalityNotSupportedError,
-) {
-    candidates.retain(|(provider, model)| {
-        !provider.eq_ignore_ascii_case(&mismatch.provider) && same_model(model, &mismatch.model)
-    });
+fn retain_same_model_failover_candidates(candidates: &mut Vec<(String, String)>, mismatch: &ModalityNotSupportedError) {
+	candidates.retain(|(provider, model)| {
+		!provider.eq_ignore_ascii_case(&mismatch.provider) && same_model(model, &mismatch.model)
+	});
 }
 
 /// Hosts name one model differently (`kimi-2.7-code` on Ollama,
 /// `@cf/moonshotai/kimi-k2.7-code` on Workers AI); octolib's reference id is
 /// what says two lane models are the same model.
 fn same_model(a: &str, b: &str) -> bool {
-    a == b || reference_model_id(a).is_some_and(|id| reference_model_id(b) == Some(id))
+	a == b || reference_model_id(a).is_some_and(|id| reference_model_id(b) == Some(id))
 }
 
 /// Keep the candidates whose provider guarantees a JSON schema's shape —
 /// octolib's `enforces_response_schema` is the single source of that fact.
 fn retain_schema_enforcing_candidates(candidates: &mut Vec<(String, String)>) {
-    candidates.retain(|(provider, model)| enforces_response_schema(provider, model));
+	candidates.retain(|(provider, model)| enforces_response_schema(provider, model));
 }
 
 pub(crate) fn enforces_response_schema(provider: &str, model: &str) -> bool {
-    ProviderFactory::create_provider(provider).is_ok_and(|p| p.enforces_response_schema(model))
+	ProviderFactory::create_provider(provider).is_ok_and(|p| p.enforces_response_schema(model))
 }
 
 /// Pick the first candidate whose provider rate windows admit a request
@@ -1535,290 +1480,279 @@ pub(crate) fn enforces_response_schema(provider: &str, model: &str) -> bool {
 /// blocked. Exhausted candidates are skipped; when ALL are exhausted the
 /// caller gets [`RateLimitedError`] carrying the soonest retry among them.
 pub(crate) fn pick_admitted(
-    tracker: &ProviderRateTracker,
-    health: &ProviderHealth,
-    config: &Config,
-    mut candidates: Vec<(String, String)>,
-    model: &str,
+	tracker: &ProviderRateTracker,
+	health: &ProviderHealth,
+	config: &Config,
+	mut candidates: Vec<(String, String)>,
+	model: &str,
 ) -> Result<(String, String)> {
-    // Stable sort: healthy candidates keep their (sticky + rotation) order
-    // in front, cooling ones follow as a last resort.
-    candidates.sort_by_key(|(provider, _)| health.is_cooling(provider));
+	// Stable sort: healthy candidates keep their (sticky + rotation) order
+	// in front, cooling ones follow as a last resort.
+	candidates.sort_by_key(|(provider, _)| health.is_cooling(provider));
 
-    let mut soonest_retry: Option<std::time::Duration> = None;
-    for (provider, resolved) in candidates {
-        // No [providers.<name>] section (or no rate limits in it) — admit.
-        let Some(provider_cfg) = config.provider_config(&provider) else {
-            return Ok((provider, resolved));
-        };
-        match tracker.try_admit(&provider, provider_cfg) {
-            Ok(()) => return Ok((provider, resolved)),
-            Err(retry) => {
-                tracing::info!(
-                    provider = %provider,
-                    retry_in_s = retry.as_secs(),
-                    "provider rate window exhausted — skipping candidate"
-                );
-                crate::metrics::record_rate_limited(&provider);
-                soonest_retry = Some(soonest_retry.map_or(retry, |s| s.min(retry)));
-            }
-        }
-    }
-    Err(anyhow!(RateLimitedError {
-        model: model.to_string(),
-        retry_after: soonest_retry.unwrap_or_default(),
-    }))
+	let mut soonest_retry: Option<std::time::Duration> = None;
+	for (provider, resolved) in candidates {
+		// No [providers.<name>] section (or no rate limits in it) — admit.
+		let Some(provider_cfg) = config.provider_config(&provider) else {
+			return Ok((provider, resolved));
+		};
+		match tracker.try_admit(&provider, provider_cfg) {
+			Ok(()) => return Ok((provider, resolved)),
+			Err(retry) => {
+				tracing::info!(
+					provider = %provider,
+					retry_in_s = retry.as_secs(),
+					"provider rate window exhausted — skipping candidate"
+				);
+				crate::metrics::record_rate_limited(&provider);
+				soonest_retry = Some(soonest_retry.map_or(retry, |s| s.min(retry)));
+			}
+		}
+	}
+	Err(anyhow!(RateLimitedError {
+		model: model.to_string(),
+		retry_after: soonest_retry.unwrap_or_default(),
+	}))
 }
 
 pub(crate) fn ensure_model_allowed(api_key: &ApiKey, model: &str) -> Result<()> {
-    if api_key.is_model_allowed(model) {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "{}: model '{}' is not permitted for this API key",
-        MODEL_FORBIDDEN_MARKER,
-        model
-    ))
+	if api_key.is_model_allowed(model) {
+		return Ok(());
+	}
+	Err(anyhow!(
+		"{}: model '{}' is not permitted for this API key",
+		MODEL_FORBIDDEN_MARKER,
+		model
+	))
 }
 
 // Implement Serialize for Input so we can store it
 impl serde::Serialize for Input {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Input::Text(s) => serializer.serialize_str(s),
-            Input::Items(items) => items.serialize(serializer),
-        }
-    }
+	fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		match self {
+			Input::Text(s) => serializer.serialize_str(s),
+			Input::Items(items) => items.serialize(serializer),
+		}
+	}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::ProviderConfig;
-    use std::collections::HashMap;
+	use super::*;
+	use crate::config::ProviderConfig;
+	use std::collections::HashMap;
 
-    fn config_with_provider(name: &str, cfg: ProviderConfig) -> Config {
-        let mut providers = HashMap::new();
-        providers.insert(name.to_string(), cfg);
-        Config {
-            server: Default::default(),
-            models: HashMap::new(),
-            embedding_models: HashMap::new(),
-            media_models: HashMap::new(),
-            evaluation_models: HashMap::new(),
-            auto: HashMap::new(),
-            providers,
-            logging: Default::default(),
-            metrics: Default::default(),
-            media: Default::default(),
-            media_providers: HashMap::new(),
-        }
-    }
+	fn config_with_provider(name: &str, cfg: ProviderConfig) -> Config {
+		let mut providers = HashMap::new();
+		providers.insert(name.to_string(), cfg);
+		Config {
+			server: Default::default(),
+			models: HashMap::new(),
+			embedding_models: HashMap::new(),
+			media_models: HashMap::new(),
+			evaluation_models: HashMap::new(),
+			auto: HashMap::new(),
+			providers,
+			logging: Default::default(),
+			metrics: Default::default(),
+			media: Default::default(),
+			media_providers: HashMap::new(),
+		}
+	}
 
-    fn candidate(provider: &str, model: &str) -> (String, String) {
-        (provider.to_string(), model.to_string())
-    }
+	fn candidate(provider: &str, model: &str) -> (String, String) {
+		(provider.to_string(), model.to_string())
+	}
 
-    /// pick_admitted with a fresh (all-healthy) health tracker.
-    fn pick(
-        tracker: &ProviderRateTracker,
-        config: &Config,
-        candidates: Vec<(String, String)>,
-        model: &str,
-    ) -> Result<(String, String)> {
-        pick_admitted(tracker, &ProviderHealth::new(), config, candidates, model)
-    }
+	/// pick_admitted with a fresh (all-healthy) health tracker.
+	fn pick(
+		tracker: &ProviderRateTracker,
+		config: &Config,
+		candidates: Vec<(String, String)>,
+		model: &str,
+	) -> Result<(String, String)> {
+		pick_admitted(tracker, &ProviderHealth::new(), config, candidates, model)
+	}
 
-    #[test]
-    fn pick_admitted_skips_exhausted_provider() {
-        let tracker = ProviderRateTracker::new();
-        let config = config_with_provider(
-            "moonshot",
-            ProviderConfig {
-                requests_per_minute: Some(1),
-                ..Default::default()
-            },
-        );
+	#[test]
+	fn pick_admitted_skips_exhausted_provider() {
+		let tracker = ProviderRateTracker::new();
+		let config = config_with_provider(
+			"moonshot",
+			ProviderConfig {
+				requests_per_minute: Some(1),
+				..Default::default()
+			},
+		);
 
-        // Consume moonshot's single request slot.
-        let cfg = config.provider_config("moonshot").unwrap();
-        tracker.try_admit("moonshot", cfg).unwrap();
+		// Consume moonshot's single request slot.
+		let cfg = config.provider_config("moonshot").unwrap();
+		tracker.try_admit("moonshot", cfg).unwrap();
 
-        let picked = pick(
-            &tracker,
-            &config,
-            vec![
-                candidate("moonshot", "kimi-k2"),
-                candidate("ollama", "kimi-k2"),
-            ],
-            "kimi-k2",
-        )
-        .unwrap();
-        assert_eq!(picked.0, "ollama", "exhausted first candidate is skipped");
-    }
+		let picked = pick(
+			&tracker,
+			&config,
+			vec![candidate("moonshot", "kimi-k2"), candidate("ollama", "kimi-k2")],
+			"kimi-k2",
+		)
+		.unwrap();
+		assert_eq!(picked.0, "ollama", "exhausted first candidate is skipped");
+	}
 
-    #[test]
-    fn pick_admitted_fails_429_when_all_exhausted() {
-        let tracker = ProviderRateTracker::new();
-        let config = config_with_provider(
-            "moonshot",
-            ProviderConfig {
-                requests_per_minute: Some(1),
-                ..Default::default()
-            },
-        );
-        let cfg = config.provider_config("moonshot").unwrap();
-        tracker.try_admit("moonshot", cfg).unwrap();
+	#[test]
+	fn pick_admitted_fails_429_when_all_exhausted() {
+		let tracker = ProviderRateTracker::new();
+		let config = config_with_provider(
+			"moonshot",
+			ProviderConfig {
+				requests_per_minute: Some(1),
+				..Default::default()
+			},
+		);
+		let cfg = config.provider_config("moonshot").unwrap();
+		tracker.try_admit("moonshot", cfg).unwrap();
 
-        let err = pick(
-            &tracker,
-            &config,
-            vec![candidate("moonshot", "kimi-k2")],
-            "kimi-k2",
-        )
-        .expect_err("all candidates exhausted");
-        let rate = err
-            .downcast_ref::<RateLimitedError>()
-            .expect("typed error for the 429 mapping");
-        assert_eq!(rate.model, "kimi-k2");
-        assert!(rate.retry_after > std::time::Duration::ZERO);
-    }
+		let err = pick(&tracker, &config, vec![candidate("moonshot", "kimi-k2")], "kimi-k2")
+			.expect_err("all candidates exhausted");
+		let rate = err
+			.downcast_ref::<RateLimitedError>()
+			.expect("typed error for the 429 mapping");
+		assert_eq!(rate.model, "kimi-k2");
+		assert!(rate.retry_after > std::time::Duration::ZERO);
+	}
 
-    #[test]
-    fn pick_admitted_counts_the_winning_request() {
-        let tracker = ProviderRateTracker::new();
-        let config = config_with_provider(
-            "moonshot",
-            ProviderConfig {
-                requests_per_minute: Some(1),
-                ..Default::default()
-            },
-        );
+	#[test]
+	fn pick_admitted_counts_the_winning_request() {
+		let tracker = ProviderRateTracker::new();
+		let config = config_with_provider(
+			"moonshot",
+			ProviderConfig {
+				requests_per_minute: Some(1),
+				..Default::default()
+			},
+		);
 
-        let candidates = vec![candidate("moonshot", "kimi-k2")];
-        assert!(pick(&tracker, &config, candidates.clone(), "kimi-k2").is_ok());
-        assert!(
-            pick(&tracker, &config, candidates, "kimi-k2").is_err(),
-            "admission must have consumed the rpm=1 budget"
-        );
-    }
+		let candidates = vec![candidate("moonshot", "kimi-k2")];
+		assert!(pick(&tracker, &config, candidates.clone(), "kimi-k2").is_ok());
+		assert!(
+			pick(&tracker, &config, candidates, "kimi-k2").is_err(),
+			"admission must have consumed the rpm=1 budget"
+		);
+	}
 
-    #[test]
-    fn prefer_provider_moves_sticky_to_front_preserving_rest() {
-        let mut candidates = vec![
-            candidate("openai", "m"),
-            candidate("groq", "m"),
-            candidate("Anthropic", "m"),
-        ];
-        prefer_provider(&mut candidates, "anthropic");
-        assert_eq!(
-            candidates,
-            vec![
-                candidate("Anthropic", "m"),
-                candidate("openai", "m"),
-                candidate("groq", "m"),
-            ],
-            "sticky provider first (case-insensitive), others keep order"
-        );
-    }
+	#[test]
+	fn prefer_provider_moves_sticky_to_front_preserving_rest() {
+		let mut candidates = vec![
+			candidate("openai", "m"),
+			candidate("groq", "m"),
+			candidate("Anthropic", "m"),
+		];
+		prefer_provider(&mut candidates, "anthropic");
+		assert_eq!(
+			candidates,
+			vec![
+				candidate("Anthropic", "m"),
+				candidate("openai", "m"),
+				candidate("groq", "m"),
+			],
+			"sticky provider first (case-insensitive), others keep order"
+		);
+	}
 
-    #[test]
-    fn sticky_provider_wins_until_exhausted() {
-        let tracker = ProviderRateTracker::new();
-        let config = config_with_provider(
-            "anthropic",
-            ProviderConfig {
-                requests_per_minute: Some(1),
-                ..Default::default()
-            },
-        );
+	#[test]
+	fn sticky_provider_wins_until_exhausted() {
+		let tracker = ProviderRateTracker::new();
+		let config = config_with_provider(
+			"anthropic",
+			ProviderConfig {
+				requests_per_minute: Some(1),
+				..Default::default()
+			},
+		);
 
-        let mut candidates = vec![candidate("openai", "m"), candidate("anthropic", "m")];
-        prefer_provider(&mut candidates, "anthropic");
+		let mut candidates = vec![candidate("openai", "m"), candidate("anthropic", "m")];
+		prefer_provider(&mut candidates, "anthropic");
 
-        // Turn 1: session sticks to its previous provider.
-        let picked = pick(&tracker, &config, candidates.clone(), "m").unwrap();
-        assert_eq!(picked.0, "anthropic");
+		// Turn 1: session sticks to its previous provider.
+		let picked = pick(&tracker, &config, candidates.clone(), "m").unwrap();
+		assert_eq!(picked.0, "anthropic");
 
-        // Turn 2: sticky provider's window exhausted — fall through, don't fail.
-        let picked = pick(&tracker, &config, candidates, "m").unwrap();
-        assert_eq!(picked.0, "openai");
-    }
+		// Turn 2: sticky provider's window exhausted — fall through, don't fail.
+		let picked = pick(&tracker, &config, candidates, "m").unwrap();
+		assert_eq!(picked.0, "openai");
+	}
 
-    #[test]
-    fn schema_requests_keep_only_enforcing_lanes_in_order() {
-        // Z.ai answers schemas with json_object only; Alibaba's Qwen3.8 family
-        // decodes against the schema; an unknown provider can't be trusted.
-        let mut candidates = vec![
-            candidate("zai", "glm-5.3-flash"),
-            candidate("alibaba", "qwen3.8-flash"),
-            candidate("no-such-provider", "m"),
-            candidate("openai", "gpt-5.5"),
-        ];
-        retain_schema_enforcing_candidates(&mut candidates);
-        assert_eq!(
-            candidates,
-            vec![
-                candidate("alibaba", "qwen3.8-flash"),
-                candidate("openai", "gpt-5.5")
-            ]
-        );
+	#[test]
+	fn schema_requests_keep_only_enforcing_lanes_in_order() {
+		// Z.ai answers schemas with json_object only; Alibaba's Qwen3.8 family
+		// decodes against the schema; an unknown provider can't be trusted.
+		let mut candidates = vec![
+			candidate("zai", "glm-5.3-flash"),
+			candidate("alibaba", "qwen3.8-flash"),
+			candidate("no-such-provider", "m"),
+			candidate("openai", "gpt-5.5"),
+		];
+		retain_schema_enforcing_candidates(&mut candidates);
+		assert_eq!(
+			candidates,
+			vec![candidate("alibaba", "qwen3.8-flash"), candidate("openai", "gpt-5.5")]
+		);
 
-        let mut candidates = vec![candidate("zai", "glm-5.3-flash")];
-        retain_schema_enforcing_candidates(&mut candidates);
-        assert!(candidates.is_empty());
-    }
+		let mut candidates = vec![candidate("zai", "glm-5.3-flash")];
+		retain_schema_enforcing_candidates(&mut candidates);
+		assert!(candidates.is_empty());
+	}
 
-    #[test]
-    fn modality_failover_keeps_only_same_model_on_another_host() {
-        let mut candidates = vec![
-            candidate("openai", "vision-model"),
-            candidate("ollama", "vision-model"),
-            candidate("anthropic", "different-model"),
-        ];
-        let mismatch = ModalityNotSupportedError {
-            provider: "openai".to_string(),
-            model: "vision-model".to_string(),
-            modality: "image".to_string(),
-        };
+	#[test]
+	fn modality_failover_keeps_only_same_model_on_another_host() {
+		let mut candidates = vec![
+			candidate("openai", "vision-model"),
+			candidate("ollama", "vision-model"),
+			candidate("anthropic", "different-model"),
+		];
+		let mismatch = ModalityNotSupportedError {
+			provider: "openai".to_string(),
+			model: "vision-model".to_string(),
+			modality: "image".to_string(),
+		};
 
-        retain_same_model_failover_candidates(&mut candidates, &mismatch);
+		retain_same_model_failover_candidates(&mut candidates, &mismatch);
 
-        assert_eq!(candidates, vec![candidate("ollama", "vision-model")]);
-    }
+		assert_eq!(candidates, vec![candidate("ollama", "vision-model")]);
+	}
 
-    #[test]
-    fn modality_failover_keeps_other_hosts_that_name_the_model_differently() {
-        let mut candidates = vec![
-            candidate("ollama", "kimi-2.7-code"),
-            candidate("cloudflare", "@cf/moonshotai/kimi-k2.7-code"),
-            candidate("together", "moonshotai/Kimi-K2.7-Code"),
-            candidate("together", "moonshotai/Kimi-K2.6"),
-        ];
-        let mismatch = ModalityNotSupportedError {
-            provider: "ollama".to_string(),
-            model: "kimi-2.7-code".to_string(),
-            modality: "video".to_string(),
-        };
+	#[test]
+	fn modality_failover_keeps_other_hosts_that_name_the_model_differently() {
+		let mut candidates = vec![
+			candidate("ollama", "kimi-2.7-code"),
+			candidate("cloudflare", "@cf/moonshotai/kimi-k2.7-code"),
+			candidate("together", "moonshotai/Kimi-K2.7-Code"),
+			candidate("together", "moonshotai/Kimi-K2.6"),
+		];
+		let mismatch = ModalityNotSupportedError {
+			provider: "ollama".to_string(),
+			model: "kimi-2.7-code".to_string(),
+			modality: "video".to_string(),
+		};
 
-        retain_same_model_failover_candidates(&mut candidates, &mismatch);
+		retain_same_model_failover_candidates(&mut candidates, &mismatch);
 
-        assert_eq!(
-            candidates,
-            vec![
-                candidate("cloudflare", "@cf/moonshotai/kimi-k2.7-code"),
-                candidate("together", "moonshotai/Kimi-K2.7-Code"),
-            ]
-        );
-    }
+		assert_eq!(
+			candidates,
+			vec![
+				candidate("cloudflare", "@cf/moonshotai/kimi-k2.7-code"),
+				candidate("together", "moonshotai/Kimi-K2.7-Code"),
+			]
+		);
+	}
 
-    #[test]
-    fn anthropic_image_reaches_provider_message_as_base64_attachment() {
-        let chat: ChatCompletionRequest = serde_json::from_str(
-            r#"{
+	#[test]
+	fn anthropic_image_reaches_provider_message_as_base64_attachment() {
+		let chat: ChatCompletionRequest = serde_json::from_str(
+			r#"{
                 "model": "vision-model",
                 "messages": [{
                     "role": "user",
@@ -1832,270 +1766,257 @@ mod tests {
                     }]
                 }]
             }"#,
-        )
-        .unwrap();
-        let request: CreateCompletionRequest = chat.into();
-        let Input::Items(items) = request.input else {
-            panic!("chat request must convert to input items");
-        };
-        let mut messages = Vec::new();
+		)
+		.unwrap();
+		let request: CreateCompletionRequest = chat.into();
+		let Input::Items(items) = request.input else {
+			panic!("chat request must convert to input items");
+		};
+		let mut messages = Vec::new();
 
-        push_items(&items, &mut messages);
+		push_items(&items, &mut messages);
 
-        let images = messages[0]
-            .images
-            .as_ref()
-            .expect("provider message must carry the image");
-        assert_eq!(images[0].media_type, "image/png");
-        assert!(matches!(
-            &images[0].data,
-            ImageData::Base64(data) if data == "aW1hZ2U="
-        ));
-    }
+		let images = messages[0]
+			.images
+			.as_ref()
+			.expect("provider message must carry the image");
+		assert_eq!(images[0].media_type, "image/png");
+		assert!(matches!(
+			&images[0].data,
+			ImageData::Base64(data) if data == "aW1hZ2U="
+		));
+	}
 
-    #[test]
-    fn cooling_provider_is_deprioritized_not_blocked() {
-        let tracker = ProviderRateTracker::new();
-        let health = ProviderHealth::new();
-        let config = config_with_provider("moonshot", ProviderConfig::default());
-        let cooldown = std::time::Duration::from_secs(60);
-        for _ in 0..3 {
-            health.record_failure("openai", cooldown);
-        }
+	#[test]
+	fn cooling_provider_is_deprioritized_not_blocked() {
+		let tracker = ProviderRateTracker::new();
+		let health = ProviderHealth::new();
+		let config = config_with_provider("moonshot", ProviderConfig::default());
+		let cooldown = std::time::Duration::from_secs(60);
+		for _ in 0..3 {
+			health.record_failure("openai", cooldown);
+		}
 
-        // Healthy candidate wins even though the cooling one is listed first.
-        let candidates = vec![candidate("openai", "m"), candidate("groq", "m")];
-        let picked = pick_admitted(&tracker, &health, &config, candidates, "m").unwrap();
-        assert_eq!(picked.0, "groq", "cooling provider sorted behind healthy");
+		// Healthy candidate wins even though the cooling one is listed first.
+		let candidates = vec![candidate("openai", "m"), candidate("groq", "m")];
+		let picked = pick_admitted(&tracker, &health, &config, candidates, "m").unwrap();
+		assert_eq!(picked.0, "groq", "cooling provider sorted behind healthy");
 
-        // A cooling provider as the ONLY candidate still dispatches.
-        let picked = pick_admitted(
-            &tracker,
-            &health,
-            &config,
-            vec![candidate("openai", "m")],
-            "m",
-        )
-        .unwrap();
-        assert_eq!(picked.0, "openai", "cooldown deprioritizes, never blocks");
-    }
+		// A cooling provider as the ONLY candidate still dispatches.
+		let picked = pick_admitted(&tracker, &health, &config, vec![candidate("openai", "m")], "m").unwrap();
+		assert_eq!(picked.0, "openai", "cooldown deprioritizes, never blocks");
+	}
 
-    #[test]
-    fn evaluation_errors_are_classified_by_variant() {
-        let rate = anyhow!(EvaluationError::RateLimit {
-            provider: "typesafe".into(),
-            message: "slow down".into(),
-            retry_after_secs: Some(2),
-        })
-        .context("Evaluation provider 'typesafe' failed for model 'jev-latest'");
-        assert!(is_provider_fault(&rate));
-        assert!(matches!(
-            evaluation_error(&rate),
-            Some(EvaluationError::RateLimit { .. })
-        ));
+	#[test]
+	fn evaluation_errors_are_classified_by_variant() {
+		let rate = anyhow!(EvaluationError::RateLimit {
+			provider: "typesafe".into(),
+			message: "slow down".into(),
+			retry_after_secs: Some(2),
+		})
+		.context("Evaluation provider 'typesafe' failed for model 'jev-latest'");
+		assert!(is_provider_fault(&rate));
+		assert!(matches!(
+			evaluation_error(&rate),
+			Some(EvaluationError::RateLimit { .. })
+		));
 
-        let overloaded = anyhow!(EvaluationError::Api {
-            provider: "typesafe".into(),
-            status: 529,
-            message: "overloaded".into(),
-        });
-        assert!(is_provider_fault(&overloaded));
+		let overloaded = anyhow!(EvaluationError::Api {
+			provider: "typesafe".into(),
+			status: 529,
+			message: "overloaded".into(),
+		});
+		assert!(is_provider_fault(&overloaded));
 
-        let rejected = anyhow!(EvaluationError::InvalidRequest("bad question".into()));
-        assert!(!is_provider_fault(&rejected));
+		let rejected = anyhow!(EvaluationError::InvalidRequest("bad question".into()));
+		assert!(!is_provider_fault(&rejected));
 
-        let bad_request = anyhow!(EvaluationError::Api {
-            provider: "typesafe".into(),
-            status: 400,
-            message: "bad question".into(),
-        });
-        assert!(!is_provider_fault(&bad_request));
+		let bad_request = anyhow!(EvaluationError::Api {
+			provider: "typesafe".into(),
+			status: 400,
+			message: "bad question".into(),
+		});
+		assert!(!is_provider_fault(&bad_request));
 
-        // A revoked key is this lane's problem; the next lane may be keyed.
-        let unauthenticated = anyhow!(EvaluationError::Authentication {
-            provider: "typesafe".into(),
-            message: "bad key".into(),
-        });
-        assert!(is_provider_fault(&unauthenticated));
+		// A revoked key is this lane's problem; the next lane may be keyed.
+		let unauthenticated = anyhow!(EvaluationError::Authentication {
+			provider: "typesafe".into(),
+			message: "bad key".into(),
+		});
+		assert!(is_provider_fault(&unauthenticated));
 
-        // An unkeyed lane must not block the keyed one behind it.
-        let unkeyed = anyhow!(EvaluationError::MissingApiKey("TYPESAFE_API_KEY".into()));
-        assert!(is_provider_fault(&unkeyed));
-    }
+		// An unkeyed lane must not block the keyed one behind it.
+		let unkeyed = anyhow!(EvaluationError::MissingApiKey("TYPESAFE_API_KEY".into()));
+		assert!(is_provider_fault(&unkeyed));
+	}
 
-    #[test]
-    fn provider_fault_classification() {
-        let upstream_timeout = anyhow::Error::new(ProxyTimeoutError::Upstream {
-            provider: "openai".to_string(),
-            timeout: std::time::Duration::from_secs(360),
-        });
-        assert!(is_provider_fault(&upstream_timeout));
+	#[test]
+	fn provider_fault_classification() {
+		let upstream_timeout = anyhow::Error::new(ProxyTimeoutError::Upstream {
+			provider: "openai".to_string(),
+			timeout: std::time::Duration::from_secs(360),
+		});
+		assert!(is_provider_fault(&upstream_timeout));
 
-        let queue_timeout = anyhow::Error::new(ProxyTimeoutError::ProviderQueue {
-            provider: "openai".to_string(),
-            timeout: std::time::Duration::from_secs(60),
-        });
-        assert!(
-            !is_provider_fault(&queue_timeout),
-            "our own queue capacity is not the provider's fault"
-        );
+		let queue_timeout = anyhow::Error::new(ProxyTimeoutError::ProviderQueue {
+			provider: "openai".to_string(),
+			timeout: std::time::Duration::from_secs(60),
+		});
+		assert!(
+			!is_provider_fault(&queue_timeout),
+			"our own queue capacity is not the provider's fault"
+		);
 
-        let upstream_500 = anyhow::anyhow!("openai API error 503 Service Unavailable");
-        assert!(is_provider_fault(&upstream_500));
+		let upstream_500 = anyhow::anyhow!("openai API error 503 Service Unavailable");
+		assert!(is_provider_fault(&upstream_500));
 
-        let upstream_429 = anyhow::anyhow!("anthropic API error 429 Too Many Requests");
-        assert!(is_provider_fault(&upstream_429));
+		let upstream_429 = anyhow::anyhow!("anthropic API error 429 Too Many Requests");
+		assert!(is_provider_fault(&upstream_429));
 
-        let client_400 = anyhow::anyhow!("ollama API error 400 Bad Request: prompt too long");
-        assert!(
-            !is_provider_fault(&client_400),
-            "400 is the request's fault — every provider rejects it"
-        );
+		let client_400 = anyhow::anyhow!("ollama API error 400 Bad Request: prompt too long");
+		assert!(
+			!is_provider_fault(&client_400),
+			"400 is the request's fault — every provider rejects it"
+		);
 
-        let past_due = anyhow::anyhow!(
-            "Provider 'ollama' chat_completion failed: ollama API error 403 Forbidden: \
+		let past_due = anyhow::anyhow!(
+			"Provider 'ollama' chat_completion failed: ollama API error 403 Forbidden: \
              your subscription payment is past due"
-        );
-        assert!(
-            is_provider_fault(&past_due),
-            "a lane's billing/auth rejection must fail over and cool the lane"
-        );
+		);
+		assert!(
+			is_provider_fault(&past_due),
+			"a lane's billing/auth rejection must fail over and cool the lane"
+		);
 
-        let model_gone = anyhow::anyhow!("together API error 404 Not Found: model not found");
-        assert!(is_provider_fault(&model_gone));
+		let model_gone = anyhow::anyhow!("together API error 404 Not Found: model not found");
+		assert!(is_provider_fault(&model_gone));
 
-        let connect_error = anyhow::anyhow!("connection refused");
-        assert!(
-            is_provider_fault(&connect_error),
-            "transport errors without a status are provider-side"
-        );
-    }
+		let connect_error = anyhow::anyhow!("connection refused");
+		assert!(
+			is_provider_fault(&connect_error),
+			"transport errors without a status are provider-side"
+		);
+	}
 
-    #[test]
-    fn pick_admitted_ignores_providers_without_config() {
-        let tracker = ProviderRateTracker::new();
-        let config = config_with_provider("moonshot", ProviderConfig::default());
+	#[test]
+	fn pick_admitted_ignores_providers_without_config() {
+		let tracker = ProviderRateTracker::new();
+		let config = config_with_provider("moonshot", ProviderConfig::default());
 
-        // Unlisted provider and listed-but-unlimited provider both admit.
-        for provider in ["ollama", "moonshot"] {
-            let picked = pick(&tracker, &config, vec![candidate(provider, "m")], "m").unwrap();
-            assert_eq!(picked.0, provider);
-        }
-    }
+		// Unlisted provider and listed-but-unlimited provider both admit.
+		for provider in ["ollama", "moonshot"] {
+			let picked = pick(&tracker, &config, vec![candidate(provider, "m")], "m").unwrap();
+			assert_eq!(picked.0, provider);
+		}
+	}
 
-    fn item(json: &str) -> InputItem {
-        serde_json::from_str(json).unwrap()
-    }
+	fn item(json: &str) -> InputItem {
+		serde_json::from_str(json).unwrap()
+	}
 
-    #[test]
-    fn function_call_coalesces_onto_preceding_assistant() {
-        // Client replays: user → assistant text → function_call → function_call_output → user
-        // Expected octolib message shape: user / assistant(text + tool_calls) / tool / user
-        let items = vec![
-            item(r#"{"type":"message","role":"user","content":"hi"}"#),
-            item(r#"{"type":"message","role":"assistant","content":"calling tool"}"#),
-            item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
-            item(r#"{"type":"function_call_output","call_id":"c1","output":"ok"}"#),
-            item(r#"{"type":"message","role":"user","content":"thanks"}"#),
-        ];
-        let mut messages = Vec::new();
-        push_items(&items, &mut messages);
+	#[test]
+	fn function_call_coalesces_onto_preceding_assistant() {
+		// Client replays: user → assistant text → function_call → function_call_output → user
+		// Expected octolib message shape: user / assistant(text + tool_calls) / tool / user
+		let items = vec![
+			item(r#"{"type":"message","role":"user","content":"hi"}"#),
+			item(r#"{"type":"message","role":"assistant","content":"calling tool"}"#),
+			item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
+			item(r#"{"type":"function_call_output","call_id":"c1","output":"ok"}"#),
+			item(r#"{"type":"message","role":"user","content":"thanks"}"#),
+		];
+		let mut messages = Vec::new();
+		push_items(&items, &mut messages);
 
-        assert_eq!(messages.len(), 4, "tool_call merges into assistant turn");
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[1].role, "assistant");
-        assert!(
-            messages[1].tool_calls.is_some(),
-            "assistant must carry tool_calls"
-        );
-        assert_eq!(messages[2].role, "tool");
-        assert_eq!(messages[3].role, "user");
-    }
+		assert_eq!(messages.len(), 4, "tool_call merges into assistant turn");
+		assert_eq!(messages[0].role, "user");
+		assert_eq!(messages[1].role, "assistant");
+		assert!(messages[1].tool_calls.is_some(), "assistant must carry tool_calls");
+		assert_eq!(messages[2].role, "tool");
+		assert_eq!(messages[3].role, "user");
+	}
 
-    #[test]
-    fn function_call_without_preceding_assistant_creates_one() {
-        // Edge case: client sends function_call as the first item with no prior assistant.
-        let items = vec![
-            item(r#"{"type":"message","role":"user","content":"go"}"#),
-            item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
-        ];
-        let mut messages = Vec::new();
-        push_items(&items, &mut messages);
+	#[test]
+	fn function_call_without_preceding_assistant_creates_one() {
+		// Edge case: client sends function_call as the first item with no prior assistant.
+		let items = vec![
+			item(r#"{"type":"message","role":"user","content":"go"}"#),
+			item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
+		];
+		let mut messages = Vec::new();
+		push_items(&items, &mut messages);
 
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].role, "assistant");
-        assert!(messages[1].tool_calls.is_some());
-    }
+		assert_eq!(messages.len(), 2);
+		assert_eq!(messages[1].role, "assistant");
+		assert!(messages[1].tool_calls.is_some());
+	}
 
-    #[test]
-    fn function_call_output_forwards_cache_control() {
-        // A tool result carrying a cache marker must propagate to the upstream
-        // Message (cached + ttl) — it's the agent-loop tail breakpoint. Regression
-        // for the proxy silently dropping markers on tool results.
-        let cached = item(
-            r#"{"type":"function_call_output","call_id":"c1","output":"ok","cache_control":{"type":"ephemeral","ttl":"1h"}}"#,
-        );
-        let plain = item(r#"{"type":"function_call_output","call_id":"c2","output":"ok"}"#);
-        let mut messages = Vec::new();
-        push_items(&[cached, plain], &mut messages);
+	#[test]
+	fn function_call_output_forwards_cache_control() {
+		// A tool result carrying a cache marker must propagate to the upstream
+		// Message (cached + ttl) — it's the agent-loop tail breakpoint. Regression
+		// for the proxy silently dropping markers on tool results.
+		let cached = item(
+			r#"{"type":"function_call_output","call_id":"c1","output":"ok","cache_control":{"type":"ephemeral","ttl":"1h"}}"#,
+		);
+		let plain = item(r#"{"type":"function_call_output","call_id":"c2","output":"ok"}"#);
+		let mut messages = Vec::new();
+		push_items(&[cached, plain], &mut messages);
 
-        assert_eq!(messages.len(), 2);
-        assert!(messages[0].cached, "marked tool result must stay cached");
-        assert_eq!(messages[0].cache_ttl.as_deref(), Some("1h"));
-        assert!(
-            !messages[1].cached,
-            "unmarked tool result must not be cached"
-        );
-    }
+		assert_eq!(messages.len(), 2);
+		assert!(messages[0].cached, "marked tool result must stay cached");
+		assert_eq!(messages[0].cache_ttl.as_deref(), Some("1h"));
+		assert!(!messages[1].cached, "unmarked tool result must not be cached");
+	}
 
-    #[test]
-    fn stored_items_strip_tool_cache_control() {
-        // Replayed-from-chain history must NOT carry markers (anti-accumulation vs
-        // Anthropic's 4-breakpoint limit); only live input anchors the breakpoint.
-        let stored = vec![serde_json::json!({
-            "type": "function_call_output",
-            "call_id": "c1",
-            "output": "ok",
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
-        })];
-        let mut messages = Vec::new();
-        push_stored_items(&stored, &mut messages);
+	#[test]
+	fn stored_items_strip_tool_cache_control() {
+		// Replayed-from-chain history must NOT carry markers (anti-accumulation vs
+		// Anthropic's 4-breakpoint limit); only live input anchors the breakpoint.
+		let stored = vec![serde_json::json!({
+			"type": "function_call_output",
+			"call_id": "c1",
+			"output": "ok",
+			"cache_control": {"type": "ephemeral", "ttl": "1h"}
+		})];
+		let mut messages = Vec::new();
+		push_stored_items(&stored, &mut messages);
 
-        assert_eq!(messages.len(), 1);
-        assert!(!messages[0].cached, "replayed history markers are stripped");
-    }
+		assert_eq!(messages.len(), 1);
+		assert!(!messages[0].cached, "replayed history markers are stripped");
+	}
 
-    #[test]
-    fn reasoning_attaches_thinking_to_preceding_assistant() {
-        // DeepSeek migration path: reasoning + tool_call replayed together must
-        // produce one assistant Message carrying both thinking and tool_calls.
-        let items = vec![
-            item(r#"{"type":"message","role":"user","content":"q"}"#),
-            item(r#"{"type":"message","role":"assistant","content":""}"#),
-            item(r#"{"type":"reasoning","content":[{"type":"output_text","text":"think..."}]}"#),
-            item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
-        ];
-        let mut messages = Vec::new();
-        push_items(&items, &mut messages);
+	#[test]
+	fn reasoning_attaches_thinking_to_preceding_assistant() {
+		// DeepSeek migration path: reasoning + tool_call replayed together must
+		// produce one assistant Message carrying both thinking and tool_calls.
+		let items = vec![
+			item(r#"{"type":"message","role":"user","content":"q"}"#),
+			item(r#"{"type":"message","role":"assistant","content":""}"#),
+			item(r#"{"type":"reasoning","content":[{"type":"output_text","text":"think..."}]}"#),
+			item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
+		];
+		let mut messages = Vec::new();
+		push_items(&items, &mut messages);
 
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].role, "assistant");
-        assert!(messages[1].thinking.is_some());
-        assert!(messages[1].tool_calls.is_some());
-    }
+		assert_eq!(messages.len(), 2);
+		assert_eq!(messages[1].role, "assistant");
+		assert!(messages[1].thinking.is_some());
+		assert!(messages[1].tool_calls.is_some());
+	}
 
-    #[test]
-    fn multiple_tool_calls_accumulate_on_same_assistant() {
-        let items = vec![
-            item(r#"{"type":"message","role":"assistant","content":""}"#),
-            item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
-            item(r#"{"type":"function_call","call_id":"c2","name":"g","arguments":"{}"}"#),
-        ];
-        let mut messages = Vec::new();
-        push_items(&items, &mut messages);
+	#[test]
+	fn multiple_tool_calls_accumulate_on_same_assistant() {
+		let items = vec![
+			item(r#"{"type":"message","role":"assistant","content":""}"#),
+			item(r#"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}"#),
+			item(r#"{"type":"function_call","call_id":"c2","name":"g","arguments":"{}"}"#),
+		];
+		let mut messages = Vec::new();
+		push_items(&items, &mut messages);
 
-        assert_eq!(messages.len(), 1);
-        let arr = messages[0].tool_calls.as_ref().unwrap().as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-    }
+		assert_eq!(messages.len(), 1);
+		let arr = messages[0].tool_calls.as_ref().unwrap().as_array().unwrap();
+		assert_eq!(arr.len(), 2);
+	}
 }

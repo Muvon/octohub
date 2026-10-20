@@ -1,8 +1,7 @@
 use super::{
-    decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models,
-    encode_auto_map, encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey,
-    ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia,
-    TimeBucket, UsageRow,
+	decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models, encode_auto_map,
+	encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
+	StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -10,25 +9,23 @@ use std::sync::Mutex;
 
 /// SQLite-backed storage implementation
 pub struct SqliteStorage {
-    conn: Mutex<Connection>,
+	conn: Mutex<Connection>,
 }
 
 impl SqliteStorage {
-    /// Create a new SQLite storage, initializing the schema
-    pub fn new(path: &str) -> Result<Self> {
-        let conn = if path == ":memory:" {
-            Connection::open_in_memory()?
-        } else {
-            Connection::open(path)?
-        };
+	/// Create a new SQLite storage, initializing the schema
+	pub fn new(path: &str) -> Result<Self> {
+		let conn = if path == ":memory:" {
+			Connection::open_in_memory()?
+		} else {
+			Connection::open(path)?
+		};
 
-        // Enable WAL mode for better concurrent read performance
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
-        )?;
+		// Enable WAL mode for better concurrent read performance
+		conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS api_keys (
+		conn.execute_batch(
+			"CREATE TABLE IF NOT EXISTS api_keys (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 key TEXT NOT NULL UNIQUE,
@@ -115,84 +112,78 @@ impl SqliteStorage {
                 map TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );",
-        )?;
+		)?;
 
-        // Additive migrations for upgrades from older schemas. SQLite has no
-        // `ADD COLUMN IF NOT EXISTS`, so we probe PRAGMA table_info first.
-        ensure_column(&conn, "api_keys", "allowed_models", "TEXT")?;
-        ensure_column(&conn, "api_keys", "owner", "TEXT")?;
-        ensure_column(&conn, "api_keys", "owner_concurrency", "INTEGER")?;
+		// Additive migrations for upgrades from older schemas. SQLite has no
+		// `ADD COLUMN IF NOT EXISTS`, so we probe PRAGMA table_info first.
+		ensure_column(&conn, "api_keys", "allowed_models", "TEXT")?;
+		ensure_column(&conn, "api_keys", "owner", "TEXT")?;
+		ensure_column(&conn, "api_keys", "owner_concurrency", "INTEGER")?;
 
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
-    }
+		Ok(Self { conn: Mutex::new(conn) })
+	}
 }
 
 /// Add `column` of `decl` to `table` if it's not already present.
 fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
-    let exists: bool = {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        let mut found = false;
-        for r in rows {
-            if r? == column {
-                found = true;
-                break;
-            }
-        }
-        found
-    };
-    if !exists {
-        conn.execute_batch(&format!(
-            "ALTER TABLE {} ADD COLUMN {} {}",
-            table, column, decl
-        ))?;
-    }
-    Ok(())
+	let exists: bool = {
+		let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+		let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+		let mut found = false;
+		for r in rows {
+			if r? == column {
+				found = true;
+				break;
+			}
+		}
+		found
+	};
+	if !exists {
+		conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, decl))?;
+	}
+	Ok(())
 }
 
 fn lock_conn(conn: &Mutex<Connection>) -> Result<std::sync::MutexGuard<'_, Connection>> {
-    conn.lock()
-        .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))
+	conn.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))
 }
 
 fn read_media(row: &rusqlite::Row) -> rusqlite::Result<StoredMedia> {
-    Ok(StoredMedia {
-        id: row.get(0)?,
-        api_key_id: row.get(1)?,
-        task: row.get(2)?,
-        status: row.get(3)?,
-        input_model: row.get(4)?,
-        resolved_model: row.get(5)?,
-        provider: row.get(6)?,
-        request: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
-        handle: decode_json_column(row.get(8)?),
-        result: decode_json_column(row.get(9)?),
-        usage: decode_json_column(row.get(10)?),
-        warnings: decode_json_column(row.get(11)?),
-        error: decode_json_column(row.get(12)?),
-        created_at: row.get(13)?,
-        completed_at: row.get(14)?,
-    })
+	Ok(StoredMedia {
+		id: row.get(0)?,
+		api_key_id: row.get(1)?,
+		task: row.get(2)?,
+		status: row.get(3)?,
+		input_model: row.get(4)?,
+		resolved_model: row.get(5)?,
+		provider: row.get(6)?,
+		request: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+		handle: decode_json_column(row.get(8)?),
+		result: decode_json_column(row.get(9)?),
+		usage: decode_json_column(row.get(10)?),
+		warnings: decode_json_column(row.get(11)?),
+		error: decode_json_column(row.get(12)?),
+		created_at: row.get(13)?,
+		completed_at: row.get(14)?,
+	})
 }
 
 fn read_completion(row: &rusqlite::Row) -> rusqlite::Result<StoredCompletion> {
-    Ok(StoredCompletion {
-        id: row.get(0)?,
-        api_key_id: row.get(1)?,
-        session_id: row.get(2)?,
-        previous_completion_id: row.get(3)?,
-        input_model: row.get(4)?,
-        resolved_model: row.get(5)?,
-        provider: row.get(6)?,
-        input: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
-        output: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
-        instructions: row.get(9)?,
-        exchange: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
-        usage: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
-        created_at: row.get(12)?,
-    })
+	Ok(StoredCompletion {
+		id: row.get(0)?,
+		api_key_id: row.get(1)?,
+		session_id: row.get(2)?,
+		previous_completion_id: row.get(3)?,
+		input_model: row.get(4)?,
+		resolved_model: row.get(5)?,
+		provider: row.get(6)?,
+		input: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+		output: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+		instructions: row.get(9)?,
+		exchange: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+		usage: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+		created_at: row.get(12)?,
+	})
 }
 
 const COMPLETION_COLUMNS: &str =
@@ -201,225 +192,209 @@ const COMPLETION_COLUMNS: &str =
 /// Build WHERE clause and params for key_ids + since/until filters.
 /// Returns (clause_string, param_values) where clause starts with " WHERE " or is empty.
 fn build_time_and_key_filter(
-    key_ids: &[i64],
-    since: Option<u64>,
-    until: Option<u64>,
+	key_ids: &[i64],
+	since: Option<u64>,
+	until: Option<u64>,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+	let mut conditions: Vec<String> = Vec::new();
+	let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-    if !key_ids.is_empty() {
-        let placeholders: Vec<String> = key_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect();
-        conditions.push(format!("api_key_id IN ({})", placeholders.join(", ")));
-        for &kid in key_ids {
-            params.push(Box::new(kid));
-        }
-    }
+	if !key_ids.is_empty() {
+		let placeholders: Vec<String> = key_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+		conditions.push(format!("api_key_id IN ({})", placeholders.join(", ")));
+		for &kid in key_ids {
+			params.push(Box::new(kid));
+		}
+	}
 
-    if let Some(s) = since {
-        let idx = params.len() + 1;
-        conditions.push(format!("created_at >= ?{}", idx));
-        params.push(Box::new(s as i64));
-    }
+	if let Some(s) = since {
+		let idx = params.len() + 1;
+		conditions.push(format!("created_at >= ?{}", idx));
+		params.push(Box::new(s as i64));
+	}
 
-    if let Some(u) = until {
-        let idx = params.len() + 1;
-        conditions.push(format!("created_at <= ?{}", idx));
-        params.push(Box::new(u as i64));
-    }
+	if let Some(u) = until {
+		let idx = params.len() + 1;
+		conditions.push(format!("created_at <= ?{}", idx));
+		params.push(Box::new(u as i64));
+	}
 
-    let clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", conditions.join(" AND "))
-    };
+	let clause = if conditions.is_empty() {
+		String::new()
+	} else {
+		format!(" WHERE {}", conditions.join(" AND "))
+	};
 
-    (clause, params)
+	(clause, params)
 }
 
 impl Storage for SqliteStorage {
-    fn create_api_key(
-        &self,
-        name: &str,
-        allowed_models: Option<&[String]>,
-        owner: Option<&str>,
-        owner_concurrency: Option<u32>,
-    ) -> Result<ApiKey> {
-        let conn = lock_conn(&self.conn)?;
-        let key = generate_api_key();
-        let key_hint = make_key_hint(&key);
-        let now = now_unix();
-        let allowed_models_json = encode_allowed_models(allowed_models);
+	fn create_api_key(
+		&self,
+		name: &str,
+		allowed_models: Option<&[String]>,
+		owner: Option<&str>,
+		owner_concurrency: Option<u32>,
+	) -> Result<ApiKey> {
+		let conn = lock_conn(&self.conn)?;
+		let key = generate_api_key();
+		let key_hint = make_key_hint(&key);
+		let now = now_unix();
+		let allowed_models_json = encode_allowed_models(allowed_models);
 
-        conn.execute(
-            "INSERT INTO api_keys (name, key, key_hint, status, allowed_models, owner, owner_concurrency, created_at)
+		conn.execute(
+			"INSERT INTO api_keys (name, key, key_hint, status, allowed_models, owner, owner_concurrency, created_at)
              VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7)",
-            rusqlite::params![name, key, key_hint, allowed_models_json, owner, owner_concurrency, now],
-        )?;
+			rusqlite::params![name, key, key_hint, allowed_models_json, owner, owner_concurrency, now],
+		)?;
 
-        let id = conn.last_insert_rowid();
+		let id = conn.last_insert_rowid();
 
-        Ok(ApiKey {
-            id,
-            name: name.to_string(),
-            key,
-            key_hint,
-            status: "active".to_string(),
-            allowed_models: allowed_models.map(|m| m.to_vec()),
-            owner: owner.map(str::to_string),
-            owner_concurrency,
-            created_at: now,
-        })
-    }
+		Ok(ApiKey {
+			id,
+			name: name.to_string(),
+			key,
+			key_hint,
+			status: "active".to_string(),
+			allowed_models: allowed_models.map(|m| m.to_vec()),
+			owner: owner.map(str::to_string),
+			owner_concurrency,
+			created_at: now,
+		})
+	}
 
-    fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
-        let conn = lock_conn(&self.conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
+	fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
+		let conn = lock_conn(&self.conn)?;
+		let mut stmt = conn.prepare(
+			"SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys ORDER BY id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(ApiKey {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                key: String::new(), // Never expose full key in list
-                key_hint: row.get(2)?,
-                status: row.get(3)?,
-                allowed_models: decode_allowed_models(row.get(4)?),
-                owner: row.get(5)?,
-                owner_concurrency: row.get(6)?,
-                created_at: row.get(7)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
+		)?;
+		let rows = stmt.query_map([], |row| {
+			Ok(ApiKey {
+				id: row.get(0)?,
+				name: row.get(1)?,
+				key: String::new(), // Never expose full key in list
+				key_hint: row.get(2)?,
+				status: row.get(3)?,
+				allowed_models: decode_allowed_models(row.get(4)?),
+				owner: row.get(5)?,
+				owner_concurrency: row.get(6)?,
+				created_at: row.get(7)?,
+			})
+		})?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+	}
 
-    fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
-        let conn = lock_conn(&self.conn)?;
-        conn.query_row(
-            "SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
+	fn get_api_key(&self, id: i64) -> Result<Option<ApiKey>> {
+		let conn = lock_conn(&self.conn)?;
+		conn.query_row(
+			"SELECT id, name, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys WHERE id = ?1",
-            rusqlite::params![id],
-            |row| {
-                Ok(ApiKey {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    key: String::new(),
-                    key_hint: row.get(2)?,
-                    status: row.get(3)?,
-                    allowed_models: decode_allowed_models(row.get(4)?),
-                    owner: row.get(5)?,
-                    owner_concurrency: row.get(6)?,
-                    created_at: row.get(7)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
-    }
+			rusqlite::params![id],
+			|row| {
+				Ok(ApiKey {
+					id: row.get(0)?,
+					name: row.get(1)?,
+					key: String::new(),
+					key_hint: row.get(2)?,
+					status: row.get(3)?,
+					allowed_models: decode_allowed_models(row.get(4)?),
+					owner: row.get(5)?,
+					owner_concurrency: row.get(6)?,
+					created_at: row.get(7)?,
+				})
+			},
+		)
+		.optional()
+		.map_err(Into::into)
+	}
 
-    fn revoke_api_key(&self, id: i64) -> Result<bool> {
-        let conn = lock_conn(&self.conn)?;
-        let affected = conn.execute(
-            "UPDATE api_keys SET status = 'revoked' WHERE id = ?1 AND status = 'active'",
-            rusqlite::params![id],
-        )?;
-        Ok(affected > 0)
-    }
+	fn revoke_api_key(&self, id: i64) -> Result<bool> {
+		let conn = lock_conn(&self.conn)?;
+		let affected = conn.execute(
+			"UPDATE api_keys SET status = 'revoked' WHERE id = ?1 AND status = 'active'",
+			rusqlite::params![id],
+		)?;
+		Ok(affected > 0)
+	}
 
-    fn update_api_key_models(&self, id: i64, allowed_models: Option<&[String]>) -> Result<bool> {
-        let conn = lock_conn(&self.conn)?;
-        let affected = conn.execute(
-            "UPDATE api_keys SET allowed_models = ?1 WHERE id = ?2 AND status = 'active'",
-            rusqlite::params![encode_allowed_models(allowed_models), id],
-        )?;
-        Ok(affected > 0)
-    }
+	fn update_api_key_models(&self, id: i64, allowed_models: Option<&[String]>) -> Result<bool> {
+		let conn = lock_conn(&self.conn)?;
+		let affected = conn.execute(
+			"UPDATE api_keys SET allowed_models = ?1 WHERE id = ?2 AND status = 'active'",
+			rusqlite::params![encode_allowed_models(allowed_models), id],
+		)?;
+		Ok(affected > 0)
+	}
 
-    fn update_api_key_owner(
-        &self,
-        id: i64,
-        owner: Option<&str>,
-        owner_concurrency: Option<u32>,
-    ) -> Result<bool> {
-        let conn = lock_conn(&self.conn)?;
-        let affected = conn.execute(
-            "UPDATE api_keys SET owner = ?1, owner_concurrency = ?2 WHERE id = ?3 AND status = 'active'",
-            rusqlite::params![owner, owner_concurrency, id],
-        )?;
-        Ok(affected > 0)
-    }
+	fn update_api_key_owner(&self, id: i64, owner: Option<&str>, owner_concurrency: Option<u32>) -> Result<bool> {
+		let conn = lock_conn(&self.conn)?;
+		let affected = conn.execute(
+			"UPDATE api_keys SET owner = ?1, owner_concurrency = ?2 WHERE id = ?3 AND status = 'active'",
+			rusqlite::params![owner, owner_concurrency, id],
+		)?;
+		Ok(affected > 0)
+	}
 
-    fn get_owner_auto_map(
-        &self,
-        owner: &str,
-    ) -> Result<Option<std::collections::HashMap<String, String>>> {
-        let conn = lock_conn(&self.conn)?;
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT map FROM owner_auto_models WHERE owner = ?1",
-                rusqlite::params![owner],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(decode_auto_map(raw))
-    }
+	fn get_owner_auto_map(&self, owner: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
+		let conn = lock_conn(&self.conn)?;
+		let raw: Option<String> = conn
+			.query_row(
+				"SELECT map FROM owner_auto_models WHERE owner = ?1",
+				rusqlite::params![owner],
+				|row| row.get(0),
+			)
+			.optional()?;
+		Ok(decode_auto_map(raw))
+	}
 
-    fn set_owner_auto_map(
-        &self,
-        owner: &str,
-        map: Option<&std::collections::HashMap<String, String>>,
-    ) -> Result<()> {
-        let conn = lock_conn(&self.conn)?;
-        match map.filter(|m| !m.is_empty()) {
-            Some(m) => {
-                conn.execute(
-                    "INSERT INTO owner_auto_models (owner, map, updated_at) VALUES (?1, ?2, ?3) \
+	fn set_owner_auto_map(&self, owner: &str, map: Option<&std::collections::HashMap<String, String>>) -> Result<()> {
+		let conn = lock_conn(&self.conn)?;
+		match map.filter(|m| !m.is_empty()) {
+			Some(m) => {
+				conn.execute(
+					"INSERT INTO owner_auto_models (owner, map, updated_at) VALUES (?1, ?2, ?3) \
                      ON CONFLICT(owner) DO UPDATE SET map = excluded.map, updated_at = excluded.updated_at",
-                    rusqlite::params![owner, encode_auto_map(m), now_unix()],
-                )?;
-            }
-            None => {
-                conn.execute(
-                    "DELETE FROM owner_auto_models WHERE owner = ?1",
-                    rusqlite::params![owner],
-                )?;
-            }
-        }
-        Ok(())
-    }
+					rusqlite::params![owner, encode_auto_map(m), now_unix()],
+				)?;
+			}
+			None => {
+				conn.execute(
+					"DELETE FROM owner_auto_models WHERE owner = ?1",
+					rusqlite::params![owner],
+				)?;
+			}
+		}
+		Ok(())
+	}
 
-    fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
-        let conn = lock_conn(&self.conn)?;
-        conn.query_row(
-            "SELECT id, name, key, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
+	fn get_api_key_by_key(&self, key: &str) -> Result<Option<ApiKey>> {
+		let conn = lock_conn(&self.conn)?;
+		conn.query_row(
+			"SELECT id, name, key, key_hint, status, allowed_models, owner, owner_concurrency, created_at \
              FROM api_keys WHERE key = ?1",
-            rusqlite::params![key],
-            |row| {
-                Ok(ApiKey {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    key: row.get(2)?,
-                    key_hint: row.get(3)?,
-                    status: row.get(4)?,
-                    allowed_models: decode_allowed_models(row.get(5)?),
-                    owner: row.get(6)?,
-                    owner_concurrency: row.get(7)?,
-                    created_at: row.get(8)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
-    }
+			rusqlite::params![key],
+			|row| {
+				Ok(ApiKey {
+					id: row.get(0)?,
+					name: row.get(1)?,
+					key: row.get(2)?,
+					key_hint: row.get(3)?,
+					status: row.get(4)?,
+					allowed_models: decode_allowed_models(row.get(5)?),
+					owner: row.get(6)?,
+					owner_concurrency: row.get(7)?,
+					created_at: row.get(8)?,
+				})
+			},
+		)
+		.optional()
+		.map_err(Into::into)
+	}
 
-    fn store_completion(&self, completion: &StoredCompletion) -> Result<()> {
-        let conn = lock_conn(&self.conn)?;
-        conn.execute(
+	fn store_completion(&self, completion: &StoredCompletion) -> Result<()> {
+		let conn = lock_conn(&self.conn)?;
+		conn.execute(
             "INSERT INTO completions (id, api_key_id, session_id, previous_completion_id, input_model, resolved_model, provider, input, output, instructions, exchange, usage, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
@@ -438,163 +413,144 @@ impl Storage for SqliteStorage {
                 completion.created_at,
             ],
         )?;
-        Ok(())
-    }
+		Ok(())
+	}
 
-    fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>> {
-        let conn = lock_conn(&self.conn)?;
-        let sql = format!(
-            "SELECT {} FROM completions WHERE id = ?1",
-            COMPLETION_COLUMNS
-        );
-        conn.query_row(&sql, rusqlite::params![id], read_completion)
-            .optional()
-            .map_err(Into::into)
-    }
+	fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>> {
+		let conn = lock_conn(&self.conn)?;
+		let sql = format!("SELECT {} FROM completions WHERE id = ?1", COMPLETION_COLUMNS);
+		conn.query_row(&sql, rusqlite::params![id], read_completion)
+			.optional()
+			.map_err(Into::into)
+	}
 
-    fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
-        let conn = lock_conn(&self.conn)?;
-        // Single recursive CTE — one round-trip regardless of chain depth.
-        // Anchor is the requested (tail) completion; each recursive step follows
-        // previous_completion_id toward the root. A `depth` counter lets us
-        // sort oldest-first by reversing the walk order.
-        // Both CTE branches qualify columns with `c.` to avoid ambiguity in the JOIN.
-        let cols_prefixed = COMPLETION_COLUMNS
-            .split(',')
-            .map(|c| format!("c.{}", c.trim()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "WITH RECURSIVE chain({cols}, depth) AS (\
+	fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
+		let conn = lock_conn(&self.conn)?;
+		// Single recursive CTE — one round-trip regardless of chain depth.
+		// Anchor is the requested (tail) completion; each recursive step follows
+		// previous_completion_id toward the root. A `depth` counter lets us
+		// sort oldest-first by reversing the walk order.
+		// Both CTE branches qualify columns with `c.` to avoid ambiguity in the JOIN.
+		let cols_prefixed = COMPLETION_COLUMNS
+			.split(',')
+			.map(|c| format!("c.{}", c.trim()))
+			.collect::<Vec<_>>()
+			.join(", ");
+		let sql = format!(
+			"WITH RECURSIVE chain({cols}, depth) AS (\
                SELECT {cols}, 0 FROM completions AS c WHERE id = ?1 \
                UNION ALL \
                SELECT {prefixed}, chain.depth + 1 FROM completions c \
                JOIN chain ON c.id = chain.previous_completion_id \
              ) \
              SELECT {cols} FROM chain ORDER BY depth DESC",
-            cols = COMPLETION_COLUMNS,
-            prefixed = cols_prefixed,
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![id], read_completion)?;
-        let chain = rows.collect::<Result<Vec<_>, _>>()?;
-        // Validate completeness: every non-root row must have its predecessor present.
-        if chain.len() > 1 {
-            let ids: std::collections::HashSet<&str> =
-                chain.iter().map(|c| c.id.as_str()).collect();
-            for c in &chain {
-                if let Some(ref prev_id) = c.previous_completion_id {
-                    if !ids.contains(prev_id.as_str()) {
-                        anyhow::bail!(
-                            "Chain broken: completion {} references missing predecessor {}",
-                            c.id,
-                            prev_id
-                        );
-                    }
-                }
-            }
-        } else if let Some(c) = chain.first() {
-            // Single entry: if it has a previous_completion_id the predecessor is missing.
-            if c.previous_completion_id.is_some() {
-                anyhow::bail!(
-                    "Chain broken: completion {} references missing predecessor",
-                    c.id
-                );
-            }
-        }
-        Ok(chain)
-    }
+			cols = COMPLETION_COLUMNS,
+			prefixed = cols_prefixed,
+		);
+		let mut stmt = conn.prepare(&sql)?;
+		let rows = stmt.query_map(rusqlite::params![id], read_completion)?;
+		let chain = rows.collect::<Result<Vec<_>, _>>()?;
+		// Validate completeness: every non-root row must have its predecessor present.
+		if chain.len() > 1 {
+			let ids: std::collections::HashSet<&str> = chain.iter().map(|c| c.id.as_str()).collect();
+			for c in &chain {
+				if let Some(ref prev_id) = c.previous_completion_id {
+					if !ids.contains(prev_id.as_str()) {
+						anyhow::bail!(
+							"Chain broken: completion {} references missing predecessor {}",
+							c.id,
+							prev_id
+						);
+					}
+				}
+			}
+		} else if let Some(c) = chain.first() {
+			// Single entry: if it has a previous_completion_id the predecessor is missing.
+			if c.previous_completion_id.is_some() {
+				anyhow::bail!("Chain broken: completion {} references missing predecessor", c.id);
+			}
+		}
+		Ok(chain)
+	}
 
-    fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {
-        let conn = lock_conn(&self.conn)?;
-        let (where_clause, filter_params) =
-            build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
+	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {
+		let conn = lock_conn(&self.conn)?;
+		let (where_clause, filter_params) = build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
 
-        let limit_idx = filter_params.len() + 1;
-        let offset_idx = filter_params.len() + 2;
-        let sql = format!(
-            "SELECT {} FROM completions{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
-            COMPLETION_COLUMNS, where_clause, limit_idx, offset_idx
-        );
+		let limit_idx = filter_params.len() + 1;
+		let offset_idx = filter_params.len() + 2;
+		let sql = format!(
+			"SELECT {} FROM completions{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+			COMPLETION_COLUMNS, where_clause, limit_idx, offset_idx
+		);
 
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
-        let limit = if filter.limit == 0 {
-            50
-        } else {
-            filter.limit.min(1000)
-        };
-        all_params.push(Box::new(limit));
-        all_params.push(Box::new(filter.offset));
+		let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
+		let limit = if filter.limit == 0 { 50 } else { filter.limit.min(1000) };
+		all_params.push(Box::new(limit));
+		all_params.push(Box::new(filter.offset));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), read_completion)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
+		let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+		let mut stmt = conn.prepare(&sql)?;
+		let rows = stmt.query_map(param_refs.as_slice(), read_completion)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+	}
 
-    fn store_embedding(&self, embedding: &StoredEmbedding) -> Result<()> {
-        let conn = lock_conn(&self.conn)?;
-        conn.execute(
-            "INSERT INTO embeddings (id, api_key_id, input_model, resolved_model, provider, input, usage, created_at)
+	fn store_embedding(&self, embedding: &StoredEmbedding) -> Result<()> {
+		let conn = lock_conn(&self.conn)?;
+		conn.execute(
+			"INSERT INTO embeddings (id, api_key_id, input_model, resolved_model, provider, input, usage, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                embedding.id,
-                embedding.api_key_id,
-                embedding.input_model,
-                embedding.resolved_model,
-                embedding.provider,
-                embedding.input.to_string(),
-                embedding.usage.to_string(),
-                embedding.created_at,
-            ],
-        )?;
-        Ok(())
-    }
+			rusqlite::params![
+				embedding.id,
+				embedding.api_key_id,
+				embedding.input_model,
+				embedding.resolved_model,
+				embedding.provider,
+				embedding.input.to_string(),
+				embedding.usage.to_string(),
+				embedding.created_at,
+			],
+		)?;
+		Ok(())
+	}
 
-    fn list_embeddings(&self, filter: &ListFilter) -> Result<Vec<StoredEmbedding>> {
-        let conn = lock_conn(&self.conn)?;
-        let (where_clause, filter_params) =
-            build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
+	fn list_embeddings(&self, filter: &ListFilter) -> Result<Vec<StoredEmbedding>> {
+		let conn = lock_conn(&self.conn)?;
+		let (where_clause, filter_params) = build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
 
-        let limit_idx = filter_params.len() + 1;
-        let offset_idx = filter_params.len() + 2;
-        let sql = format!(
-            "SELECT id, api_key_id, input_model, resolved_model, provider, input, usage, created_at \
+		let limit_idx = filter_params.len() + 1;
+		let offset_idx = filter_params.len() + 2;
+		let sql = format!(
+			"SELECT id, api_key_id, input_model, resolved_model, provider, input, usage, created_at \
              FROM embeddings{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
-            where_clause, limit_idx, offset_idx
-        );
+			where_clause, limit_idx, offset_idx
+		);
 
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
-        let limit = if filter.limit == 0 {
-            50
-        } else {
-            filter.limit.min(1000)
-        };
-        all_params.push(Box::new(limit));
-        all_params.push(Box::new(filter.offset));
+		let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
+		let limit = if filter.limit == 0 { 50 } else { filter.limit.min(1000) };
+		all_params.push(Box::new(limit));
+		all_params.push(Box::new(filter.offset));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok(StoredEmbedding {
-                id: row.get(0)?,
-                api_key_id: row.get(1)?,
-                input_model: row.get(2)?,
-                resolved_model: row.get(3)?,
-                provider: row.get(4)?,
-                input: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                usage: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                created_at: row.get(7)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
+		let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+		let mut stmt = conn.prepare(&sql)?;
+		let rows = stmt.query_map(param_refs.as_slice(), |row| {
+			Ok(StoredEmbedding {
+				id: row.get(0)?,
+				api_key_id: row.get(1)?,
+				input_model: row.get(2)?,
+				resolved_model: row.get(3)?,
+				provider: row.get(4)?,
+				input: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+				usage: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+				created_at: row.get(7)?,
+			})
+		})?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+	}
 
-    fn store_evaluation(&self, evaluation: &StoredEvaluation) -> Result<()> {
-        let conn = lock_conn(&self.conn)?;
-        conn.execute(
+	fn store_evaluation(&self, evaluation: &StoredEvaluation) -> Result<()> {
+		let conn = lock_conn(&self.conn)?;
+		conn.execute(
             "INSERT INTO evaluations (id, api_key_id, input_model, resolved_model, provider, request, answers, usage, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
@@ -609,827 +565,791 @@ impl Storage for SqliteStorage {
                 evaluation.created_at,
             ],
         )?;
-        Ok(())
-    }
+		Ok(())
+	}
 
-    fn list_evaluations(&self, filter: &ListFilter) -> Result<Vec<StoredEvaluation>> {
-        let conn = lock_conn(&self.conn)?;
-        let (where_clause, filter_params) =
-            build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
+	fn list_evaluations(&self, filter: &ListFilter) -> Result<Vec<StoredEvaluation>> {
+		let conn = lock_conn(&self.conn)?;
+		let (where_clause, filter_params) = build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
 
-        let limit_idx = filter_params.len() + 1;
-        let offset_idx = filter_params.len() + 2;
-        let sql = format!(
-            "SELECT id, api_key_id, input_model, resolved_model, provider, request, answers, usage, created_at \
+		let limit_idx = filter_params.len() + 1;
+		let offset_idx = filter_params.len() + 2;
+		let sql = format!(
+			"SELECT id, api_key_id, input_model, resolved_model, provider, request, answers, usage, created_at \
              FROM evaluations{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
-            where_clause, limit_idx, offset_idx
-        );
+			where_clause, limit_idx, offset_idx
+		);
 
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
-        let limit = if filter.limit == 0 {
-            50
-        } else {
-            filter.limit.min(1000)
-        };
-        all_params.push(Box::new(limit));
-        all_params.push(Box::new(filter.offset));
+		let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
+		let limit = if filter.limit == 0 { 50 } else { filter.limit.min(1000) };
+		all_params.push(Box::new(limit));
+		all_params.push(Box::new(filter.offset));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok(StoredEvaluation {
-                id: row.get(0)?,
-                api_key_id: row.get(1)?,
-                input_model: row.get(2)?,
-                resolved_model: row.get(3)?,
-                provider: row.get(4)?,
-                request: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                answers: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                usage: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
-                created_at: row.get(8)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
+		let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+		let mut stmt = conn.prepare(&sql)?;
+		let rows = stmt.query_map(param_refs.as_slice(), |row| {
+			Ok(StoredEvaluation {
+				id: row.get(0)?,
+				api_key_id: row.get(1)?,
+				input_model: row.get(2)?,
+				resolved_model: row.get(3)?,
+				provider: row.get(4)?,
+				request: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+				answers: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+				usage: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
+				created_at: row.get(8)?,
+			})
+		})?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+	}
 
-    fn store_media(&self, record: &StoredMedia) -> Result<()> {
-        let conn = lock_conn(&self.conn)?;
-        conn.execute(
-            "INSERT INTO media (id, api_key_id, task, status, input_model, resolved_model, \
+	fn store_media(&self, record: &StoredMedia) -> Result<()> {
+		let conn = lock_conn(&self.conn)?;
+		conn.execute(
+			"INSERT INTO media (id, api_key_id, task, status, input_model, resolved_model, \
              provider, request, handle, result, usage, warnings, error, created_at, completed_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            rusqlite::params![
-                record.id,
-                record.api_key_id,
-                record.task,
-                record.status,
-                record.input_model,
-                record.resolved_model,
-                record.provider,
-                serde_json::to_string(&record.request)?,
-                encode_json_column(record.handle.as_ref()),
-                encode_json_column(record.result.as_ref()),
-                encode_json_column(record.usage.as_ref()),
-                encode_json_column(record.warnings.as_ref()),
-                encode_json_column(record.error.as_ref()),
-                record.created_at,
-                record.completed_at,
-            ],
-        )?;
-        Ok(())
-    }
+			rusqlite::params![
+				record.id,
+				record.api_key_id,
+				record.task,
+				record.status,
+				record.input_model,
+				record.resolved_model,
+				record.provider,
+				serde_json::to_string(&record.request)?,
+				encode_json_column(record.handle.as_ref()),
+				encode_json_column(record.result.as_ref()),
+				encode_json_column(record.usage.as_ref()),
+				encode_json_column(record.warnings.as_ref()),
+				encode_json_column(record.error.as_ref()),
+				record.created_at,
+				record.completed_at,
+			],
+		)?;
+		Ok(())
+	}
 
-    fn update_media(&self, record: &StoredMedia) -> Result<()> {
-        let conn = lock_conn(&self.conn)?;
-        // Only the mutable half is written: identity, ownership and the
-        // original request are immutable once the job has been submitted.
-        conn.execute(
-            "UPDATE media SET status = ?1, handle = ?2, result = ?3, usage = ?4, \
+	fn update_media(&self, record: &StoredMedia) -> Result<()> {
+		let conn = lock_conn(&self.conn)?;
+		// Only the mutable half is written: identity, ownership and the
+		// original request are immutable once the job has been submitted.
+		conn.execute(
+			"UPDATE media SET status = ?1, handle = ?2, result = ?3, usage = ?4, \
              warnings = ?5, error = ?6, completed_at = ?7 WHERE id = ?8",
-            rusqlite::params![
-                record.status,
-                encode_json_column(record.handle.as_ref()),
-                encode_json_column(record.result.as_ref()),
-                encode_json_column(record.usage.as_ref()),
-                encode_json_column(record.warnings.as_ref()),
-                encode_json_column(record.error.as_ref()),
-                record.completed_at,
-                record.id,
-            ],
-        )?;
-        Ok(())
-    }
+			rusqlite::params![
+				record.status,
+				encode_json_column(record.handle.as_ref()),
+				encode_json_column(record.result.as_ref()),
+				encode_json_column(record.usage.as_ref()),
+				encode_json_column(record.warnings.as_ref()),
+				encode_json_column(record.error.as_ref()),
+				record.completed_at,
+				record.id,
+			],
+		)?;
+		Ok(())
+	}
 
-    fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {
-        let conn = lock_conn(&self.conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, api_key_id, task, status, input_model, resolved_model, provider, \
+	fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {
+		let conn = lock_conn(&self.conn)?;
+		let mut stmt = conn.prepare(
+			"SELECT id, api_key_id, task, status, input_model, resolved_model, provider, \
              request, handle, result, usage, warnings, error, created_at, completed_at \
              FROM media WHERE id = ?1 AND api_key_id = ?2",
-        )?;
-        let mut rows = stmt.query_map(rusqlite::params![id, api_key_id], read_media)?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
-        }
-    }
+		)?;
+		let mut rows = stmt.query_map(rusqlite::params![id, api_key_id], read_media)?;
+		match rows.next() {
+			Some(row) => Ok(Some(row?)),
+			None => Ok(None),
+		}
+	}
 
-    fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>> {
-        let conn = lock_conn(&self.conn)?;
-        let (where_clause, filter_params) =
-            build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
+	fn list_media(&self, filter: &ListFilter) -> Result<Vec<StoredMedia>> {
+		let conn = lock_conn(&self.conn)?;
+		let (where_clause, filter_params) = build_time_and_key_filter(&filter.key_ids, filter.since, filter.until);
 
-        let limit_idx = filter_params.len() + 1;
-        let offset_idx = filter_params.len() + 2;
-        let sql = format!(
-            "SELECT id, api_key_id, task, status, input_model, resolved_model, provider, \
+		let limit_idx = filter_params.len() + 1;
+		let offset_idx = filter_params.len() + 2;
+		let sql = format!(
+			"SELECT id, api_key_id, task, status, input_model, resolved_model, provider, \
              request, handle, result, usage, warnings, error, created_at, completed_at \
              FROM media{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
-            where_clause, limit_idx, offset_idx
-        );
+			where_clause, limit_idx, offset_idx
+		);
 
-        let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
-        let limit = if filter.limit == 0 {
-            50
-        } else {
-            filter.limit.min(1000)
-        };
-        all_params.push(Box::new(limit));
-        all_params.push(Box::new(filter.offset));
+		let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = filter_params;
+		let limit = if filter.limit == 0 { 50 } else { filter.limit.min(1000) };
+		all_params.push(Box::new(limit));
+		all_params.push(Box::new(filter.offset));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), read_media)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
+		let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+		let mut stmt = conn.prepare(&sql)?;
+		let rows = stmt.query_map(param_refs.as_slice(), read_media)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+	}
 
-    fn get_usage(
-        &self,
-        key_ids: &[i64],
-        bucket: Option<TimeBucket>,
-        since: Option<u64>,
-        until: Option<u64>,
-    ) -> Result<Vec<UsageRow>> {
-        let conn = lock_conn(&self.conn)?;
+	fn get_usage(
+		&self,
+		key_ids: &[i64],
+		bucket: Option<TimeBucket>,
+		since: Option<u64>,
+		until: Option<u64>,
+	) -> Result<Vec<UsageRow>> {
+		let conn = lock_conn(&self.conn)?;
 
-        // Build the time-bucketing expression for SQLite
-        let bucket_expr = match bucket {
-            Some(TimeBucket::Hour) => "(created_at / 3600) * 3600",
-            Some(TimeBucket::Day) => "(created_at / 86400) * 86400",
-            Some(TimeBucket::Week) => "(created_at / 604800) * 604800",
-            Some(TimeBucket::Month) => "(created_at / 2592000) * 2592000",
-            None => "0", // No bucketing — single aggregate
-        };
+		// Build the time-bucketing expression for SQLite
+		let bucket_expr = match bucket {
+			Some(TimeBucket::Hour) => "(created_at / 3600) * 3600",
+			Some(TimeBucket::Day) => "(created_at / 86400) * 86400",
+			Some(TimeBucket::Week) => "(created_at / 604800) * 604800",
+			Some(TimeBucket::Month) => "(created_at / 2592000) * 2592000",
+			None => "0", // No bucketing — single aggregate
+		};
 
-        let (where_clause, filter_params) = build_time_and_key_filter(key_ids, since, until);
+		let (where_clause, filter_params) = build_time_and_key_filter(key_ids, since, until);
 
-        // Query completions usage
-        let compl_sql = format!(
-            "SELECT api_key_id, {bucket} AS period, \
+		// Query completions usage
+		let compl_sql = format!(
+			"SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
              COALESCE(SUM(json_extract(usage, '$.input_tokens')), 0) AS inp, \
              COALESCE(SUM(json_extract(usage, '$.output_tokens')), 0) AS outp, \
              COALESCE(SUM(json_extract(usage, '$.cost')), 0.0) AS cost \
              FROM completions{where_clause} \
              GROUP BY api_key_id, period",
-            bucket = bucket_expr,
-            where_clause = where_clause,
-        );
+			bucket = bucket_expr,
+			where_clause = where_clause,
+		);
 
-        let emb_sql = format!(
-            "SELECT api_key_id, {bucket} AS period, \
+		let emb_sql = format!(
+			"SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
              COALESCE(SUM(json_extract(usage, '$.input_tokens')), 0) AS inp, \
              COALESCE(SUM(json_extract(usage, '$.cost')), 0.0) AS cost \
              FROM embeddings{where_clause} \
              GROUP BY api_key_id, period",
-            bucket = bucket_expr,
-            where_clause = where_clause,
-        );
+			bucket = bucket_expr,
+			where_clause = where_clause,
+		);
 
-        let eval_sql = format!(
-            "SELECT api_key_id, {bucket} AS period, \
+		let eval_sql = format!(
+			"SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
              COALESCE(SUM(json_extract(usage, '$.input_tokens')), 0) AS inp, \
              COALESCE(SUM(json_extract(usage, '$.output_tokens')), 0) AS outp, \
              COALESCE(SUM(json_extract(usage, '$.cost')), 0.0) AS cost \
              FROM evaluations{where_clause} \
              GROUP BY api_key_id, period",
-            bucket = bucket_expr,
-            where_clause = where_clause,
-        );
+			bucket = bucket_expr,
+			where_clause = where_clause,
+		);
 
-        // Media rows carry cost but no tokens; an unpriced row contributes
-        // nothing rather than zero-filling the total.
-        let media_sql = format!(
-            "SELECT api_key_id, {bucket} AS period, \
+		// Media rows carry cost but no tokens; an unpriced row contributes
+		// nothing rather than zero-filling the total.
+		let media_sql = format!(
+			"SELECT api_key_id, {bucket} AS period, \
              COUNT(*) AS cnt, \
              COALESCE(SUM(json_extract(usage, '$.cost')), 0.0) AS cost \
              FROM media{where_clause} \
              GROUP BY api_key_id, period",
-            bucket = bucket_expr,
-            where_clause = where_clause,
-        );
+			bucket = bucket_expr,
+			where_clause = where_clause,
+		);
 
-        // Collect completion stats
-        use std::collections::HashMap;
-        type BucketKey = (i64, u64); // (key_id, period)
-        let mut usage_map: HashMap<BucketKey, UsageRow> = HashMap::new();
+		// Collect completion stats
+		use std::collections::HashMap;
+		type BucketKey = (i64, u64); // (key_id, period)
+		let mut usage_map: HashMap<BucketKey, UsageRow> = HashMap::new();
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            filter_params.iter().map(|p| p.as_ref()).collect();
+		let param_refs: Vec<&dyn rusqlite::types::ToSql> = filter_params.iter().map(|p| p.as_ref()).collect();
 
-        {
-            let mut stmt = conn.prepare(&compl_sql)?;
-            let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
-                    row.get::<_, u64>(4)?,
-                    row.get::<_, f64>(5)?,
-                ))
-            })?;
-            for row in rows {
-                let (key_id, period, cnt, inp, outp, cost) = row?;
-                let entry = usage_map
-                    .entry((key_id, period))
-                    .or_insert_with(|| UsageRow {
-                        period: if bucket.is_some() { Some(period) } else { None },
-                        key_id,
-                        key_name: String::new(),
-                        completions_count: 0,
-                        embeddings_count: 0,
-                        total_input_tokens: 0,
-                        total_output_tokens: 0,
-                        media_count: 0,
-                        evaluations_count: 0,
-                        total_cost: 0.0,
-                    });
-                entry.completions_count = cnt;
-                entry.total_input_tokens += inp;
-                entry.total_output_tokens += outp;
-                entry.total_cost += cost;
-            }
-        }
+		{
+			let mut stmt = conn.prepare(&compl_sql)?;
+			let rows = stmt.query_map(param_refs.as_slice(), |row| {
+				Ok((
+					row.get::<_, i64>(0)?,
+					row.get::<_, u64>(1)?,
+					row.get::<_, u64>(2)?,
+					row.get::<_, u64>(3)?,
+					row.get::<_, u64>(4)?,
+					row.get::<_, f64>(5)?,
+				))
+			})?;
+			for row in rows {
+				let (key_id, period, cnt, inp, outp, cost) = row?;
+				let entry = usage_map.entry((key_id, period)).or_insert_with(|| UsageRow {
+					period: if bucket.is_some() { Some(period) } else { None },
+					key_id,
+					key_name: String::new(),
+					completions_count: 0,
+					embeddings_count: 0,
+					total_input_tokens: 0,
+					total_output_tokens: 0,
+					media_count: 0,
+					evaluations_count: 0,
+					total_cost: 0.0,
+				});
+				entry.completions_count = cnt;
+				entry.total_input_tokens += inp;
+				entry.total_output_tokens += outp;
+				entry.total_cost += cost;
+			}
+		}
 
-        // Collect embedding stats
-        {
-            let mut stmt = conn.prepare(&emb_sql)?;
-            let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
-                    row.get::<_, f64>(4)?,
-                ))
-            })?;
-            for row in rows {
-                let (key_id, period, cnt, inp, cost) = row?;
-                let entry = usage_map
-                    .entry((key_id, period))
-                    .or_insert_with(|| UsageRow {
-                        period: if bucket.is_some() { Some(period) } else { None },
-                        key_id,
-                        key_name: String::new(),
-                        completions_count: 0,
-                        embeddings_count: 0,
-                        total_input_tokens: 0,
-                        total_output_tokens: 0,
-                        media_count: 0,
-                        evaluations_count: 0,
-                        total_cost: 0.0,
-                    });
-                entry.embeddings_count = cnt;
-                entry.total_input_tokens += inp;
-                entry.total_cost += cost;
-            }
-        }
+		// Collect embedding stats
+		{
+			let mut stmt = conn.prepare(&emb_sql)?;
+			let rows = stmt.query_map(param_refs.as_slice(), |row| {
+				Ok((
+					row.get::<_, i64>(0)?,
+					row.get::<_, u64>(1)?,
+					row.get::<_, u64>(2)?,
+					row.get::<_, u64>(3)?,
+					row.get::<_, f64>(4)?,
+				))
+			})?;
+			for row in rows {
+				let (key_id, period, cnt, inp, cost) = row?;
+				let entry = usage_map.entry((key_id, period)).or_insert_with(|| UsageRow {
+					period: if bucket.is_some() { Some(period) } else { None },
+					key_id,
+					key_name: String::new(),
+					completions_count: 0,
+					embeddings_count: 0,
+					total_input_tokens: 0,
+					total_output_tokens: 0,
+					media_count: 0,
+					evaluations_count: 0,
+					total_cost: 0.0,
+				});
+				entry.embeddings_count = cnt;
+				entry.total_input_tokens += inp;
+				entry.total_cost += cost;
+			}
+		}
 
-        // Collect evaluation stats
-        {
-            let mut stmt = conn.prepare(&eval_sql)?;
-            let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
-                    row.get::<_, u64>(4)?,
-                    row.get::<_, f64>(5)?,
-                ))
-            })?;
-            for row in rows {
-                let (key_id, period, cnt, inp, outp, cost) = row?;
-                let entry = usage_map
-                    .entry((key_id, period))
-                    .or_insert_with(|| UsageRow {
-                        period: if bucket.is_some() { Some(period) } else { None },
-                        key_id,
-                        key_name: String::new(),
-                        completions_count: 0,
-                        embeddings_count: 0,
-                        total_input_tokens: 0,
-                        total_output_tokens: 0,
-                        media_count: 0,
-                        evaluations_count: 0,
-                        total_cost: 0.0,
-                    });
-                entry.evaluations_count = cnt;
-                entry.total_input_tokens += inp;
-                entry.total_output_tokens += outp;
-                entry.total_cost += cost;
-            }
-        }
+		// Collect evaluation stats
+		{
+			let mut stmt = conn.prepare(&eval_sql)?;
+			let rows = stmt.query_map(param_refs.as_slice(), |row| {
+				Ok((
+					row.get::<_, i64>(0)?,
+					row.get::<_, u64>(1)?,
+					row.get::<_, u64>(2)?,
+					row.get::<_, u64>(3)?,
+					row.get::<_, u64>(4)?,
+					row.get::<_, f64>(5)?,
+				))
+			})?;
+			for row in rows {
+				let (key_id, period, cnt, inp, outp, cost) = row?;
+				let entry = usage_map.entry((key_id, period)).or_insert_with(|| UsageRow {
+					period: if bucket.is_some() { Some(period) } else { None },
+					key_id,
+					key_name: String::new(),
+					completions_count: 0,
+					embeddings_count: 0,
+					total_input_tokens: 0,
+					total_output_tokens: 0,
+					media_count: 0,
+					evaluations_count: 0,
+					total_cost: 0.0,
+				});
+				entry.evaluations_count = cnt;
+				entry.total_input_tokens += inp;
+				entry.total_output_tokens += outp;
+				entry.total_cost += cost;
+			}
+		}
 
-        // Collect media stats
-        {
-            let mut stmt = conn.prepare(&media_sql)?;
-            let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, f64>(3)?,
-                ))
-            })?;
-            for row in rows {
-                let (key_id, period, cnt, cost) = row?;
-                let entry = usage_map
-                    .entry((key_id, period))
-                    .or_insert_with(|| UsageRow {
-                        period: if bucket.is_some() { Some(period) } else { None },
-                        key_id,
-                        key_name: String::new(),
-                        completions_count: 0,
-                        embeddings_count: 0,
-                        total_input_tokens: 0,
-                        total_output_tokens: 0,
-                        media_count: 0,
-                        evaluations_count: 0,
-                        total_cost: 0.0,
-                    });
-                entry.media_count = cnt;
-                entry.total_cost += cost;
-            }
-        }
+		// Collect media stats
+		{
+			let mut stmt = conn.prepare(&media_sql)?;
+			let rows = stmt.query_map(param_refs.as_slice(), |row| {
+				Ok((
+					row.get::<_, i64>(0)?,
+					row.get::<_, u64>(1)?,
+					row.get::<_, u64>(2)?,
+					row.get::<_, f64>(3)?,
+				))
+			})?;
+			for row in rows {
+				let (key_id, period, cnt, cost) = row?;
+				let entry = usage_map.entry((key_id, period)).or_insert_with(|| UsageRow {
+					period: if bucket.is_some() { Some(period) } else { None },
+					key_id,
+					key_name: String::new(),
+					completions_count: 0,
+					embeddings_count: 0,
+					total_input_tokens: 0,
+					total_output_tokens: 0,
+					media_count: 0,
+					evaluations_count: 0,
+					total_cost: 0.0,
+				});
+				entry.media_count = cnt;
+				entry.total_cost += cost;
+			}
+		}
 
-        // Resolve key names
-        let key_name_map: HashMap<i64, String> = {
-            let mut stmt = conn.prepare("SELECT id, name FROM api_keys")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
+		// Resolve key names
+		let key_name_map: HashMap<i64, String> = {
+			let mut stmt = conn.prepare("SELECT id, name FROM api_keys")?;
+			let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+			rows.filter_map(|r| r.ok()).collect()
+		};
 
-        let mut results: Vec<UsageRow> = usage_map
-            .into_values()
-            .map(|mut row| {
-                row.key_name = key_name_map.get(&row.key_id).cloned().unwrap_or_default();
-                row
-            })
-            .collect();
+		let mut results: Vec<UsageRow> = usage_map
+			.into_values()
+			.map(|mut row| {
+				row.key_name = key_name_map.get(&row.key_id).cloned().unwrap_or_default();
+				row
+			})
+			.collect();
 
-        // Sort by period then key_id
-        results.sort_by(|a, b| a.period.cmp(&b.period).then(a.key_id.cmp(&b.key_id)));
+		// Sort by period then key_id
+		results.sort_by(|a, b| a.period.cmp(&b.period).then(a.key_id.cmp(&b.key_id)));
 
-        Ok(results)
-    }
+		Ok(results)
+	}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+	use super::*;
 
-    fn create_test_storage() -> SqliteStorage {
-        SqliteStorage::new(":memory:").unwrap()
-    }
+	fn create_test_storage() -> SqliteStorage {
+		SqliteStorage::new(":memory:").unwrap()
+	}
 
-    fn create_test_key(storage: &SqliteStorage) -> ApiKey {
-        storage
-            .create_api_key("test-key", None, None, None)
-            .unwrap()
-    }
+	fn create_test_key(storage: &SqliteStorage) -> ApiKey {
+		storage.create_api_key("test-key", None, None, None).unwrap()
+	}
 
-    fn make_stored_completion(
-        id: &str,
-        api_key_id: i64,
-        prev: Option<&str>,
-        input: &str,
-        output: &str,
-    ) -> StoredCompletion {
-        StoredCompletion {
-            id: id.to_string(),
-            api_key_id,
-            session_id: format!("sess_test_{}", id),
-            previous_completion_id: prev.map(|s| s.to_string()),
-            input_model: "gpt-4o".to_string(),
-            resolved_model: "gpt-4o".to_string(),
-            provider: "openai".to_string(),
-            input: serde_json::json!({"content": input}),
-            output: serde_json::json!({"content": output}),
-            instructions: None,
-            exchange: serde_json::json!({}),
-            usage: serde_json::json!({"input_tokens": 10, "output_tokens": 5}),
-            created_at: 1700000000,
-        }
-    }
+	fn make_stored_completion(
+		id: &str,
+		api_key_id: i64,
+		prev: Option<&str>,
+		input: &str,
+		output: &str,
+	) -> StoredCompletion {
+		StoredCompletion {
+			id: id.to_string(),
+			api_key_id,
+			session_id: format!("sess_test_{}", id),
+			previous_completion_id: prev.map(|s| s.to_string()),
+			input_model: "gpt-4o".to_string(),
+			resolved_model: "gpt-4o".to_string(),
+			provider: "openai".to_string(),
+			input: serde_json::json!({"content": input}),
+			output: serde_json::json!({"content": output}),
+			instructions: None,
+			exchange: serde_json::json!({}),
+			usage: serde_json::json!({"input_tokens": 10, "output_tokens": 5}),
+			created_at: 1700000000,
+		}
+	}
 
-    // ── API key tests ──
+	// ── API key tests ──
 
-    #[test]
-    fn test_create_api_key() {
-        let storage = create_test_storage();
-        let key = storage.create_api_key("my-app", None, None, None).unwrap();
-        assert_eq!(key.name, "my-app");
-        assert_eq!(key.status, "active");
-        assert!(!key.key.is_empty());
-        assert!(key.key_hint.starts_with("..."));
-        assert_eq!(key.key_hint.len(), 7); // "..." + 4 chars
-    }
+	#[test]
+	fn test_create_api_key() {
+		let storage = create_test_storage();
+		let key = storage.create_api_key("my-app", None, None, None).unwrap();
+		assert_eq!(key.name, "my-app");
+		assert_eq!(key.status, "active");
+		assert!(!key.key.is_empty());
+		assert!(key.key_hint.starts_with("..."));
+		assert_eq!(key.key_hint.len(), 7); // "..." + 4 chars
+	}
 
-    #[test]
-    fn test_create_api_key_with_allowed_models() {
-        let storage = create_test_storage();
-        let allowed = vec!["gpt".to_string(), "openai:gpt-4o".to_string()];
-        let key = storage
-            .create_api_key("scoped", Some(&allowed), None, None)
-            .unwrap();
-        assert_eq!(key.allowed_models.as_deref(), Some(allowed.as_slice()));
-        assert!(key.is_model_allowed("gpt"));
-        assert!(key.is_model_allowed("openai:gpt-4o"));
-        assert!(!key.is_model_allowed("haiku"));
-    }
+	#[test]
+	fn test_create_api_key_with_allowed_models() {
+		let storage = create_test_storage();
+		let allowed = vec!["gpt".to_string(), "openai:gpt-4o".to_string()];
+		let key = storage.create_api_key("scoped", Some(&allowed), None, None).unwrap();
+		assert_eq!(key.allowed_models.as_deref(), Some(allowed.as_slice()));
+		assert!(key.is_model_allowed("gpt"));
+		assert!(key.is_model_allowed("openai:gpt-4o"));
+		assert!(!key.is_model_allowed("haiku"));
+	}
 
-    #[test]
-    fn test_create_api_key_unrestricted_by_default() {
-        let storage = create_test_storage();
-        let key = storage.create_api_key("open", None, None, None).unwrap();
-        assert!(key.allowed_models.is_none());
-        assert!(key.is_model_allowed("anything"));
-    }
+	#[test]
+	fn test_create_api_key_unrestricted_by_default() {
+		let storage = create_test_storage();
+		let key = storage.create_api_key("open", None, None, None).unwrap();
+		assert!(key.allowed_models.is_none());
+		assert!(key.is_model_allowed("anything"));
+	}
 
-    #[test]
-    fn test_allowed_models_round_trip_through_lookup() {
-        // Persist via create_api_key, fetch back through the auth path
-        // (get_api_key_by_key) and confirm the JSON survived the round trip.
-        let storage = create_test_storage();
-        let allowed = vec!["haiku".to_string(), "sonnet".to_string()];
-        let created = storage
-            .create_api_key("scoped", Some(&allowed), None, None)
-            .unwrap();
-        let fetched = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
-        assert_eq!(fetched.allowed_models.as_deref(), Some(allowed.as_slice()));
-    }
+	#[test]
+	fn test_allowed_models_round_trip_through_lookup() {
+		// Persist via create_api_key, fetch back through the auth path
+		// (get_api_key_by_key) and confirm the JSON survived the round trip.
+		let storage = create_test_storage();
+		let allowed = vec!["haiku".to_string(), "sonnet".to_string()];
+		let created = storage.create_api_key("scoped", Some(&allowed), None, None).unwrap();
+		let fetched = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
+		assert_eq!(fetched.allowed_models.as_deref(), Some(allowed.as_slice()));
+	}
 
-    #[test]
-    fn test_owner_auto_map_roundtrip_update_and_clear() {
-        let storage = create_test_storage();
-        // Absent owner → None (config floor applies).
-        assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
+	#[test]
+	fn test_owner_auto_map_roundtrip_update_and_clear() {
+		let storage = create_test_storage();
+		// Absent owner → None (config floor applies).
+		assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
 
-        let mut map = std::collections::HashMap::new();
-        map.insert("default".to_string(), "glm".to_string());
-        map.insert("compression".to_string(), "cheap".to_string());
-        storage.set_owner_auto_map("acct_1", Some(&map)).unwrap();
-        assert_eq!(storage.get_owner_auto_map("acct_1").unwrap(), Some(map));
+		let mut map = std::collections::HashMap::new();
+		map.insert("default".to_string(), "glm".to_string());
+		map.insert("compression".to_string(), "cheap".to_string());
+		storage.set_owner_auto_map("acct_1", Some(&map)).unwrap();
+		assert_eq!(storage.get_owner_auto_map("acct_1").unwrap(), Some(map));
 
-        // Upsert replaces in place.
-        let mut map2 = std::collections::HashMap::new();
-        map2.insert("default".to_string(), "strong".to_string());
-        storage.set_owner_auto_map("acct_1", Some(&map2)).unwrap();
-        assert_eq!(storage.get_owner_auto_map("acct_1").unwrap(), Some(map2));
+		// Upsert replaces in place.
+		let mut map2 = std::collections::HashMap::new();
+		map2.insert("default".to_string(), "strong".to_string());
+		storage.set_owner_auto_map("acct_1", Some(&map2)).unwrap();
+		assert_eq!(storage.get_owner_auto_map("acct_1").unwrap(), Some(map2));
 
-        // Owners are independent.
-        assert!(storage.get_owner_auto_map("acct_2").unwrap().is_none());
+		// Owners are independent.
+		assert!(storage.get_owner_auto_map("acct_2").unwrap().is_none());
 
-        // None clears; an EMPTY map clears too (both mean "back to the floor").
-        storage.set_owner_auto_map("acct_1", None).unwrap();
-        assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
-        let empty = std::collections::HashMap::new();
-        storage.set_owner_auto_map("acct_1", Some(&empty)).unwrap();
-        assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
-    }
+		// None clears; an EMPTY map clears too (both mean "back to the floor").
+		storage.set_owner_auto_map("acct_1", None).unwrap();
+		assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
+		let empty = std::collections::HashMap::new();
+		storage.set_owner_auto_map("acct_1", Some(&empty)).unwrap();
+		assert!(storage.get_owner_auto_map("acct_1").unwrap().is_none());
+	}
 
-    #[test]
-    fn test_list_api_keys_hides_full_key() {
-        let storage = create_test_storage();
-        storage.create_api_key("key-1", None, None, None).unwrap();
-        storage.create_api_key("key-2", None, None, None).unwrap();
-        let keys = storage.list_api_keys().unwrap();
-        assert_eq!(keys.len(), 2);
-        assert!(keys[0].key.is_empty()); // Full key not exposed
-        assert!(keys[1].key.is_empty());
-    }
+	#[test]
+	fn test_list_api_keys_hides_full_key() {
+		let storage = create_test_storage();
+		storage.create_api_key("key-1", None, None, None).unwrap();
+		storage.create_api_key("key-2", None, None, None).unwrap();
+		let keys = storage.list_api_keys().unwrap();
+		assert_eq!(keys.len(), 2);
+		assert!(keys[0].key.is_empty()); // Full key not exposed
+		assert!(keys[1].key.is_empty());
+	}
 
-    #[test]
-    fn test_get_api_key() {
-        let storage = create_test_storage();
-        let created = storage.create_api_key("my-app", None, None, None).unwrap();
-        let fetched = storage.get_api_key(created.id).unwrap().unwrap();
-        assert_eq!(fetched.name, "my-app");
-        assert!(fetched.key.is_empty()); // Full key not exposed in get
-    }
+	#[test]
+	fn test_get_api_key() {
+		let storage = create_test_storage();
+		let created = storage.create_api_key("my-app", None, None, None).unwrap();
+		let fetched = storage.get_api_key(created.id).unwrap().unwrap();
+		assert_eq!(fetched.name, "my-app");
+		assert!(fetched.key.is_empty()); // Full key not exposed in get
+	}
 
-    #[test]
-    fn test_revoke_api_key() {
-        let storage = create_test_storage();
-        let key = storage.create_api_key("my-app", None, None, None).unwrap();
-        assert!(storage.revoke_api_key(key.id).unwrap());
-        // Second revoke returns false (already revoked)
-        assert!(!storage.revoke_api_key(key.id).unwrap());
-        let fetched = storage.get_api_key(key.id).unwrap().unwrap();
-        assert_eq!(fetched.status, "revoked");
-    }
+	#[test]
+	fn test_revoke_api_key() {
+		let storage = create_test_storage();
+		let key = storage.create_api_key("my-app", None, None, None).unwrap();
+		assert!(storage.revoke_api_key(key.id).unwrap());
+		// Second revoke returns false (already revoked)
+		assert!(!storage.revoke_api_key(key.id).unwrap());
+		let fetched = storage.get_api_key(key.id).unwrap().unwrap();
+		assert_eq!(fetched.status, "revoked");
+	}
 
-    #[test]
-    fn test_get_api_key_by_key() {
-        let storage = create_test_storage();
-        let created = storage.create_api_key("my-app", None, None, None).unwrap();
-        let found = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
-        assert_eq!(found.id, created.id);
-        assert_eq!(found.name, "my-app");
-    }
+	#[test]
+	fn test_get_api_key_by_key() {
+		let storage = create_test_storage();
+		let created = storage.create_api_key("my-app", None, None, None).unwrap();
+		let found = storage.get_api_key_by_key(&created.key).unwrap().unwrap();
+		assert_eq!(found.id, created.id);
+		assert_eq!(found.name, "my-app");
+	}
 
-    #[test]
-    fn test_get_api_key_by_key_not_found() {
-        let storage = create_test_storage();
-        let result = storage.get_api_key_by_key("nonexistent").unwrap();
-        assert!(result.is_none());
-    }
+	#[test]
+	fn test_get_api_key_by_key_not_found() {
+		let storage = create_test_storage();
+		let result = storage.get_api_key_by_key("nonexistent").unwrap();
+		assert!(result.is_none());
+	}
 
-    // ── Completion tests ──
+	// ── Completion tests ──
 
-    #[test]
-    fn test_store_and_retrieve() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
-        let cmpl = make_stored_completion("cmpl_001", key.id, None, "Hello", "Hi there!");
+	#[test]
+	fn test_store_and_retrieve() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		let cmpl = make_stored_completion("cmpl_001", key.id, None, "Hello", "Hi there!");
 
-        storage.store_completion(&cmpl).unwrap();
-        let retrieved = storage.get_completion("cmpl_001").unwrap().unwrap();
+		storage.store_completion(&cmpl).unwrap();
+		let retrieved = storage.get_completion("cmpl_001").unwrap().unwrap();
 
-        assert_eq!(retrieved.id, "cmpl_001");
-        assert_eq!(retrieved.api_key_id, key.id);
-        assert_eq!(retrieved.input_model, "gpt-4o");
-        assert!(retrieved.previous_completion_id.is_none());
-    }
+		assert_eq!(retrieved.id, "cmpl_001");
+		assert_eq!(retrieved.api_key_id, key.id);
+		assert_eq!(retrieved.input_model, "gpt-4o");
+		assert!(retrieved.previous_completion_id.is_none());
+	}
 
-    #[test]
-    fn test_get_nonexistent() {
-        let storage = create_test_storage();
-        let result = storage.get_completion("nonexistent").unwrap();
-        assert!(result.is_none());
-    }
+	#[test]
+	fn test_get_nonexistent() {
+		let storage = create_test_storage();
+		let result = storage.get_completion("nonexistent").unwrap();
+		assert!(result.is_none());
+	}
 
-    #[test]
-    fn test_walk_chain_single() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
-        let cmpl = make_stored_completion("cmpl_001", key.id, None, "Hello", "Hi!");
-        storage.store_completion(&cmpl).unwrap();
+	#[test]
+	fn test_walk_chain_single() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		let cmpl = make_stored_completion("cmpl_001", key.id, None, "Hello", "Hi!");
+		storage.store_completion(&cmpl).unwrap();
 
-        let chain = storage.walk_chain("cmpl_001").unwrap();
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].id, "cmpl_001");
-    }
+		let chain = storage.walk_chain("cmpl_001").unwrap();
+		assert_eq!(chain.len(), 1);
+		assert_eq!(chain[0].id, "cmpl_001");
+	}
 
-    #[test]
-    fn test_walk_chain_multi() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
+	#[test]
+	fn test_walk_chain_multi() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
 
-        storage
-            .store_completion(&make_stored_completion(
-                "cmpl_001",
-                key.id,
-                None,
-                "What is Rust?",
-                "Rust is a systems language",
-            ))
-            .unwrap();
-        storage
-            .store_completion(&make_stored_completion(
-                "cmpl_002",
-                key.id,
-                Some("cmpl_001"),
-                "And its async story?",
-                "Tokio is the main runtime",
-            ))
-            .unwrap();
-        storage
-            .store_completion(&make_stored_completion(
-                "cmpl_003",
-                key.id,
-                Some("cmpl_002"),
-                "Tell me more",
-                "Tokio provides...",
-            ))
-            .unwrap();
+		storage
+			.store_completion(&make_stored_completion(
+				"cmpl_001",
+				key.id,
+				None,
+				"What is Rust?",
+				"Rust is a systems language",
+			))
+			.unwrap();
+		storage
+			.store_completion(&make_stored_completion(
+				"cmpl_002",
+				key.id,
+				Some("cmpl_001"),
+				"And its async story?",
+				"Tokio is the main runtime",
+			))
+			.unwrap();
+		storage
+			.store_completion(&make_stored_completion(
+				"cmpl_003",
+				key.id,
+				Some("cmpl_002"),
+				"Tell me more",
+				"Tokio provides...",
+			))
+			.unwrap();
 
-        let chain = storage.walk_chain("cmpl_003").unwrap();
-        assert_eq!(chain.len(), 3);
-        assert_eq!(chain[0].id, "cmpl_001");
-        assert_eq!(chain[1].id, "cmpl_002");
-        assert_eq!(chain[2].id, "cmpl_003");
-    }
+		let chain = storage.walk_chain("cmpl_003").unwrap();
+		assert_eq!(chain.len(), 3);
+		assert_eq!(chain[0].id, "cmpl_001");
+		assert_eq!(chain[1].id, "cmpl_002");
+		assert_eq!(chain[2].id, "cmpl_003");
+	}
 
-    #[test]
-    fn test_walk_chain_missing_link() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
-        storage
-            .store_completion(&make_stored_completion(
-                "cmpl_002",
-                key.id,
-                Some("cmpl_001"),
-                "test",
-                "test",
-            ))
-            .unwrap();
+	#[test]
+	fn test_walk_chain_missing_link() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		storage
+			.store_completion(&make_stored_completion(
+				"cmpl_002",
+				key.id,
+				Some("cmpl_001"),
+				"test",
+				"test",
+			))
+			.unwrap();
 
-        let result = storage.walk_chain("cmpl_002");
-        assert!(result.is_err());
-    }
+		let result = storage.walk_chain("cmpl_002");
+		assert!(result.is_err());
+	}
 
-    #[test]
-    fn test_store_with_instructions() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
-        let mut cmpl = make_stored_completion("cmpl_001", key.id, None, "Hello", "Hi!");
-        cmpl.instructions = Some("You are helpful".to_string());
-        storage.store_completion(&cmpl).unwrap();
+	#[test]
+	fn test_store_with_instructions() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		let mut cmpl = make_stored_completion("cmpl_001", key.id, None, "Hello", "Hi!");
+		cmpl.instructions = Some("You are helpful".to_string());
+		storage.store_completion(&cmpl).unwrap();
 
-        let retrieved = storage.get_completion("cmpl_001").unwrap().unwrap();
-        assert_eq!(retrieved.instructions.as_deref(), Some("You are helpful"));
-    }
+		let retrieved = storage.get_completion("cmpl_001").unwrap().unwrap();
+		assert_eq!(retrieved.instructions.as_deref(), Some("You are helpful"));
+	}
 
-    #[test]
-    fn test_list_completions_filtered() {
-        let storage = create_test_storage();
-        let key1 = storage.create_api_key("app-1", None, None, None).unwrap();
-        let key2 = storage.create_api_key("app-2", None, None, None).unwrap();
+	#[test]
+	fn test_list_completions_filtered() {
+		let storage = create_test_storage();
+		let key1 = storage.create_api_key("app-1", None, None, None).unwrap();
+		let key2 = storage.create_api_key("app-2", None, None, None).unwrap();
 
-        storage
-            .store_completion(&make_stored_completion("c1", key1.id, None, "a", "b"))
-            .unwrap();
-        storage
-            .store_completion(&make_stored_completion("c2", key2.id, None, "c", "d"))
-            .unwrap();
-        storage
-            .store_completion(&make_stored_completion("c3", key1.id, None, "e", "f"))
-            .unwrap();
+		storage
+			.store_completion(&make_stored_completion("c1", key1.id, None, "a", "b"))
+			.unwrap();
+		storage
+			.store_completion(&make_stored_completion("c2", key2.id, None, "c", "d"))
+			.unwrap();
+		storage
+			.store_completion(&make_stored_completion("c3", key1.id, None, "e", "f"))
+			.unwrap();
 
-        // Filter by key1 only
-        let filter = ListFilter {
-            key_ids: vec![key1.id],
-            limit: 50,
-            ..Default::default()
-        };
-        let results = storage.list_completions(&filter).unwrap();
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|c| c.api_key_id == key1.id));
+		// Filter by key1 only
+		let filter = ListFilter {
+			key_ids: vec![key1.id],
+			limit: 50,
+			..Default::default()
+		};
+		let results = storage.list_completions(&filter).unwrap();
+		assert_eq!(results.len(), 2);
+		assert!(results.iter().all(|c| c.api_key_id == key1.id));
 
-        // No filter — all
-        let filter = ListFilter {
-            limit: 50,
-            ..Default::default()
-        };
-        let results = storage.list_completions(&filter).unwrap();
-        assert_eq!(results.len(), 3);
-    }
+		// No filter — all
+		let filter = ListFilter {
+			limit: 50,
+			..Default::default()
+		};
+		let results = storage.list_completions(&filter).unwrap();
+		assert_eq!(results.len(), 3);
+	}
 
-    // ── Usage tests ──
+	// ── Usage tests ──
 
-    fn make_stored_media(id: &str, api_key_id: i64, status: &str) -> StoredMedia {
-        StoredMedia {
-            id: id.to_string(),
-            api_key_id,
-            task: "text_to_image".to_string(),
-            status: status.to_string(),
-            input_model: "flux".to_string(),
-            resolved_model: "fal-ai/flux/dev".to_string(),
-            provider: "fal".to_string(),
-            request: serde_json::json!({"prompt": "a red panda"}),
-            handle: Some(serde_json::json!({"remote_id": "job-1"})),
-            result: None,
-            usage: None,
-            warnings: None,
-            error: None,
-            created_at: 1700000000,
-            completed_at: None,
-        }
-    }
+	fn make_stored_media(id: &str, api_key_id: i64, status: &str) -> StoredMedia {
+		StoredMedia {
+			id: id.to_string(),
+			api_key_id,
+			task: "text_to_image".to_string(),
+			status: status.to_string(),
+			input_model: "flux".to_string(),
+			resolved_model: "fal-ai/flux/dev".to_string(),
+			provider: "fal".to_string(),
+			request: serde_json::json!({"prompt": "a red panda"}),
+			handle: Some(serde_json::json!({"remote_id": "job-1"})),
+			result: None,
+			usage: None,
+			warnings: None,
+			error: None,
+			created_at: 1700000000,
+			completed_at: None,
+		}
+	}
 
-    #[test]
-    fn media_round_trips_through_submit_and_completion() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
+	#[test]
+	fn media_round_trips_through_submit_and_completion() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
 
-        let queued = make_stored_media("med_1", key.id, "queued");
-        storage.store_media(&queued).unwrap();
+		let queued = make_stored_media("med_1", key.id, "queued");
+		storage.store_media(&queued).unwrap();
 
-        let stored = storage.get_media("med_1", key.id).unwrap().unwrap();
-        assert_eq!(stored.status, "queued");
-        assert_eq!(stored.provider, "fal");
-        assert_eq!(stored.request["prompt"], serde_json::json!("a red panda"));
-        // The handle is what makes a paid job resumable after a restart.
-        assert!(stored.handle.is_some());
-        assert!(stored.completed_at.is_none());
+		let stored = storage.get_media("med_1", key.id).unwrap().unwrap();
+		assert_eq!(stored.status, "queued");
+		assert_eq!(stored.provider, "fal");
+		assert_eq!(stored.request["prompt"], serde_json::json!("a red panda"));
+		// The handle is what makes a paid job resumable after a restart.
+		assert!(stored.handle.is_some());
+		assert!(stored.completed_at.is_none());
 
-        let mut done = stored;
-        done.status = "succeeded".to_string();
-        done.handle = None;
-        done.usage = Some(serde_json::json!({"cost": 0.08, "cost_source": "provider"}));
-        done.completed_at = Some(1700000042);
-        storage.update_media(&done).unwrap();
+		let mut done = stored;
+		done.status = "succeeded".to_string();
+		done.handle = None;
+		done.usage = Some(serde_json::json!({"cost": 0.08, "cost_source": "provider"}));
+		done.completed_at = Some(1700000042);
+		storage.update_media(&done).unwrap();
 
-        let reread = storage.get_media("med_1", key.id).unwrap().unwrap();
-        assert_eq!(reread.status, "succeeded");
-        assert!(reread.handle.is_none(), "a terminal job keeps no handle");
-        assert_eq!(reread.usage.unwrap()["cost"], serde_json::json!(0.08));
-        assert_eq!(reread.completed_at, Some(1700000042));
-        // Identity and the original request are immutable after submit.
-        assert_eq!(reread.input_model, "flux");
-        assert_eq!(reread.request["prompt"], serde_json::json!("a red panda"));
-    }
+		let reread = storage.get_media("med_1", key.id).unwrap().unwrap();
+		assert_eq!(reread.status, "succeeded");
+		assert!(reread.handle.is_none(), "a terminal job keeps no handle");
+		assert_eq!(reread.usage.unwrap()["cost"], serde_json::json!(0.08));
+		assert_eq!(reread.completed_at, Some(1700000042));
+		// Identity and the original request are immutable after submit.
+		assert_eq!(reread.input_model, "flux");
+		assert_eq!(reread.request["prompt"], serde_json::json!("a red panda"));
+	}
 
-    /// Record ids must not be probeable across tenants: another key's id has to
-    /// read as absent so the handler can answer 404 rather than 403.
-    #[test]
-    fn media_is_scoped_to_its_owning_key() {
-        let storage = create_test_storage();
-        let owner = create_test_key(&storage);
-        let other = storage
-            .create_api_key("other-key", None, None, None)
-            .unwrap();
+	/// Record ids must not be probeable across tenants: another key's id has to
+	/// read as absent so the handler can answer 404 rather than 403.
+	#[test]
+	fn media_is_scoped_to_its_owning_key() {
+		let storage = create_test_storage();
+		let owner = create_test_key(&storage);
+		let other = storage.create_api_key("other-key", None, None, None).unwrap();
 
-        storage
-            .store_media(&make_stored_media("med_1", owner.id, "queued"))
-            .unwrap();
+		storage
+			.store_media(&make_stored_media("med_1", owner.id, "queued"))
+			.unwrap();
 
-        assert!(storage.get_media("med_1", owner.id).unwrap().is_some());
-        assert!(storage.get_media("med_1", other.id).unwrap().is_none());
-        assert!(storage
-            .get_media("med_missing", owner.id)
-            .unwrap()
-            .is_none());
-    }
+		assert!(storage.get_media("med_1", owner.id).unwrap().is_some());
+		assert!(storage.get_media("med_1", other.id).unwrap().is_none());
+		assert!(storage.get_media("med_missing", owner.id).unwrap().is_none());
+	}
 
-    #[test]
-    fn list_media_filters_by_key_and_orders_newest_first() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
-        let other = storage
-            .create_api_key("other-key", None, None, None)
-            .unwrap();
+	#[test]
+	fn list_media_filters_by_key_and_orders_newest_first() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		let other = storage.create_api_key("other-key", None, None, None).unwrap();
 
-        let mut older = make_stored_media("med_old", key.id, "succeeded");
-        older.created_at = 1700000000;
-        let mut newer = make_stored_media("med_new", key.id, "queued");
-        newer.created_at = 1700000100;
-        storage.store_media(&older).unwrap();
-        storage.store_media(&newer).unwrap();
-        storage
-            .store_media(&make_stored_media("med_other", other.id, "queued"))
-            .unwrap();
+		let mut older = make_stored_media("med_old", key.id, "succeeded");
+		older.created_at = 1700000000;
+		let mut newer = make_stored_media("med_new", key.id, "queued");
+		newer.created_at = 1700000100;
+		storage.store_media(&older).unwrap();
+		storage.store_media(&newer).unwrap();
+		storage
+			.store_media(&make_stored_media("med_other", other.id, "queued"))
+			.unwrap();
 
-        let all = storage.list_media(&ListFilter::default()).unwrap();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].id, "med_new", "newest first");
+		let all = storage.list_media(&ListFilter::default()).unwrap();
+		assert_eq!(all.len(), 3);
+		assert_eq!(all[0].id, "med_new", "newest first");
 
-        let mine = storage
-            .list_media(&ListFilter {
-                key_ids: vec![key.id],
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(mine.len(), 2);
-        assert!(mine.iter().all(|m| m.api_key_id == key.id));
-        assert_eq!(mine[0].id, "med_new");
-    }
+		let mine = storage
+			.list_media(&ListFilter {
+				key_ids: vec![key.id],
+				..Default::default()
+			})
+			.unwrap();
+		assert_eq!(mine.len(), 2);
+		assert!(mine.iter().all(|m| m.api_key_id == key.id));
+		assert_eq!(mine[0].id, "med_new");
+	}
 
-    /// An unpriced media row must contribute nothing to the spend total rather
-    /// than pulling it toward zero.
-    #[test]
-    fn usage_counts_media_rows_and_sums_only_priced_cost() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
+	/// An unpriced media row must contribute nothing to the spend total rather
+	/// than pulling it toward zero.
+	#[test]
+	fn usage_counts_media_rows_and_sums_only_priced_cost() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
 
-        let mut priced = make_stored_media("med_1", key.id, "succeeded");
-        priced.usage = Some(serde_json::json!({"cost": 0.08, "cost_source": "provider"}));
-        let mut unpriced = make_stored_media("med_2", key.id, "succeeded");
-        unpriced.usage = Some(serde_json::json!({"cost": null, "cost_source": "unavailable"}));
-        storage.store_media(&priced).unwrap();
-        storage.store_media(&unpriced).unwrap();
+		let mut priced = make_stored_media("med_1", key.id, "succeeded");
+		priced.usage = Some(serde_json::json!({"cost": 0.08, "cost_source": "provider"}));
+		let mut unpriced = make_stored_media("med_2", key.id, "succeeded");
+		unpriced.usage = Some(serde_json::json!({"cost": null, "cost_source": "unavailable"}));
+		storage.store_media(&priced).unwrap();
+		storage.store_media(&unpriced).unwrap();
 
-        let usage = storage.get_usage(&[], None, None, None).unwrap();
-        assert_eq!(usage.len(), 1);
-        assert_eq!(usage[0].media_count, 2);
-        assert!((usage[0].total_cost - 0.08).abs() < 1e-9);
-    }
+		let usage = storage.get_usage(&[], None, None, None).unwrap();
+		assert_eq!(usage.len(), 1);
+		assert_eq!(usage[0].media_count, 2);
+		assert!((usage[0].total_cost - 0.08).abs() < 1e-9);
+	}
 
-    #[test]
-    fn test_get_usage_total() {
-        let storage = create_test_storage();
-        let key = create_test_key(&storage);
+	#[test]
+	fn test_get_usage_total() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
 
-        storage
-            .store_completion(&make_stored_completion("c1", key.id, None, "a", "b"))
-            .unwrap();
-        storage
-            .store_completion(&make_stored_completion("c2", key.id, None, "c", "d"))
-            .unwrap();
+		storage
+			.store_completion(&make_stored_completion("c1", key.id, None, "a", "b"))
+			.unwrap();
+		storage
+			.store_completion(&make_stored_completion("c2", key.id, None, "c", "d"))
+			.unwrap();
 
-        let usage = storage.get_usage(&[], None, None, None).unwrap();
-        assert_eq!(usage.len(), 1);
-        assert_eq!(usage[0].completions_count, 2);
-        assert_eq!(usage[0].total_input_tokens, 20); // 10 * 2
-        assert_eq!(usage[0].total_output_tokens, 10); // 5 * 2
-    }
+		let usage = storage.get_usage(&[], None, None, None).unwrap();
+		assert_eq!(usage.len(), 1);
+		assert_eq!(usage[0].completions_count, 2);
+		assert_eq!(usage[0].total_input_tokens, 20); // 10 * 2
+		assert_eq!(usage[0].total_output_tokens, 10); // 5 * 2
+	}
 }
