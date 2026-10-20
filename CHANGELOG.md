@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1] - 2026-10-20
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: refresh locked Rust dependencies `5b2e2886`
+- format Rust code at 120 columns `9a067202`
+
 ## [0.11.0] - 2026-10-18
 
 ### 📋 Release Summary
