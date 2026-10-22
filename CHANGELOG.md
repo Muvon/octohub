@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0] - 2026-10-22
+
+### 📋 Release Summary
+
+The HTTP server now supports graceful shutdown, bounded by the configured shutdown timeout.
+
+### ✨ New Features & Enhancements
+
+- **server**: gracefully shut down the HTTP server `38dbff03`
+
+### 🐛 Bug Fixes & Stability
+
+- **server**: bound graceful shutdown with configured timeout `e2eab5e9`
+
 ## [0.12.1] - 2026-10-22
 
 ### 📋 Release Summary
