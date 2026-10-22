@@ -1438,6 +1438,9 @@ mod credential_tests {
 		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
 		assert!(!storage.has_credentials().unwrap());
 		assert!(!Credentials::new(storage.clone(), None).unwrap().enabled());
+		for unset in ["", "  \n"] {
+			assert!(!Credentials::new(storage.clone(), Some(unset)).unwrap().enabled());
+		}
 		for invalid in ["not base64", "c2hvcnQ="] {
 			assert!(Credentials::new(storage.clone(), Some(invalid)).is_err());
 		}
@@ -1451,6 +1454,16 @@ mod credential_tests {
 		}
 		assert!(storage.has_credentials().unwrap());
 		assert!(Credentials::new(storage.clone(), None).is_err());
+		assert!(Credentials::new(storage.clone(), Some("")).is_err());
+		let padded = format!("{encryption_key}\n");
+		assert_eq!(
+			Credentials::new(storage.clone(), Some(&padded))
+				.unwrap()
+				.load("a")
+				.unwrap()[0]
+				.key,
+			secret
+		);
 		let loaded = credentials.load("a").unwrap();
 		assert_eq!(loaded[0].key, secret);
 		assert_eq!(loaded[0].record.key_hint, "...xY9z");

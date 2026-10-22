@@ -100,6 +100,9 @@ impl Credentials {
 	pub fn new(storage: Arc<dyn Storage>, key: Option<&str>) -> anyhow::Result<Self> {
 		use aes_gcm::KeyInit;
 		use base64::Engine;
+		// Deploy templates forward the variable even when it is unset, so an empty
+		// value means "not configured": BYOK off, not a refusal to start.
+		let key = key.map(str::trim).filter(|key| !key.is_empty());
 		let cipher = match key {
 			Some(key) => {
 				let decoded = base64::engine::general_purpose::STANDARD
