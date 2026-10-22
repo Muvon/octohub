@@ -6,21 +6,18 @@ mod http_util;
 mod logging;
 mod metrics;
 mod proxy;
+mod server;
 mod storage;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bytes::Bytes;
 use clap::Parser;
 use http_body_util::Full;
-use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto;
-use tokio::net::TcpListener;
 use tracing::Instrument;
 use ulid::Ulid;
 
@@ -157,7 +154,8 @@ async fn main() -> anyhow::Result<()> {
 	));
 
 	let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
-	let listener = TcpListener::bind(addr).await?;
+	let listener = server::bind(addr).with_context(|| format!("Failed to bind {addr}"))?;
+	let signal = server::shutdown_signal().context("Failed to install shutdown signal handlers")?;
 
 	// Structured startup banner
 	let db_kind = if cfg.server.db_url.starts_with("mysql://") {
@@ -187,40 +185,21 @@ async fn main() -> anyhow::Result<()> {
 		tracing::info!(bind = %cfg.metrics.bind, "metrics endpoint listening");
 	}
 
-	loop {
-		// A failed accept (EMFILE, ECONNABORTED, ...) must not kill the server —
-		// log, back off briefly, and keep accepting.
-		let (stream, remote_addr) = match listener.accept().await {
-			Ok(conn) => conn,
-			Err(e) => {
-				tracing::warn!(error = %e, "accept failed");
-				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-				continue;
-			}
-		};
-		let io = TokioIo::new(stream);
-		let engine = engine.clone();
-		let storage = storage.clone();
-
-		tokio::task::spawn(async move {
-			let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-				let engine = engine.clone();
-				let storage = storage.clone();
-				async move { Ok::<_, hyper::Error>(route(req, engine, storage, remote_addr).await) }
-			});
-
-			// auto::Builder negotiates HTTP/1 or HTTP/2 from what the client speaks
-			// (HTTP/2 prior-knowledge for plaintext, ALPN for TLS — TLS terminated
-			// upstream). HTTP/1 keep-alive stays disabled so each request closes
-			// its connection — prevents clients from reusing a stale pooled
-			// connection silently dropped by NAT/firewall during long LLM gaps.
-			let mut builder = auto::Builder::new(TokioExecutor::new());
-			builder.http1().keep_alive(false);
-			if let Err(err) = builder.serve_connection(io, service).await {
-				tracing::error!(remote = %remote_addr, error = %err, "connection error");
-			}
-		});
-	}
+	// On SIGTERM/SIGINT: stop accepting, let every in-flight request finish,
+	// exit. The drain is bounded by the upstream timeout — the longest single
+	// upstream call — read at shutdown because SIGHUP may have changed it. A
+	// request that also queued or failed over can outrun it and is then cut.
+	let drain_engine = engine.clone();
+	let shutdown = async move {
+		signal.await;
+		Duration::from_secs(drain_engine.config().server.upstream_timeout_secs)
+	};
+	server::serve(
+		listener,
+		move |req, remote_addr| route(req, engine.clone(), storage.clone(), remote_addr),
+		shutdown,
+	)
+	.await
 }
 
 /// Build a concise provider summary for the startup banner, e.g. "ollama:4,minimax:8"

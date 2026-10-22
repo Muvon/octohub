@@ -14,7 +14,8 @@ OctoHub is a Rust 2021 binary using Tokio and Hyper 1. It proxies completions, e
 
 | Path | Responsibility |
 |---|---|
-| `src/main.rs` | CLI, startup, HTTP/1 and HTTP/2 listener, route dispatch/classification, request spans and IDs, Unix SIGHUP reload |
+| `src/main.rs` | CLI, startup, route dispatch/classification, request spans and IDs, Unix SIGHUP reload |
+| `src/server.rs` | HTTP/1 and HTTP/2 listener (`SO_REUSEPORT`), accept loop, SIGTERM/SIGINT graceful drain bounded by `server.upstream_timeout_secs` |
 | `src/config.rs` | TOML/env loading, defaults, validation, model candidate lists, media endpoint overrides |
 | `src/auth.rs` | Independent client-key and admin-master-key authentication |
 | `src/api/handler.rs` | Client handlers, request conversion, error/status mapping, buffered chat SSE, metrics |
@@ -80,7 +81,7 @@ Use existing handler authentication, parsing, filtering, and error helpers when 
 ### Loading and precedence
 
 - Pass a file explicitly with `-c PATH` / `--config PATH`. There is **no automatic loading of `./octohub.toml`**. Without a path, startup uses defaults plus environment variables and empty model maps.
-- `--bind HOST:PORT` overrides the loaded bind address. `OCTOHUB_HOST` and `OCTOHUB_PORT` apply only in the no-file environment path.
+- Bind address precedence: `--bind HOST:PORT` → `OCTOHUB_HOST` / `OCTOHUB_PORT` (both load paths; blank host or invalid port is a startup error, unlike other numeric overrides) → `[server]` host/port → defaults.
 - If a TOML `[server]` table is present, `api_key` is currently a required field during deserialization, even when `OCTOHUB_MASTER_KEY` will override it. Omitting the entire table uses `ServerConfig::default()`.
 - Supported sections are `[server]`, `[models]`, `[embedding_models]`, `[media_models]`, `[evaluation_models]`, `[auto]`, `[providers.<name>]`, `[logging]`, `[metrics]`, `[media]`, and `[media_providers.<name>]`.
 - File and no-file modes both accept `OCTOHUB_MASTER_KEY`, `OCTOHUB_DB_URL`, `OCTOHUB_LOG_FORMAT`, `OCTOHUB_LOG_LEVEL`, `OCTOHUB_METRICS_BIND`, `OCTOHUB_METRICS_ENABLED`, `OCTOHUB_PROVIDER_QUEUE_TIMEOUT_SECS`, `OCTOHUB_UPSTREAM_TIMEOUT_SECS`, `OCTOHUB_FAILOVER_ON_ERROR`, and `OCTOHUB_PROVIDER_ERROR_COOLDOWN_SECS`.

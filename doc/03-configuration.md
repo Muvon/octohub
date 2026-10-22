@@ -242,8 +242,8 @@ loaded (`src/config.rs:190`).
 | `OCTOHUB_UPSTREAM_TIMEOUT_SECS` | `[server].upstream_timeout_secs` | Overrides the complete upstream operation deadline. |
 | `OCTOHUB_FAILOVER_ON_ERROR` | `[server].failover_on_error` | `true`/`1` enables provider failover. |
 | `OCTOHUB_PROVIDER_ERROR_COOLDOWN_SECS` | `[server].provider_error_cooldown_secs` | Overrides the provider cooldown duration. |
-| `OCTOHUB_HOST` | `[server].host` | Only when no config file is loaded. |
-| `OCTOHUB_PORT` | `[server].port` | Only when no config file is loaded. |
+| `OCTOHUB_HOST` | `[server].host` | Overrides the file too. Set but blank is a startup error. |
+| `OCTOHUB_PORT` | `[server].port` | Overrides the file too. Not a port number (0-65535) is a startup error. |
 | `OCTOHUB_LOG_FORMAT` | `[logging].format` | `auto`, `pretty`, or `json`. |
 | `OCTOHUB_LOG_LEVEL` | `[logging].level` | `trace`, `debug`, `info`, `warn`, `error`. Takes precedence over `RUST_LOG`. |
 | `OCTOHUB_METRICS_ENABLED` | `[metrics].enabled` | `true`/`false`/`1`/`0`. |

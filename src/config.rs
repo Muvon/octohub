@@ -274,6 +274,27 @@ fn default_port() -> u16 {
 	8080
 }
 
+/// `OCTOHUB_HOST` / `OCTOHUB_PORT` replace the listen address in both load
+/// paths (file and no-file), so one config file can serve several instances
+/// on different ports. A value that is set but blank or not a port is an
+/// error: binding the file's address instead would put two instances on one
+/// port. `var` reads a variable (the process environment outside tests).
+fn apply_bind_overrides(server: &mut ServerConfig, var: impl Fn(&str) -> Option<String>) -> Result<()> {
+	if let Some(host) = var("OCTOHUB_HOST") {
+		if host.trim().is_empty() {
+			anyhow::bail!("OCTOHUB_HOST is set but empty");
+		}
+		server.host = host;
+	}
+	if let Some(port) = var("OCTOHUB_PORT") {
+		server.port = port
+			.trim()
+			.parse()
+			.with_context(|| format!("Invalid OCTOHUB_PORT '{port}': expected a port number 0-65535"))?;
+	}
+	Ok(())
+}
+
 fn default_db_url() -> String {
 	"sqlite://octohub.db".to_string()
 }
@@ -327,6 +348,7 @@ impl Config {
 			if let Ok(db_url) = env::var("OCTOHUB_DB_URL") {
 				config.server.db_url = db_url;
 			}
+			apply_bind_overrides(&mut config.server, |name| env::var(name).ok())?;
 			Self::apply_env_overrides(&mut config);
 
 			tracing::info!("Loaded config from {}", path);
@@ -334,7 +356,7 @@ impl Config {
 		} else {
 			// No config file - use defaults with env overrides
 			tracing::info!("No config file specified, using defaults");
-			Ok(Self::from_env())
+			Self::from_env()
 		}
 	}
 
@@ -429,14 +451,11 @@ impl Config {
 	}
 
 	/// Load from environment variables only (fallback)
-	fn from_env() -> Self {
+	fn from_env() -> Result<Self> {
 		let mut config = Self {
 			server: ServerConfig {
-				host: env::var("OCTOHUB_HOST").unwrap_or_else(|_| default_host()),
-				port: env::var("OCTOHUB_PORT")
-					.ok()
-					.and_then(|p| p.parse().ok())
-					.unwrap_or(default_port()),
+				host: default_host(),
+				port: default_port(),
 				api_key: env::var("OCTOHUB_MASTER_KEY").unwrap_or_default(),
 				db_url: env::var("OCTOHUB_DB_URL").unwrap_or_else(|_| default_db_url()),
 				trust_forwarded_for: false,
@@ -457,8 +476,9 @@ impl Config {
 			media: MediaConfig::default(),
 			media_providers: HashMap::new(),
 		};
+		apply_bind_overrides(&mut config.server, |name| env::var(name).ok())?;
 		Self::apply_env_overrides(&mut config);
-		config
+		Ok(config)
 	}
 
 	/// All (provider, model_name) candidates for `model`, rotated to a
@@ -1037,5 +1057,60 @@ mod tests {
 		assert_eq!(config.server.provider_queue_timeout_secs, 45);
 		assert_eq!(config.server.owner_queue_timeout_secs, 5);
 		assert_eq!(config.server.upstream_timeout_secs, 420);
+	}
+
+	fn file_server() -> ServerConfig {
+		let config: Config = toml::from_str(
+			r#"
+            [server]
+            api_key = ""
+            host = "0.0.0.0"
+            port = 2780
+            "#,
+		)
+		.unwrap();
+		config.server
+	}
+
+	/// A stand-in environment: the process one is shared by parallel tests.
+	fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+		let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+		move |name| {
+			pairs
+				.iter()
+				.find(|(key, _)| key == name)
+				.map(|(_, value)| value.clone())
+		}
+	}
+
+	#[test]
+	fn bind_env_overrides_the_file_address() {
+		let mut server = file_server();
+		apply_bind_overrides(
+			&mut server,
+			vars(&[("OCTOHUB_HOST", "127.0.0.1"), ("OCTOHUB_PORT", "2781")]),
+		)
+		.unwrap();
+		assert_eq!((server.host.as_str(), server.port), ("127.0.0.1", 2781));
+	}
+
+	#[test]
+	fn bind_env_unset_keeps_the_file_address() {
+		let mut server = file_server();
+		apply_bind_overrides(&mut server, vars(&[])).unwrap();
+		assert_eq!((server.host.as_str(), server.port), ("0.0.0.0", 2780));
+
+		apply_bind_overrides(&mut server, vars(&[("OCTOHUB_PORT", "2782")])).unwrap();
+		assert_eq!((server.host.as_str(), server.port), ("0.0.0.0", 2782));
+	}
+
+	#[test]
+	fn bind_env_rejects_a_bad_port_or_blank_host() {
+		for port in ["", "http", "65536", "-1"] {
+			let err = apply_bind_overrides(&mut file_server(), vars(&[("OCTOHUB_PORT", port)])).expect_err(port);
+			assert!(err.to_string().starts_with("Invalid OCTOHUB_PORT"), "{err}");
+		}
+		let err = apply_bind_overrides(&mut file_server(), vars(&[("OCTOHUB_HOST", " ")])).unwrap_err();
+		assert_eq!(err.to_string(), "OCTOHUB_HOST is set but empty");
 	}
 }

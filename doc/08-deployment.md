@@ -167,6 +167,41 @@ There is no separate `/ready` endpoint. Don't add a check that pokes
 the upstream providers — those are slow and external; you don't want
 your readiness check to flap because Anthropic had a bad minute.
 
+## Shutdown and restarts
+
+Source: `src/server.rs`. On `SIGTERM` or `SIGINT` (Ctrl-C on Windows)
+OctoHub drains instead of dying mid-request:
+
+1. The listening socket closes at once — new connections are refused
+   (or go to another process sharing the port, below).
+2. Every connection serving a request finishes it and closes. HTTP/2
+   connections get a `GOAWAY`; idle connections close immediately.
+3. Once none are left the process exits `0`.
+
+The drain is bounded by `server.upstream_timeout_secs`
+(`OCTOHUB_UPSTREAM_TIMEOUT_SECS`; the value in force at the signal, so a
+SIGHUP reload counts). Connections still open at the bound are logged
+(`drain timed out with connections still open`, `connections` field) and
+the process exits non-zero. Give the supervisor a stop timeout a little
+above the bound — e.g. `docker stop -t 390` for the default 360 s —
+so it does not `SIGKILL` a drain that would have finished.
+
+The handlers are installed explicitly, so this works with OctoHub as
+PID 1 in a container (no init shim needed).
+
+Media jobs need no draining: the job is stored before the inline wait,
+so a client that lost its connection resumes it with
+`GET /v1/media/{id}`. Only the inline wait itself (and any blocking
+completion, embedding or evaluation call) relies on the drain.
+
+### Sharing the port
+
+The client listener sets `SO_REUSEPORT` (Unix), so a second process —
+a new OctoHub, or a load balancer that also sets it — can bind the same
+address while the old one still serves. The kernel spreads new
+connections across every socket on the port; when one closes, the
+others keep taking them.
+
 ## `X-Forwarded-For`
 
 Source: `src/http_util.rs:9`. Behavior:
@@ -195,7 +230,7 @@ still know which client connected (via the proxy's logs).
 
 ## HTTP/1 keep-alive is disabled
 
-This is a deliberate choice in `src/main.rs:138`. Read the comment:
+This is a deliberate choice in `src/server.rs` (`serve`). Read the comment:
 
 > HTTP/1 keep-alive stays disabled so each request closes its
 > connection — prevents clients from reusing a stale pooled connection

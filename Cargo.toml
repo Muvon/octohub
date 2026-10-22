@@ -11,7 +11,7 @@ octolib = { version = "0.45.0", default-features = false, features = ["llm", "em
 # octolib = { path = "../octolib", default-features = false, features = ["llm", "embeddings", "media", "evaluation"] }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful", "http1", "http2"] }
 http-body-util = "0.1"
 bytes = "1"
 toml = "0.8"
