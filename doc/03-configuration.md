@@ -72,6 +72,7 @@ Defined in `src/config.rs:83`. All keys optional except as noted.
 | `upstream_timeout_secs` | `360` | Maximum duration of the complete provider operation, including octolib retries. Exceeding it returns `504`. |
 | `failover_on_error` | `false` | Re-route provider-side failures (timeout, connect, 401/403 key or billing rejection, 404, 429, 5xx) to the next candidate provider of the model alias. A 400 never fails over. |
 | `provider_error_cooldown_secs` | `0` | After 3 consecutive provider-side failures, deprioritize the provider for this many seconds (used only when no healthy candidate admits). `0` = off. |
+| `shutdown_timeout_secs` | `900` | Drain bound on SIGTERM/SIGINT: in-flight requests get this long to finish, then the process exits non-zero. Must be > 0 and ≥ the longest admitted request (`owner_queue + attempts × (provider_queue + upstream)`); the container stop timeout must exceed it. See [08 — Deployment](08-deployment.md#shutdown-and-restarts). |
 
 The legacy alias `db_path` is also accepted and treated as `db_url`
 (`src/config.rs:98`).
@@ -242,6 +243,7 @@ loaded (`src/config.rs:190`).
 | `OCTOHUB_UPSTREAM_TIMEOUT_SECS` | `[server].upstream_timeout_secs` | Overrides the complete upstream operation deadline. |
 | `OCTOHUB_FAILOVER_ON_ERROR` | `[server].failover_on_error` | `true`/`1` enables provider failover. |
 | `OCTOHUB_PROVIDER_ERROR_COOLDOWN_SECS` | `[server].provider_error_cooldown_secs` | Overrides the provider cooldown duration. |
+| `OCTOHUB_SHUTDOWN_TIMEOUT_SECS` | `[server].shutdown_timeout_secs` | Overrides the drain bound. Not whole seconds, or `0`, is a startup error. |
 | `OCTOHUB_HOST` | `[server].host` | Overrides the file too. Set but blank is a startup error. |
 | `OCTOHUB_PORT` | `[server].port` | Overrides the file too. Not a port number (0-65535) is a startup error. |
 | `OCTOHUB_LOG_FORMAT` | `[logging].format` | `auto`, `pretty`, or `json`. |

@@ -178,13 +178,23 @@ OctoHub drains instead of dying mid-request:
    connections get a `GOAWAY`; idle connections close immediately.
 3. Once none are left the process exits `0`.
 
-The drain is bounded by `server.upstream_timeout_secs`
-(`OCTOHUB_UPSTREAM_TIMEOUT_SECS`; the value in force at the signal, so a
-SIGHUP reload counts). Connections still open at the bound are logged
-(`drain timed out with connections still open`, `connections` field) and
-the process exits non-zero. Give the supervisor a stop timeout a little
-above the bound — e.g. `docker stop -t 390` for the default 360 s —
-so it does not `SIGKILL` a drain that would have finished.
+The drain is bounded by `server.shutdown_timeout_secs`
+(`OCTOHUB_SHUTDOWN_TIMEOUT_SECS`, default 900, must be > 0; the value in
+force at the signal, so a SIGHUP reload counts). Connections still open
+at the bound are logged (`drain timed out with connections still open`,
+`connections` field) and the process exits non-zero.
+
+Size it to the longest request OctoHub admits, not to
+`upstream_timeout_secs`: a request can wait in its owner queue
+(`owner_queue_timeout_secs`), then for each candidate wait for a provider
+permit (`provider_queue_timeout_secs`) and spend a full upstream window
+(`upstream_timeout_secs`) before failing over to the next. Roughly
+`owner_queue + attempts × (provider_queue + upstream)`. The default 900 s
+covers two attempts at the default timeouts.
+
+Give the supervisor a stop timeout above the bound — e.g.
+`docker stop -t 960` for the default 900 s — so it does not `SIGKILL` a
+drain that would have finished.
 
 The handlers are installed explicitly, so this works with OctoHub as
 PID 1 in a container (no init shim needed).

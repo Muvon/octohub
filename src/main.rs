@@ -179,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
 		provider_queue_timeout_secs = cfg.server.provider_queue_timeout_secs,
 		owner_queue_timeout_secs = cfg.server.owner_queue_timeout_secs,
 		upstream_timeout_secs = cfg.server.upstream_timeout_secs,
+		shutdown_timeout_secs = cfg.server.shutdown_timeout_secs,
 		"octohub starting"
 	);
 	if cfg.metrics.enabled {
@@ -186,13 +187,12 @@ async fn main() -> anyhow::Result<()> {
 	}
 
 	// On SIGTERM/SIGINT: stop accepting, let every in-flight request finish,
-	// exit. The drain is bounded by the upstream timeout — the longest single
-	// upstream call — read at shutdown because SIGHUP may have changed it. A
-	// request that also queued or failed over can outrun it and is then cut.
+	// exit. The drain bound is `server.shutdown_timeout_secs`, read at
+	// shutdown because SIGHUP may have changed it.
 	let drain_engine = engine.clone();
 	let shutdown = async move {
 		signal.await;
-		Duration::from_secs(drain_engine.config().server.upstream_timeout_secs)
+		Duration::from_secs(drain_engine.config().server.shutdown_timeout_secs)
 	};
 	server::serve(
 		listener,

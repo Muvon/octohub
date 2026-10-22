@@ -123,8 +123,12 @@ where
 			// connection silently dropped by NAT/firewall during long LLM gaps.
 			let mut builder = auto::Builder::new(TokioExecutor::new());
 			builder.http1().keep_alive(false);
-			if let Err(err) = watcher.watch(builder.serve_connection(io, service)).await {
-				tracing::error!(remote = %remote_addr, error = %err, "connection error");
+			match watcher.watch(builder.serve_connection(io, service)).await {
+				Ok(()) => {}
+				Err(err) if is_idle_close(err.as_ref()) => {
+					tracing::debug!(remote = %remote_addr, "idle connection closed for shutdown");
+				}
+				Err(err) => tracing::error!(remote = %remote_addr, error = %err, "connection error"),
 			}
 		});
 	};
@@ -144,6 +148,16 @@ where
 	}
 	tracing::info!("drained; exiting");
 	Ok(())
+}
+
+/// True for the error a connection ends with when shutdown closes it before
+/// it sent a single request: hyper-util cancels the protocol sniff and yields
+/// a bare `io::Error` of kind `Interrupted` ("Cancelled"). Expected during a
+/// drain, unlike every other connection error, which hyper wraps in its own
+/// error type.
+fn is_idle_close(err: &(dyn std::error::Error + 'static)) -> bool {
+	err.downcast_ref::<std::io::Error>()
+		.is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)
 }
 
 #[cfg(test)]
@@ -288,6 +302,41 @@ mod tests {
 			.unwrap()
 			.expect_err("drain past the bound must fail");
 		assert_eq!(err.to_string(), "1 connection(s) still open after the 200ms drain");
+	}
+
+	/// Serve one accepted connection the way `serve` does. `client` is what the
+	/// peer writes first; `shutdown` signals a drain once the connection is up.
+	async fn connection_error(client: &[u8], shutdown: bool) -> Box<dyn std::error::Error + Send + Sync> {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+		peer.write_all(client).await.unwrap();
+		let (stream, _) = listener.accept().await.unwrap();
+
+		let service = service_fn(|_req: Request<Incoming>| async {
+			Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::new())))
+		});
+		let mut builder = auto::Builder::new(TokioExecutor::new());
+		builder.http1().keep_alive(false);
+		let graceful = GracefulShutdown::new();
+		let connection = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
+		let result = if shutdown {
+			tokio::join!(connection, graceful.shutdown()).0
+		} else {
+			connection.await
+		};
+		result.expect_err("connection must end in an error")
+	}
+
+	#[tokio::test]
+	async fn idle_close_on_shutdown_is_recognised() {
+		let err = connection_error(b"", true).await;
+		assert!(is_idle_close(err.as_ref()), "{err:?}");
+	}
+
+	#[tokio::test]
+	async fn real_connection_errors_are_not_idle_closes() {
+		let err = connection_error(b"NOT HTTP AT ALL\r\n\r\n", false).await;
+		assert!(!is_idle_close(err.as_ref()), "{err:?}");
 	}
 
 	#[cfg(unix)]

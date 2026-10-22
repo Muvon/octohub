@@ -222,6 +222,14 @@ pub struct ServerConfig {
 	/// candidate can admit the request. 0 = disabled.
 	#[serde(default)]
 	pub provider_error_cooldown_secs: u64,
+	/// How long SIGTERM/SIGINT waits for in-flight requests before exiting
+	/// non-zero. Must cover the longest request octohub admits: owner queue +
+	/// provider queue + one `upstream_timeout_secs` window per failover
+	/// attempt — `upstream_timeout_secs` alone would cut a request that queued
+	/// or failed over. A container's stop timeout must exceed it, or the
+	/// runtime kills the drain first. Must be > 0.
+	#[serde(default = "default_shutdown_timeout_secs")]
+	pub shutdown_timeout_secs: u64,
 }
 
 /// Per-provider configuration knobs.
@@ -278,8 +286,10 @@ fn default_port() -> u16 {
 /// paths (file and no-file), so one config file can serve several instances
 /// on different ports. A value that is set but blank or not a port is an
 /// error: binding the file's address instead would put two instances on one
-/// port. `var` reads a variable (the process environment outside tests).
-fn apply_bind_overrides(server: &mut ServerConfig, var: impl Fn(&str) -> Option<String>) -> Result<()> {
+/// port. `OCTOHUB_SHUTDOWN_TIMEOUT_SECS` is strict the same way — silently
+/// keeping another drain bound would let the stop timeout cut requests.
+/// `var` reads a variable (the process environment outside tests).
+fn apply_server_overrides(server: &mut ServerConfig, var: impl Fn(&str) -> Option<String>) -> Result<()> {
 	if let Some(host) = var("OCTOHUB_HOST") {
 		if host.trim().is_empty() {
 			anyhow::bail!("OCTOHUB_HOST is set but empty");
@@ -291,6 +301,15 @@ fn apply_bind_overrides(server: &mut ServerConfig, var: impl Fn(&str) -> Option<
 			.trim()
 			.parse()
 			.with_context(|| format!("Invalid OCTOHUB_PORT '{port}': expected a port number 0-65535"))?;
+	}
+	if let Some(secs) = var("OCTOHUB_SHUTDOWN_TIMEOUT_SECS") {
+		server.shutdown_timeout_secs = secs
+			.trim()
+			.parse()
+			.with_context(|| format!("Invalid OCTOHUB_SHUTDOWN_TIMEOUT_SECS '{secs}': expected whole seconds"))?;
+	}
+	if server.shutdown_timeout_secs == 0 {
+		anyhow::bail!("server.shutdown_timeout_secs must be > 0: a zero drain cuts every in-flight request");
 	}
 	Ok(())
 }
@@ -311,6 +330,12 @@ fn default_upstream_timeout_secs() -> u64 {
 	6 * 60
 }
 
+/// With the default timeouts it covers the owner queue (30 s) plus two full
+/// attempts, each a provider queue and an upstream window (2 × (60 + 360) s).
+fn default_shutdown_timeout_secs() -> u64 {
+	15 * 60
+}
+
 impl Default for ServerConfig {
 	fn default() -> Self {
 		Self {
@@ -324,6 +349,7 @@ impl Default for ServerConfig {
 			upstream_timeout_secs: default_upstream_timeout_secs(),
 			failover_on_error: false,
 			provider_error_cooldown_secs: 0,
+			shutdown_timeout_secs: default_shutdown_timeout_secs(),
 		}
 	}
 }
@@ -348,7 +374,7 @@ impl Config {
 			if let Ok(db_url) = env::var("OCTOHUB_DB_URL") {
 				config.server.db_url = db_url;
 			}
-			apply_bind_overrides(&mut config.server, |name| env::var(name).ok())?;
+			apply_server_overrides(&mut config.server, |name| env::var(name).ok())?;
 			Self::apply_env_overrides(&mut config);
 
 			tracing::info!("Loaded config from {}", path);
@@ -464,6 +490,7 @@ impl Config {
 				upstream_timeout_secs: default_upstream_timeout_secs(),
 				failover_on_error: false,
 				provider_error_cooldown_secs: 0,
+				shutdown_timeout_secs: default_shutdown_timeout_secs(),
 			},
 			models: HashMap::new(),
 			embedding_models: HashMap::new(),
@@ -476,7 +503,7 @@ impl Config {
 			media: MediaConfig::default(),
 			media_providers: HashMap::new(),
 		};
-		apply_bind_overrides(&mut config.server, |name| env::var(name).ok())?;
+		apply_server_overrides(&mut config.server, |name| env::var(name).ok())?;
 		Self::apply_env_overrides(&mut config);
 		Ok(config)
 	}
@@ -1086,7 +1113,7 @@ mod tests {
 	#[test]
 	fn bind_env_overrides_the_file_address() {
 		let mut server = file_server();
-		apply_bind_overrides(
+		apply_server_overrides(
 			&mut server,
 			vars(&[("OCTOHUB_HOST", "127.0.0.1"), ("OCTOHUB_PORT", "2781")]),
 		)
@@ -1097,20 +1124,68 @@ mod tests {
 	#[test]
 	fn bind_env_unset_keeps_the_file_address() {
 		let mut server = file_server();
-		apply_bind_overrides(&mut server, vars(&[])).unwrap();
+		apply_server_overrides(&mut server, vars(&[])).unwrap();
 		assert_eq!((server.host.as_str(), server.port), ("0.0.0.0", 2780));
 
-		apply_bind_overrides(&mut server, vars(&[("OCTOHUB_PORT", "2782")])).unwrap();
+		apply_server_overrides(&mut server, vars(&[("OCTOHUB_PORT", "2782")])).unwrap();
 		assert_eq!((server.host.as_str(), server.port), ("0.0.0.0", 2782));
 	}
 
 	#[test]
 	fn bind_env_rejects_a_bad_port_or_blank_host() {
 		for port in ["", "http", "65536", "-1"] {
-			let err = apply_bind_overrides(&mut file_server(), vars(&[("OCTOHUB_PORT", port)])).expect_err(port);
+			let err = apply_server_overrides(&mut file_server(), vars(&[("OCTOHUB_PORT", port)])).expect_err(port);
 			assert!(err.to_string().starts_with("Invalid OCTOHUB_PORT"), "{err}");
 		}
-		let err = apply_bind_overrides(&mut file_server(), vars(&[("OCTOHUB_HOST", " ")])).unwrap_err();
+		let err = apply_server_overrides(&mut file_server(), vars(&[("OCTOHUB_HOST", " ")])).unwrap_err();
 		assert_eq!(err.to_string(), "OCTOHUB_HOST is set but empty");
+	}
+
+	#[test]
+	fn shutdown_timeout_defaults_above_the_longest_default_request() {
+		let server = ServerConfig::default();
+		assert_eq!(server.shutdown_timeout_secs, 900);
+		// Owner queue + two attempts of (provider queue + upstream window).
+		let two_attempts =
+			server.owner_queue_timeout_secs + 2 * (server.provider_queue_timeout_secs + server.upstream_timeout_secs);
+		assert!(server.shutdown_timeout_secs > two_attempts, "{two_attempts}");
+		assert_eq!(
+			file_server().shutdown_timeout_secs,
+			900,
+			"absent from the file = default"
+		);
+	}
+
+	#[test]
+	fn shutdown_timeout_comes_from_file_then_env() {
+		let config: Config = toml::from_str("[server]\napi_key = \"\"\nshutdown_timeout_secs = 600\n").unwrap();
+		let mut server = config.server;
+		apply_server_overrides(&mut server, vars(&[])).unwrap();
+		assert_eq!(server.shutdown_timeout_secs, 600);
+
+		apply_server_overrides(&mut server, vars(&[("OCTOHUB_SHUTDOWN_TIMEOUT_SECS", "960")])).unwrap();
+		assert_eq!(server.shutdown_timeout_secs, 960);
+	}
+
+	#[test]
+	fn shutdown_timeout_rejects_zero_and_garbage() {
+		for secs in ["", "soon", "-5", "1.5"] {
+			let err = apply_server_overrides(&mut file_server(), vars(&[("OCTOHUB_SHUTDOWN_TIMEOUT_SECS", secs)]))
+				.expect_err(secs);
+			assert!(
+				err.to_string().starts_with("Invalid OCTOHUB_SHUTDOWN_TIMEOUT_SECS"),
+				"{err}"
+			);
+		}
+		let zero_env = apply_server_overrides(&mut file_server(), vars(&[("OCTOHUB_SHUTDOWN_TIMEOUT_SECS", "0")]));
+		let config: Config = toml::from_str("[server]\napi_key = \"\"\nshutdown_timeout_secs = 0\n").unwrap();
+		let mut file_zero = config.server;
+		let zero_file = apply_server_overrides(&mut file_zero, vars(&[]));
+		for result in [zero_env, zero_file] {
+			assert!(result
+				.unwrap_err()
+				.to_string()
+				.starts_with("server.shutdown_timeout_secs must be > 0"));
+		}
 	}
 }
