@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.12.0] - 2026-10-22
+
+### 📋 Release Summary
+
+Owner-provided BYOK credentials can now be stored encrypted. Storage errors are sanitized, and MySQL writes are serialized.
+
+### ✨ New Features & Enhancements
+
+- **byok**: support encrypted owner BYOK credentials `e58d1d04`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: upgrade octolib dependency `292c2dbf`
+
+### 🐛 Bug Fixes & Stability
+
+- **storage**: sanitize storage errors and serialize MySQL writes `5bc9a5b1`
+
 ## [0.11.1] - 2026-10-20
 
 ### 🔧 Improvements & Optimizations
