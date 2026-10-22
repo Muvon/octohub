@@ -105,6 +105,113 @@ impl std::fmt::Display for ModalityNotSupportedError {
 
 impl std::error::Error for ModalityNotSupportedError {}
 
+/// The attachment kinds a conversation carries — what any lane serving it
+/// must be able to read. Checked per candidate before the upstream call, and
+/// per alias when `auto` picks one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Modalities {
+	pub images: bool,
+	pub videos: bool,
+}
+
+impl Modalities {
+	pub(crate) fn of(messages: &[Message]) -> Self {
+		Self {
+			images: messages
+				.iter()
+				.any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty())),
+			videos: messages
+				.iter()
+				.any(|m| m.videos.as_ref().is_some_and(|v| !v.is_empty())),
+		}
+	}
+
+	/// Whether one `provider:model` lane can read everything this carries.
+	pub(crate) fn served_by(self, provider: &str, model: &str) -> bool {
+		if !self.images && !self.videos {
+			return true;
+		}
+		ProviderFactory::create_provider(provider)
+			.is_ok_and(|p| (!self.images || p.supports_vision(model)) && (!self.videos || p.supports_video(model)))
+	}
+
+	/// Whether at least one lane of a `[models]` alias can serve this — the
+	/// request then routes to it, exactly as an explicit model would.
+	pub(crate) fn served_by_alias(self, config: &Config, alias: &str) -> bool {
+		config
+			.ordered_model_candidates(alias)
+			.is_ok_and(|lanes| lanes.iter().any(|(provider, model)| self.served_by(provider, model)))
+	}
+
+	/// What of this NO lane of `alias` can read — the attachments that must be
+	/// left out for that alias to serve the request at all.
+	pub(crate) fn unread_by_alias(self, config: &Config, alias: &str) -> Self {
+		let images = Self {
+			images: true,
+			videos: false,
+		};
+		let videos = Self {
+			images: false,
+			videos: true,
+		};
+		Self {
+			images: self.images && !images.served_by_alias(config, alias),
+			videos: self.videos && !videos.served_by_alias(config, alias),
+		}
+	}
+
+	/// Suffix for an unresolvable-`auto` error, naming what ruled entries out.
+	fn describe(self) -> &'static str {
+		match (self.images, self.videos) {
+			(true, true) => " that reads images and video",
+			(true, false) => " that reads images",
+			(false, true) => " that reads video",
+			(false, false) => "",
+		}
+	}
+}
+
+/// Where the turn the model is answering now begins: just after the last
+/// assistant message. Everything from there on (the user's message, or the tool
+/// results of the model's own last calls) is what it is being asked about; what
+/// came before is history it has already answered.
+pub(crate) fn current_turn_start(messages: &[Message]) -> usize {
+	messages
+		.iter()
+		.rposition(|m| m.role == "assistant")
+		.map_or(0, |i| i + 1)
+}
+
+/// Leave out the attachment kinds in `omit`, saying so in the message text so
+/// the model knows something was there. The same thing octomind does before it
+/// sends history to a model it knows cannot read images.
+pub(crate) fn omit_attachments(messages: &mut [Message], omit: Modalities) {
+	for m in messages {
+		let mut left_out = Vec::new();
+		if omit.images {
+			if let Some(images) = m.images.take().filter(|i| !i.is_empty()) {
+				left_out.push(format!("{} image(s)", images.len()));
+			}
+		}
+		if omit.videos {
+			if let Some(videos) = m.videos.take().filter(|v| !v.is_empty()) {
+				left_out.push(format!("{} video(s)", videos.len()));
+			}
+		}
+		if !left_out.is_empty() {
+			let note = format!(
+				"[{} omitted: the model answering now cannot read them]",
+				left_out.join(" and ")
+			);
+			m.content = if m.content.is_empty() {
+				note
+			} else {
+				format!("{}\n\n{}", m.content, note)
+			};
+		}
+	}
+}
+
 /// A JSON-schema request for a model none of whose lanes guarantees the
 /// schema's shape. A request fault, not a provider fault: every lane was
 /// filtered out before any upstream call.
@@ -296,41 +403,9 @@ impl ProxyEngine {
 		// so `auto` can never smuggle in a model the key's roster bans.
 		ensure_model_allowed(api_key, &req.model)?;
 
-		// Virtual `auto`: pick the real alias from the owner's stored map, then
-		// the [auto] config floor (see proxy::auto for the chain). `req.model`
-		// deliberately stays "auto" — it is what the client sent, and it lands
-		// in `input_model` for observability; `routed_model` feeds routing.
-		let routed_model = if config.is_auto(&req.model) {
-			let owner_map = match api_key.owner.clone() {
-				Some(owner) => {
-					let storage = self.storage.clone();
-					tokio::task::spawn_blocking(move || storage.get_owner_auto_map(&owner)).await??
-				}
-				None => None,
-			};
-			let resolved = super::auto::resolve(purpose.as_deref(), owner_map.as_ref(), &config.auto, |m| {
-				config.models.contains_key(m)
-			})
-			.with_context(|| {
-				format!(
-					"Failed to resolve model 'auto' (purpose '{}'): no usable [auto] mapping",
-					purpose.as_deref().unwrap_or("")
-				)
-			})?;
-			ensure_model_allowed(api_key, &resolved)?;
-			tracing::Span::current().record("model", resolved.as_str());
-			tracing::info!(
-				purpose = purpose.as_deref().unwrap_or(""),
-				resolved = %resolved,
-				"auto model resolved"
-			);
-			resolved
-		} else {
-			req.model.clone()
-		};
-
 		// Owner budget slot — held for the WHOLE request (queue + upstream +
 		// storage), completions and embeddings drain the same budget.
+
 		let _owner_slot = self.acquire_owner_slot(api_key).await?;
 
 		let limiter = self.limiter();
@@ -416,6 +491,60 @@ impl ProxyEngine {
 			}
 		}
 
+		// Virtual `auto`: pick the real alias from the owner's stored map, then
+		// the [auto] config floor (see proxy::auto for the chain). `req.model`
+		// deliberately stays "auto" — it is what the client sent, and it lands
+		// in `input_model` for observability; `routed_model` feeds routing.
+		//
+		// Resolved only now that the conversation is assembled, because `auto` is
+		// OUR choice of model and must be able to serve the request it is given
+		// (prod 2026-10-22: one screenshot made every octomind call on `auto` a
+		// modality 400, which failed the turn). The current turn decides: an entry
+		// that cannot read the images or video the model is being asked about
+		// right now is skipped, as a stale one is. Images further back in history
+		// do not move the pick — one old screenshot must not downgrade a whole
+		// conversation — they are omitted for a model that cannot read them,
+		// exactly what octomind does itself for a known text-only model.
+		let turn_start = current_turn_start(&messages);
+		let routed_model = if config.is_auto(&req.model) {
+			let owner_map = match api_key.owner.clone() {
+				Some(owner) => {
+					let storage = self.storage.clone();
+					tokio::task::spawn_blocking(move || storage.get_owner_auto_map(&owner)).await??
+				}
+				None => None,
+			};
+			let turn = Modalities::of(&messages[turn_start..]);
+			let resolved = super::auto::resolve(purpose.as_deref(), owner_map.as_ref(), &config.auto, |m| {
+				config.models.contains_key(m) && turn.served_by_alias(&config, m)
+			})
+			.with_context(|| {
+				format!(
+					"Failed to resolve model 'auto' (purpose '{}'): no usable [auto] mapping{}",
+					purpose.as_deref().unwrap_or(""),
+					turn.describe()
+				)
+			})?;
+			ensure_model_allowed(api_key, &resolved)?;
+			let earlier = Modalities::of(&messages[..turn_start]);
+			let omitted = earlier.unread_by_alias(&config, &resolved);
+			omit_attachments(&mut messages[..turn_start], omitted);
+			tracing::Span::current().record("model", resolved.as_str());
+			tracing::info!(
+				purpose = purpose.as_deref().unwrap_or(""),
+				resolved = %resolved,
+				turn_images = turn.images,
+				turn_videos = turn.videos,
+				omitted_images = omitted.images,
+				omitted_videos = omitted.videos,
+				"auto model resolved"
+			);
+			resolved
+		} else {
+			req.model.clone()
+		};
+		let needs = Modalities::of(&messages);
+
 		// 4. Resolve provider and model via config. The chain's previous
 		//    provider is preferred (provider-side prompt caches are per
 		//    provider); candidates whose rate windows are exhausted are
@@ -496,10 +625,7 @@ impl ProxyEngine {
 
 				// Modality compatibility: fail fast so the outer loop can skip
 				// this candidate without counting it as a provider fault.
-				let has_videos = messages
-					.iter()
-					.any(|m| m.videos.as_ref().is_some_and(|v| !v.is_empty()));
-				if has_videos && !provider.supports_video(&resolved_model) {
+				if needs.videos && !provider.supports_video(&resolved_model) {
 					return Err(anyhow!(ModalityNotSupportedError {
 						provider: provider_name.clone(),
 						model: resolved_model.clone(),
@@ -507,10 +633,7 @@ impl ProxyEngine {
 					}));
 				}
 
-				let has_images = messages
-					.iter()
-					.any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()));
-				if has_images && !provider.supports_vision(&resolved_model) {
+				if needs.images && !provider.supports_vision(&resolved_model) {
 					return Err(anyhow!(ModalityNotSupportedError {
 						provider: provider_name.clone(),
 						model: resolved_model.clone(),
@@ -1771,6 +1894,141 @@ mod tests {
 
 	fn candidate(provider: &str, model: &str) -> (String, String) {
 		(provider.to_string(), model.to_string())
+	}
+
+	fn with_image(text: &str) -> Message {
+		let mut m = Message::user(text);
+		m.images = parse_image_url("https://example.test/shot.png").map(|i| vec![i]);
+		m
+	}
+
+	#[test]
+	fn modalities_come_from_the_whole_conversation() {
+		assert_eq!(Modalities::of(&[Message::user("hi")]), Modalities::default());
+		// An image anywhere in history counts: providers get the whole history.
+		let got = Modalities::of(&[with_image("look"), Message::user("and now?")]);
+		assert!(got.images && !got.videos);
+	}
+
+	#[test]
+	fn auto_skips_entries_whose_lanes_cannot_read_the_images() {
+		// Prod 2026-10-22: owner map main = glm-5.3 (text-only), floor default =
+		// glm-5.3-flash (multimodal). A turn carrying a screenshot must land on the
+		// floor, not 400 on the owner's text model.
+		let mut config = config_with_provider("zai", ProviderConfig::default());
+		config.models.insert("glm-5.3".into(), vec!["zai:glm-5.3".into()]);
+		config
+			.models
+			.insert("glm-5.3-flash".into(), vec!["zai:glm-5.3-flash".into()]);
+		config.auto.insert("default".into(), "glm-5.3-flash".into());
+		let owner: HashMap<String, String> = [("main".to_string(), "glm-5.3".to_string())].into();
+		let pick = |config: &Config, needs: Modalities| {
+			super::super::auto::resolve(Some("main"), Some(&owner), &config.auto, |m| {
+				config.models.contains_key(m) && needs.served_by_alias(config, m)
+			})
+		};
+		assert_eq!(
+			pick(&config, Modalities::default()).as_deref(),
+			Some("glm-5.3"),
+			"text keeps the owner's pick"
+		);
+		let image = Modalities {
+			images: true,
+			videos: false,
+		};
+		assert_eq!(
+			pick(&config, image).as_deref(),
+			Some("glm-5.3-flash"),
+			"an image skips the text-only model"
+		);
+
+		// Nothing in the chain reads images: unresolvable, never a silent text model.
+		config.auto.insert("default".into(), "glm-5.3".into());
+		assert_eq!(pick(&config, image), None);
+		assert_eq!(image.describe(), " that reads images");
+	}
+
+	#[test]
+	fn the_current_turn_starts_after_the_last_assistant_message() {
+		let mut answer = Message::user("done");
+		answer.role = "assistant".into();
+		assert_eq!(
+			current_turn_start(&[with_image("look")]),
+			0,
+			"no answer yet: all of it is the turn"
+		);
+		let convo = [with_image("look"), answer.clone(), Message::user("and now?")];
+		assert_eq!(current_turn_start(&convo), 2);
+		// The screenshot is history now: it must not move the pick for this turn.
+		assert_eq!(Modalities::of(&convo[2..]), Modalities::default());
+		assert!(Modalities::of(&convo[..2]).images);
+		assert_eq!(
+			current_turn_start(&[with_image("look"), answer]),
+			2,
+			"nothing asked yet"
+		);
+	}
+
+	#[test]
+	fn history_images_are_omitted_for_a_model_that_cannot_read_them() {
+		let mut config = config_with_provider("zai", ProviderConfig::default());
+		config.models.insert("glm-5.3".into(), vec!["zai:glm-5.3".into()]);
+		config
+			.models
+			.insert("glm-5.3-flash".into(), vec!["zai:glm-5.3-flash".into()]);
+		let earlier = Modalities {
+			images: true,
+			videos: false,
+		};
+		assert_eq!(
+			earlier.unread_by_alias(&config, "glm-5.3"),
+			earlier,
+			"a text-only alias reads none of it"
+		);
+		assert_eq!(
+			earlier.unread_by_alias(&config, "glm-5.3-flash"),
+			Modalities::default(),
+			"a vision alias keeps it"
+		);
+
+		let mut history = vec![with_image("see this"), Message::user("plain")];
+		omit_attachments(&mut history, earlier.unread_by_alias(&config, "glm-5.3"));
+		assert!(history[0].images.is_none(), "the image left the request");
+		assert!(
+			history[0].content.starts_with("see this\n\n[1 image(s) omitted"),
+			"and the text says so"
+		);
+		assert_eq!(
+			history[1].content, "plain",
+			"messages without attachments are untouched"
+		);
+		assert_eq!(
+			Modalities::of(&history),
+			Modalities::default(),
+			"nothing left to refuse"
+		);
+
+		// Nothing to omit: nothing changes.
+		let mut kept = vec![with_image("see this")];
+		omit_attachments(&mut kept, Modalities::default());
+		assert!(kept[0].images.is_some() && kept[0].content == "see this");
+	}
+
+	#[test]
+	fn an_alias_serves_a_modality_when_any_lane_does() {
+		let mut config = config_with_provider("zai", ProviderConfig::default());
+		config
+			.models
+			.insert("mixed".into(), vec!["zai:glm-5.3".into(), "zai:glm-5.3-flash".into()]);
+		config.models.insert("text".into(), vec!["zai:glm-5.3".into()]);
+		let image = Modalities {
+			images: true,
+			videos: false,
+		};
+		assert!(image.served_by_alias(&config, "mixed"));
+		assert!(!image.served_by_alias(&config, "text"));
+		assert!(Modalities::default().served_by_alias(&config, "text"));
+		assert!(!image.served_by_alias(&config, "missing"));
 	}
 
 	/// pick_admitted with a fresh (all-healthy) health tracker.
