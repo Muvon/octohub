@@ -1,3 +1,4 @@
+pub mod credentials;
 pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
@@ -179,6 +180,15 @@ pub enum TimeBucket {
 
 /// Storage trait for completion persistence
 pub trait Storage: Send + Sync {
+	fn has_credentials(&self) -> Result<bool>;
+	fn owner_credentials(&self, owner: &str) -> Result<Vec<credentials::Credential>>;
+	/// Apply a change under a database transaction, including ordering and telemetry.
+	/// Call through `auth::Credentials::update`, which invalidates the routing cache.
+	fn update_credentials(
+		&self,
+		owner: &str,
+		change: credentials::CredentialChange,
+	) -> Result<Vec<credentials::Credential>>;
 	// API key management
 	/// Create a new API key. `allowed_models` is persisted as-is: `None`
 	/// means unrestricted, `Some(list)` restricts to that exact set.

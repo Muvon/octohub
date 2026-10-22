@@ -416,6 +416,10 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
 		};
 	}
 
+	if let Some(byok) = error.downcast_ref::<crate::proxy::engine::ByokFailure>() {
+		return (byok.status, byok.to_string());
+	}
+
 	if let Some(timeout) = error.downcast_ref::<ProxyTimeoutError>() {
 		let status = match timeout {
 			ProxyTimeoutError::ProviderQueue { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -1097,7 +1101,13 @@ mod tests {
 		let config = Arc::new(RwLock::new(Arc::new(config)));
 		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
 		(
-			Arc::new(ProxyEngine::new(storage, config.clone(), limiter, 1_720_000_000)),
+			Arc::new(ProxyEngine::new(
+				storage.clone(),
+				config.clone(),
+				limiter,
+				1_720_000_000,
+				Arc::new(crate::auth::Credentials::new(storage, None).unwrap()),
+			)),
 			config,
 		)
 	}
@@ -1409,6 +1419,7 @@ mod tests {
 				finish_reason: "stop".to_string(),
 			}],
 			usage: ChatUsage {
+				byok: None,
 				prompt_tokens: 3,
 				completion_tokens: 7,
 				total_tokens: 10,
@@ -1491,6 +1502,7 @@ mod tests {
 						finish_reason: "tool_calls".to_string(),
 					}],
 					usage: ChatUsage {
+						byok: None,
 						prompt_tokens: 3,
 						completion_tokens: 7,
 						total_tokens: 10,

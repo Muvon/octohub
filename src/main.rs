@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
 	// Initialize storage from DSN
 	let storage: Arc<dyn Storage> = storage::from_url(&cfg.server.db_url)?;
+	let credentials = Arc::new(auth::Credentials::from_env(storage.clone())?);
 
 	// Live handles swapped on SIGHUP; requests read a fresh snapshot each time.
 	let config_live: Live<Config> = Arc::new(RwLock::new(cfg.clone()));
@@ -152,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
 		config_live,
 		limiter_live,
 		config_loaded_at,
+		credentials,
 	));
 
 	let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
@@ -262,6 +264,8 @@ fn classify_route(path: &str) -> &'static str {
 	} else if path.starts_with("/v1/media/") {
 		// Collapsed so a per-record label cannot explode metric cardinality.
 		"/v1/media/{id}"
+	} else if path.starts_with("/v1/admin/owners/") {
+		"/v1/admin/owners/{owner}"
 	} else if path.starts_with("/v1/admin/keys") {
 		"/v1/admin/keys"
 	} else if path == "/v1/admin/usage" {
@@ -346,7 +350,7 @@ async fn route(
 	let response = async {
 		// Admin endpoints: /v1/admin/* (master key auth)
 		if path.starts_with("/v1/admin/") {
-			return route_admin(req, method, &path, storage, &master_key).await;
+			return route_admin(req, method, &path, storage, &master_key, engine.credentials.clone()).await;
 		}
 
 		// Client endpoints (api_keys table auth)
@@ -409,6 +413,7 @@ async fn route_admin(
 	path: &str,
 	storage: Arc<dyn Storage>,
 	master_key: &str,
+	credentials: Arc<auth::Credentials>,
 ) -> Response<BoxBody> {
 	// Parse /v1/admin/keys/:id and /v1/admin/keys/:id/revoke
 	let segments: Vec<&str> = path
@@ -458,6 +463,12 @@ async fn route_admin(
 		}
 		(Method::PUT, ["owners", owner, "auto"]) => {
 			api::admin::handle_set_owner_auto(req, storage, master_key, owner).await
+		}
+		(Method::GET | Method::PUT | Method::DELETE, ["owners", owner, "credentials"]) => {
+			api::admin::handle_credentials(req, storage, credentials, master_key, owner, None).await
+		}
+		(Method::PUT | Method::DELETE, ["owners", owner, "credentials", provider]) => {
+			api::admin::handle_credentials(req, storage, credentials, master_key, owner, Some(provider)).await
 		}
 		// GET /v1/admin/status — per-model health observed from real traffic
 		(Method::GET, ["status"]) => api::admin::handle_status(req, master_key).await,

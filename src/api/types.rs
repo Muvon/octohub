@@ -315,6 +315,8 @@ pub enum ContentPart {
 /// Token usage information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub byok: Option<bool>,
 	pub input_tokens: u64,
 	pub output_tokens: u64,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -610,6 +612,8 @@ pub struct ChatResponseMessage {
 /// Token usage in the classic response.
 #[derive(Debug, Serialize)]
 pub struct ChatUsage {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub byok: Option<bool>,
 	pub prompt_tokens: u64,
 	pub completion_tokens: u64,
 	pub total_tokens: u64,
@@ -810,6 +814,7 @@ impl From<CreateCompletionResponse> for ChatCompletionResponse {
 				finish_reason: resp.finish_reason.unwrap_or_else(|| "stop".to_string()),
 			}],
 			usage: ChatUsage {
+				byok: resp.usage.byok,
 				prompt_tokens: resp.usage.input_tokens,
 				completion_tokens: resp.usage.output_tokens,
 				total_tokens: resp.usage.total_tokens,
@@ -1035,6 +1040,7 @@ mod tests {
 				}],
 			}],
 			usage: Usage {
+				byok: None,
 				input_tokens: 10,
 				output_tokens: 5,
 				cache_read_tokens: None,
@@ -1078,6 +1084,7 @@ mod tests {
 				arguments: r#"{"location":"NYC"}"#.to_string(),
 			}],
 			usage: Usage {
+				byok: None,
 				input_tokens: 20,
 				output_tokens: 10,
 				cache_read_tokens: None,
@@ -1116,6 +1123,7 @@ mod tests {
 				}],
 			}],
 			usage: Usage {
+				byok: None,
 				input_tokens: 10,
 				output_tokens: 5,
 				cache_read_tokens: None,

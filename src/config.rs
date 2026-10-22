@@ -466,22 +466,26 @@ impl Config {
 	/// letting the caller fall through to the next candidate when one is
 	/// rate-limited. A direct "provider:model" input yields one candidate.
 	pub fn model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
-		self.candidates_from_map(model, &self.models, "model")
+		self.candidates_from_map(model, &self.models, "model", true)
+	}
+
+	pub fn ordered_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
+		self.candidates_from_map(model, &self.models, "model", false)
 	}
 
 	/// Embedding counterpart of [`model_candidates`](Self::model_candidates).
 	pub fn embedding_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
-		self.candidates_from_map(model, &self.embedding_models, "embedding model")
+		self.candidates_from_map(model, &self.embedding_models, "embedding model", true)
 	}
 
 	/// Media counterpart of [`model_candidates`](Self::model_candidates).
 	pub fn media_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
-		self.candidates_from_map(model, &self.media_models, "media model")
+		self.candidates_from_map(model, &self.media_models, "media model", true)
 	}
 
 	/// Evaluation counterpart of [`model_candidates`](Self::model_candidates).
 	pub fn evaluation_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
-		self.candidates_from_map(model, &self.evaluation_models, "evaluation model")
+		self.candidates_from_map(model, &self.evaluation_models, "evaluation model", true)
 	}
 
 	/// Same boot-time checks as [`validate_media`](Self::validate_media) for
@@ -617,6 +621,7 @@ impl Config {
 		model: &str,
 		map: &HashMap<String, Vec<String>>,
 		kind: &str,
+		rotate: bool,
 	) -> Result<Vec<(String, String)>> {
 		fn split(entry: &str, kind: &str) -> Result<(String, String)> {
 			let pos = entry
@@ -642,11 +647,15 @@ impl Config {
 			anyhow::bail!("{} '{}' has an empty provider list in config", kind, model);
 		}
 
-		let start = (std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.unwrap_or_default()
-			.as_nanos() as usize)
-			% providers.len();
+		let start = if rotate {
+			(std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap_or_default()
+				.as_nanos() as usize)
+				% providers.len()
+		} else {
+			0
+		};
 
 		(0..providers.len())
 			.map(|i| split(&providers[(start + i) % providers.len()], kind))

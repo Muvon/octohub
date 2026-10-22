@@ -1,3 +1,4 @@
+use super::credentials::{apply_change, decode_error, Credential, CredentialChange};
 use super::{
 	decode_auto_map, encode_allowed_models, encode_auto_map, encode_json_column, generate_api_key, make_key_hint,
 	now_unix, ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia,
@@ -113,6 +114,20 @@ impl PostgresStorage {
             CREATE INDEX IF NOT EXISTS idx_media_api_key ON media(api_key_id);
             CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at);
             CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
+
+            CREATE TABLE IF NOT EXISTS owner_credentials (
+                owner TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                secret TEXT NOT NULL,
+                key_hint TEXT NOT NULL,
+                position BIGINT NOT NULL,
+                created_at BIGINT NOT NULL,
+                last_used_at BIGINT,
+                last_error_at BIGINT,
+                last_error_status BIGINT,
+                last_error_message TEXT,
+                PRIMARY KEY (owner, provider)
+            );
 
             CREATE TABLE IF NOT EXISTS owner_auto_models (
                 owner TEXT PRIMARY KEY,
@@ -275,7 +290,71 @@ fn effective_limit(limit: u32) -> i64 {
 	}
 }
 
+fn read_credentials(client: &mut impl postgres::GenericClient, owner: &str) -> Result<Vec<Credential>> {
+	client
+		.query(
+			"SELECT provider, secret, key_hint, position, created_at, last_used_at,
+         last_error_at, last_error_status, last_error_message
+         FROM owner_credentials WHERE owner = $1 ORDER BY position",
+			&[&owner],
+		)?
+		.into_iter()
+		.map(|row| {
+			Ok(Credential {
+				provider: row.try_get(0)?,
+				secret: row.try_get(1)?,
+				key_hint: row.try_get(2)?,
+				position: row.try_get(3)?,
+				created_at: row.try_get(4)?,
+				last_used_at: row.try_get(5)?,
+				last_error: decode_error(row.try_get(6)?, row.try_get(7)?, row.try_get(8)?)?,
+			})
+		})
+		.collect()
+}
+
 impl Storage for PostgresStorage {
+	fn has_credentials(&self) -> Result<bool> {
+		Ok(self
+			.pool
+			.get()?
+			.query_one("SELECT EXISTS(SELECT 1 FROM owner_credentials)", &[])?
+			.try_get(0)?)
+	}
+	fn owner_credentials(&self, owner: &str) -> Result<Vec<Credential>> {
+		read_credentials(&mut *self.pool.get()?, owner)
+	}
+	fn update_credentials(&self, owner: &str, change: CredentialChange) -> Result<Vec<Credential>> {
+		let mut client = self.pool.get()?;
+		let mut tx = client.transaction()?;
+		// Serialize insertion as well as updates, including owners without any rows yet.
+		tx.batch_execute("LOCK TABLE owner_credentials IN SHARE ROW EXCLUSIVE MODE")?;
+		let mut rows = read_credentials(&mut tx, owner)?;
+		apply_change(&mut rows, change)?;
+		tx.execute("DELETE FROM owner_credentials WHERE owner = $1", &[&owner])?;
+		for row in &rows {
+			tx.execute(
+				"INSERT INTO owner_credentials (owner, provider, secret, key_hint, position, created_at,
+                 last_used_at, last_error_at, last_error_status, last_error_message)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+				&[
+					&owner,
+					&row.provider,
+					&row.secret,
+					&row.key_hint,
+					&row.position,
+					&row.created_at,
+					&row.last_used_at,
+					&row.last_error.as_ref().map(|e| e.at),
+					&row.last_error.as_ref().map(|e| i64::from(e.status)),
+					&row.last_error.as_ref().map(|e| &e.message),
+				],
+			)?;
+		}
+		tx.commit()?;
+		Ok(rows)
+	}
+
 	fn create_api_key(
 		&self,
 		name: &str,

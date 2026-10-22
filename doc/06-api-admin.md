@@ -30,7 +30,7 @@ labels these produce in metrics.
 
 ## Conventions
 
-- All list endpoints return `{"data": [...]}`.
+- Record list endpoints return `{"data": [...]}`; owner credential lists use `{"owner":"…","credentials":[…]}`.
 - All timestamps in responses are **Unix seconds (u64)**, not ISO-8601.
 - All `id` fields are **i64** database row IDs.
 - Errors: `{"error":{"message":"…","type":"invalid_request_error"}}` —
@@ -335,3 +335,87 @@ status, so there is no separate queue to inspect.
 could price contributes nothing rather than zero — see
 [11 — Media](./11-media.md#cost) for what makes a request unpriced, and the
 `octohub_media_cost_unknown_total` metric for how often it happens.
+
+## Owner provider credentials (BYOK)
+
+These routes use the master-key authentication above. Credentials belong to the
+owner string on client API keys; all keys sharing that owner use the same
+credentials. OctoHub does not enforce subscription plans: the control plane must
+restrict writes to paid accounts and clear credentials on downgrade.
+
+Set `OCTOHUB_CREDENTIALS_KEY` before using these routes (see
+[configuration](./03-configuration.md#owner-credential-encryption)). When disabled,
+all credential routes return **503** with `error.type = "credentials_disabled"`
+after authentication. Invalid admin authentication returns **401**.
+
+| Method | Path | Request | Success |
+|---|---|---|---|
+| `GET` | `/v1/admin/owners/:owner/credentials` | — | `200 {"owner":"…","credentials":[…]}` ordered by position |
+| `PUT` | `/v1/admin/owners/:owner/credentials/:provider` | `{"key":"…"}` | `200` credential object below |
+| `DELETE` | `/v1/admin/owners/:owner/credentials/:provider` | — | `200 {"owner":"…","status":"updated"}`; absent credential: `404` |
+| `PUT` | `/v1/admin/owners/:owner/credentials` | `{"order":["zai","ollama"]}` | `200 {"owner":"…","status":"updated"}` |
+| `DELETE` | `/v1/admin/owners/:owner/credentials` | — | `200 {"owner":"…","status":"updated"}`; idempotent |
+
+Credential object (timestamps are Unix seconds):
+
+```json
+{
+  "provider": "zai",
+  "key_hint": "...xY9z",
+  "position": 0,
+  "created_at": 1792600000,
+  "last_used_at": null,
+  "last_error": null
+}
+```
+
+On failure, `last_error` is `{"at":1792600010,"status":401,"message":"…"}`.
+The message is redacted and limited to 300 characters. No credential response
+contains the secret or ciphertext. Keys of four or fewer characters use `...`
+without a suffix to avoid disclosing the entire key. A new provider is appended; replacement
+preserves its position and creation time and clears `last_error`. Successful
+calls update `last_used_at`; previous errors remain until replacement or another
+failure. Deletion repacks positions to `0..n-1`. A call finishing after replacement
+or deletion cannot update the replacement or recreate the deleted credential.
+
+Supported provider IDs: `openai`, `anthropic`, `google-studio`, `openrouter`,
+`ollama`, `together`, `deepseek`, `zai`, `moonshot`, `alibaba`, `cerebras`.
+Unsupported provider PUT paths return **400** with `error.type = "unsupported_provider"`.
+An empty/whitespace-only key, malformed JSON, or an order that is not an exact
+permutation of the current provider set returns **400** with
+`error.type = "invalid_request_error"`. Other storage failures return **500**
+in the same error envelope. PUT bodies reject unknown fields.
+
+### Routing and usage
+
+BYOK applies to chat requests on `/v1/completions` and `/v1/chat/completions`,
+including buffered chat SSE. Virtual `auto` is resolved first. Existing
+requested-model and resolved-alias allowlists still apply. A direct
+`provider:model` reference is a single lane and goes through the same BYOK
+filter: a matching owner credential is used instead of the platform key.
+Embeddings, media, and evaluations continue using platform credentials.
+
+When a resolved model has no lane covered by the owner's credentials, platform
+routing is unchanged. Otherwise, only covered lanes are used, sorted by credential
+position; ties preserve TOML order. Random rotation, replay provider affinity,
+platform rate windows and platform provider cooldowns do not reorder or consume
+these owner-key requests. Owner and provider concurrency limits still apply.
+
+A 401, 403, 429, 5xx, upstream timeout, or transport failure tries the next BYOK
+lane, regardless of `server.failover_on_error`. Each lane gets one upstream
+attempt. Failover happens before a response reaches the client. Exhaustion never
+tries a platform lane: the response preserves the last upstream status and says
+`Your <Label> key failed: <upstream message>`. Transport errors use 502; upstream
+timeouts use 504. A local provider queue timeout remains 503. Other upstream 4xx
+errors stop the request. Credential decryption failures fail the request without
+calling any lane.
+
+Successful BYOK calls always store `"byok":true` in the completion row's `usage`.
+The response marker appears only where usage is emitted; the field is absent for
+platform calls. Classic chat SSE includes it in the usage chunk when
+`stream_options.include_usage` is enabled. Without that option, the stream has
+no usage or BYOK marker, and no additional event is emitted; the stored row still
+carries `usage.byok`. Provider token cost remains in stored/Responses-style
+`usage.cost`; classic chat retains its
+existing token-usage fields plus `byok`. Billing the BYOK request fee belongs to
+the control plane, not OctoHub.

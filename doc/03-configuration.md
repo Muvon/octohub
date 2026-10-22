@@ -234,6 +234,7 @@ loaded (`src/config.rs:190`).
 
 | Variable | Overrides | Notes |
 |---|---|---|
+| `OCTOHUB_CREDENTIALS_KEY` | Startup only; no TOML field | Base64 of 32 bytes for owner credential encryption; see below. |
 | `OCTOHUB_MASTER_KEY` | `[server].api_key` | Master admin key. |
 | `OCTOHUB_DB_URL` | `[server].db_url` | Useful in containerized deployments. |
 | `OCTOHUB_PROVIDER_QUEUE_TIMEOUT_SECS` | `[server].provider_queue_timeout_secs` | Overrides the provider queue deadline. |
@@ -353,3 +354,33 @@ Applied by exporting the adapter's own base-URL environment variable at startup
 `ELEVENLABS_API_URL`, `RUNWAY_API_URL`). Because those are process-global, there
 is exactly **one custom endpoint per adapter** per deployment. An
 already-set environment variable wins over the config.
+
+### Owner credential encryption
+
+`OCTOHUB_CREDENTIALS_KEY` is standard base64 encoding of exactly 32 random bytes.
+It is an environment-only startup setting, not a TOML field or a SIGHUP-reloaded
+value. Generate it once, for example with `openssl rand -base64 32`, and keep it
+in the deployment's secret store. All processes sharing the credential database
+must use the same key. Retain it with database backups; changing it does not
+reencrypt existing credentials.
+
+- Unset with no credential rows: startup succeeds, BYOK is disabled, credential
+  admin routes return 503 `credentials_disabled`, and platform routing continues.
+- Unset while any credential rows exist: startup fails with an error naming
+  `OCTOHUB_CREDENTIALS_KEY`.
+- Invalid base64 or a decoded length other than 32 bytes: startup fails, even if
+  the credential table is empty.
+- A valid but incorrect encryption key cannot decrypt existing credentials;
+  affected completion requests fail rather than using platform credentials.
+
+SQLite, MySQL, and PostgreSQL initialize `owner_credentials` automatically on
+startup. Each `(owner, provider)` row stores AES-256-GCM ciphertext as
+`base64(nonce || ciphertext-and-tag)` with a fresh random 96-bit nonce. The owner
+and provider are authenticated as associated data, preventing ciphertext from
+being moved to another owner/provider. Only hints and operational metadata are
+returned by the [credential admin API](./06-api-admin.md#owner-provider-credentials-byok).
+Each process caches an owner's decrypted credentials, including an empty set, for
+up to 60 seconds. Credential admin edits on the same process take effect on the next
+request; edits made by another process sharing the database can take up to 60 seconds.
+Usage telemetry (`last_used_at`, `last_error`) does not affect routing and does not
+invalidate the cache. Decryption failures are not cached.

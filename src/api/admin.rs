@@ -31,7 +31,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
 }
 
 /// Verify admin auth from request headers against master key
-fn check_admin(req: &Request<hyper::body::Incoming>, master_key: &str) -> Result<(), Box<Response<BoxBody>>> {
+fn check_admin<B>(req: &Request<B>, master_key: &str) -> Result<(), Box<Response<BoxBody>>> {
 	let header = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
 
 	if authenticate_admin(header, master_key) {
@@ -647,5 +647,323 @@ fn build_filter(params: &std::collections::HashMap<String, String>) -> ListFilte
 		offset: params.get("offset").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0),
 		since: params.get("since").and_then(|s| s.parse::<u64>().ok()),
 		until: params.get("until").and_then(|s| s.parse::<u64>().ok()),
+	}
+}
+
+pub async fn handle_credentials<B>(
+	req: Request<B>,
+	storage: Arc<dyn Storage>,
+	credentials: Arc<crate::auth::Credentials>,
+	master_key: &str,
+	owner: &str,
+	provider: Option<&str>,
+) -> Response<BoxBody>
+where
+	B: hyper::body::Body<Data = Bytes> + Send,
+{
+	use crate::storage::credentials::{CredentialChange, CredentialInputError};
+	use hyper::Method;
+	if let Err(response) = check_admin(&req, master_key) {
+		return *response;
+	}
+	if !credentials.enabled() {
+		return json_response(
+			StatusCode::SERVICE_UNAVAILABLE,
+			serde_json::json!({"error": {
+				"type": "credentials_disabled", "message": "Owner credentials are disabled: configure OCTOHUB_CREDENTIALS_KEY"
+			}}),
+		);
+	}
+	if req.method() == Method::PUT && provider.is_some_and(|p| crate::auth::byok_provider_label(p).is_none()) {
+		return json_response(
+			StatusCode::BAD_REQUEST,
+			serde_json::json!({"error": {
+				"type": "unsupported_provider", "message": "Unsupported BYOK provider"
+			}}),
+		);
+	}
+	let method = req.method().clone();
+	let change = match (&method, provider) {
+		(&Method::GET, None) => None,
+		(&Method::DELETE, None) => Some(CredentialChange::Clear),
+		(&Method::DELETE, Some(provider)) => Some(CredentialChange::Delete(provider.to_owned())),
+		(&Method::PUT, provider) => {
+			let bytes = match req.collect().await {
+				Ok(body) => body.to_bytes(),
+				Err(_) => return error_response(StatusCode::BAD_REQUEST, "Failed to read credential request body"),
+			};
+			match provider {
+				Some(provider) => {
+					#[derive(serde::Deserialize)]
+					#[serde(deny_unknown_fields)]
+					struct Put {
+						key: String,
+					}
+					let input: Put = match serde_json::from_slice(&bytes) {
+						Ok(input) => input,
+						Err(_) => {
+							return error_response(StatusCode::BAD_REQUEST, "Expected JSON object with a key string")
+						}
+					};
+					if input.key.trim().is_empty() {
+						return error_response(StatusCode::BAD_REQUEST, "Key must not be empty");
+					}
+					match credentials.put(owner, provider, &input.key) {
+						Ok(change) => Some(change),
+						Err(_) => {
+							return error_response(
+								StatusCode::INTERNAL_SERVER_ERROR,
+								"Failed to encrypt owner credential",
+							)
+						}
+					}
+				}
+				None => {
+					#[derive(serde::Deserialize)]
+					#[serde(deny_unknown_fields)]
+					struct Order {
+						order: Vec<String>,
+					}
+					match serde_json::from_slice::<Order>(&bytes) {
+						Ok(input) => Some(CredentialChange::Order(input.order)),
+						Err(_) => {
+							return error_response(StatusCode::BAD_REQUEST, "Expected JSON object with an order array")
+						}
+					}
+				}
+			}
+		}
+		_ => return error_response(StatusCode::NOT_FOUND, "Not found"),
+	};
+	let owner = owner.to_owned();
+	let owner_db = owner.clone();
+	let result = tokio::task::spawn_blocking(move || match change {
+		Some(change) => credentials.update(&owner_db, change),
+		None => storage.owner_credentials(&owner_db),
+	})
+	.await;
+	match result {
+		Ok(Ok(rows)) => {
+			if method == Method::PUT {
+				if let Some(provider) = provider {
+					let row = rows
+						.iter()
+						.find(|row| row.provider == provider)
+						.expect("upsert returns inserted provider");
+					return json_response(StatusCode::OK, serde_json::json!(row));
+				}
+			}
+			if method == Method::GET {
+				json_response(StatusCode::OK, serde_json::json!({"owner": owner, "credentials": rows}))
+			} else {
+				json_response(StatusCode::OK, serde_json::json!({"owner": owner, "status": "updated"}))
+			}
+		}
+		Ok(Err(error)) => {
+			if let Some(input) = error.downcast_ref::<CredentialInputError>() {
+				let status = match input {
+					CredentialInputError::NotFound => StatusCode::NOT_FOUND,
+					CredentialInputError::InvalidOrder => StatusCode::BAD_REQUEST,
+				};
+				return error_response(status, &input.to_string());
+			}
+			// Database driver errors may contain bound values; never log credential operations verbatim.
+			tracing::error!("Owner credential storage operation failed");
+			error_response(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"Owner credential storage operation failed",
+			)
+		}
+		Err(_) => error_response(
+			StatusCode::INTERNAL_SERVER_ERROR,
+			"Owner credential storage task failed",
+		),
+	}
+}
+
+#[cfg(test)]
+mod credential_tests {
+	use super::*;
+	use crate::auth::Credentials;
+	use crate::storage::sqlite::SqliteStorage;
+	use base64::Engine;
+
+	async fn call(
+		storage: Arc<dyn Storage>,
+		credentials: Arc<Credentials>,
+		method: &str,
+		provider: Option<&str>,
+		body: &str,
+		auth: &str,
+	) -> (StatusCode, serde_json::Value) {
+		let req = Request::builder()
+			.method(method)
+			.header("Authorization", auth)
+			.body(Full::new(Bytes::copy_from_slice(body.as_bytes())))
+			.unwrap();
+		let response = handle_credentials(req, storage, credentials, "master", "account", provider).await;
+		let status = response.status();
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		(status, serde_json::from_slice(&body).unwrap())
+	}
+
+	#[tokio::test]
+	async fn credential_admin_contract() {
+		let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		let disabled = Arc::new(Credentials::new(storage.clone(), None).unwrap());
+		let (status, _) = call(storage.clone(), disabled.clone(), "GET", None, "", "Bearer wrong").await;
+		assert_eq!(status, StatusCode::UNAUTHORIZED);
+		for (method, provider) in [
+			("GET", None),
+			("PUT", None),
+			("DELETE", None),
+			("PUT", Some("zai")),
+			("DELETE", Some("zai")),
+		] {
+			let (status, body) = call(
+				storage.clone(),
+				disabled.clone(),
+				method,
+				provider,
+				"{}",
+				"Bearer master",
+			)
+			.await;
+			assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+			assert_eq!(body["error"]["type"], "credentials_disabled");
+		}
+		let key = base64::engine::general_purpose::STANDARD.encode([3; 32]);
+		let credentials = Arc::new(Credentials::new(storage.clone(), Some(&key)).unwrap());
+		let (status, body) = call(storage.clone(), credentials.clone(), "GET", None, "", "Bearer master").await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body, serde_json::json!({"owner": "account", "credentials": []}));
+		let (status, body) = call(
+			storage.clone(),
+			credentials.clone(),
+			"PUT",
+			Some("cloudflare"),
+			r#"{"key":"private"}"#,
+			"Bearer master",
+		)
+		.await;
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert_eq!(body["error"]["type"], "unsupported_provider");
+		let (status, _) = call(
+			storage.clone(),
+			credentials.clone(),
+			"DELETE",
+			Some("cloudflare"),
+			"",
+			"Bearer master",
+		)
+		.await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+		for body in [
+			r#"{"key":""}"#,
+			r#"{"key":"  "}"#,
+			r#"{"key":42}"#,
+			r#"{"key":"private","private":"extra"}"#,
+			"not-json-private",
+		] {
+			let (status, body) = call(
+				storage.clone(),
+				credentials.clone(),
+				"PUT",
+				Some("zai"),
+				body,
+				"Bearer master",
+			)
+			.await;
+			assert_eq!(status, StatusCode::BAD_REQUEST);
+			assert!(!body.to_string().contains("private"));
+		}
+		for (position, provider) in ["zai", "ollama"].into_iter().enumerate() {
+			let (status, body) = call(
+				storage.clone(),
+				credentials.clone(),
+				"PUT",
+				Some(provider),
+				r#"{"key":"owner-private-secret-1234"}"#,
+				"Bearer master",
+			)
+			.await;
+			assert_eq!(status, StatusCode::OK);
+			assert_eq!(body["provider"], provider);
+			assert_eq!(body["position"], position);
+			assert_eq!(body["key_hint"], "...1234");
+			assert!(body["last_error"].is_null());
+			assert!(body["last_used_at"].is_null());
+			assert!(body["created_at"].is_i64());
+			assert!(body.get("secret").is_none());
+			assert!(!body.to_string().contains("owner-private"));
+		}
+		for body in [
+			r#"{"order":["zai"]}"#,
+			r#"{"order":["zai","zai"]}"#,
+			r#"{"order":["zai","openai"]}"#,
+		] {
+			let (status, _) = call(storage.clone(), credentials.clone(), "PUT", None, body, "Bearer master").await;
+			assert_eq!(status, StatusCode::BAD_REQUEST);
+		}
+		let (status, _) = call(
+			storage.clone(),
+			credentials.clone(),
+			"PUT",
+			None,
+			r#"{"order":["ollama","zai"]}"#,
+			"Bearer master",
+		)
+		.await;
+		assert_eq!(status, StatusCode::OK);
+		let (status, body) = call(
+			storage.clone(),
+			credentials.clone(),
+			"PUT",
+			Some("zai"),
+			r#"{"key":"replacement-private-5678"}"#,
+			"Bearer master",
+		)
+		.await;
+		assert_eq!(status, StatusCode::OK);
+		assert_eq!(body["position"], 1);
+		assert_eq!(body["key_hint"], "...5678");
+		let (_, body) = call(storage.clone(), credentials.clone(), "GET", None, "", "Bearer master").await;
+		assert_eq!(body["credentials"][0]["provider"], "ollama");
+		let (status, _) = call(
+			storage.clone(),
+			credentials.clone(),
+			"DELETE",
+			Some("ollama"),
+			"",
+			"Bearer master",
+		)
+		.await;
+		assert_eq!(status, StatusCode::OK);
+		let (status, _) = call(
+			storage.clone(),
+			credentials.clone(),
+			"DELETE",
+			Some("ollama"),
+			"",
+			"Bearer master",
+		)
+		.await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
+		let (_, body) = call(storage.clone(), credentials.clone(), "GET", None, "", "Bearer master").await;
+		assert_eq!(body["credentials"][0]["position"], 0);
+		for _ in 0..2 {
+			let (status, body) = call(
+				storage.clone(),
+				credentials.clone(),
+				"DELETE",
+				None,
+				"",
+				"Bearer master",
+			)
+			.await;
+			assert_eq!(status, StatusCode::OK);
+			assert_eq!(body, serde_json::json!({"owner": "account", "status": "updated"}));
+		}
+		assert!(!storage.has_credentials().unwrap());
 	}
 }

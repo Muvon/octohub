@@ -1,3 +1,4 @@
+use super::credentials::{apply_change, decode_error, Credential, CredentialChange};
 use super::{
 	decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models, encode_auto_map,
 	encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
@@ -106,6 +107,20 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_media_api_key ON media(api_key_id);
             CREATE INDEX IF NOT EXISTS idx_media_created ON media(created_at);
             CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
+
+            CREATE TABLE IF NOT EXISTS owner_credentials (
+                owner TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                secret TEXT NOT NULL,
+                key_hint TEXT NOT NULL,
+                position BIGINT NOT NULL,
+                created_at BIGINT NOT NULL,
+                last_used_at BIGINT,
+                last_error_at BIGINT,
+                last_error_status BIGINT,
+                last_error_message TEXT,
+                PRIMARY KEY (owner, provider)
+            );
 
             CREATE TABLE IF NOT EXISTS owner_auto_models (
                 owner TEXT PRIMARY KEY,
@@ -228,7 +243,63 @@ fn build_time_and_key_filter(
 	(clause, params)
 }
 
+fn read_credentials(conn: &Connection, owner: &str) -> Result<Vec<Credential>> {
+	let mut stmt = conn.prepare("SELECT provider, secret, key_hint, position, created_at, last_used_at,
+                last_error_at, last_error_status, last_error_message FROM owner_credentials WHERE owner = ?1 ORDER BY position")?;
+	let mut cursor = stmt.query([owner])?;
+	let mut rows = Vec::new();
+	while let Some(row) = cursor.next()? {
+		rows.push(Credential {
+			provider: row.get(0)?,
+			secret: row.get(1)?,
+			key_hint: row.get(2)?,
+			position: row.get(3)?,
+			created_at: row.get(4)?,
+			last_used_at: row.get(5)?,
+			last_error: decode_error(row.get(6)?, row.get(7)?, row.get(8)?)?,
+		});
+	}
+	Ok(rows)
+}
+
 impl Storage for SqliteStorage {
+	fn has_credentials(&self) -> Result<bool> {
+		let conn = lock_conn(&self.conn)?;
+		Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM owner_credentials)", [], |r| r.get(0))?)
+	}
+	fn owner_credentials(&self, owner: &str) -> Result<Vec<Credential>> {
+		let conn = lock_conn(&self.conn)?;
+		read_credentials(&conn, owner)
+	}
+	fn update_credentials(&self, owner: &str, change: CredentialChange) -> Result<Vec<Credential>> {
+		let mut conn = lock_conn(&self.conn)?;
+		let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+		let mut rows = read_credentials(&tx, owner)?;
+		apply_change(&mut rows, change)?;
+		tx.execute("DELETE FROM owner_credentials WHERE owner = ?1", [owner])?;
+		for row in &rows {
+			tx.execute(
+				"INSERT INTO owner_credentials (owner, provider, secret, key_hint, position, created_at,
+                 last_used_at, last_error_at, last_error_status, last_error_message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+				rusqlite::params![
+					owner,
+					row.provider,
+					row.secret,
+					row.key_hint,
+					row.position,
+					row.created_at,
+					row.last_used_at,
+					row.last_error.as_ref().map(|e| e.at),
+					row.last_error.as_ref().map(|e| i64::from(e.status)),
+					row.last_error.as_ref().map(|e| &e.message),
+				],
+			)?;
+		}
+		tx.commit()?;
+		Ok(rows)
+	}
+
 	fn create_api_key(
 		&self,
 		name: &str,
@@ -1351,5 +1422,193 @@ mod tests {
 		assert_eq!(usage[0].completions_count, 2);
 		assert_eq!(usage[0].total_input_tokens, 20); // 10 * 2
 		assert_eq!(usage[0].total_output_tokens, 10); // 5 * 2
+	}
+}
+
+#[cfg(test)]
+mod credential_tests {
+	use super::*;
+	use crate::auth::Credentials;
+	use crate::storage::credentials::{CredentialError, CredentialInputError};
+	use base64::Engine;
+	use std::sync::Arc;
+
+	#[test]
+	fn credentials_encrypt_roundtrip_order_replace_delete_and_fail_closed() {
+		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		assert!(!storage.has_credentials().unwrap());
+		assert!(!Credentials::new(storage.clone(), None).unwrap().enabled());
+		for invalid in ["not base64", "c2hvcnQ="] {
+			assert!(Credentials::new(storage.clone(), Some(invalid)).is_err());
+		}
+		let encryption_key = base64::engine::general_purpose::STANDARD.encode([7; 32]);
+		let credentials = Credentials::new(storage.clone(), Some(&encryption_key)).unwrap();
+		let secret = "owner-private-key-xY9z";
+		for provider in ["zai", "ollama", "openai"] {
+			storage
+				.update_credentials("a", credentials.put("a", provider, secret).unwrap())
+				.unwrap();
+		}
+		assert!(storage.has_credentials().unwrap());
+		assert!(Credentials::new(storage.clone(), None).is_err());
+		let loaded = credentials.load("a").unwrap();
+		assert_eq!(loaded[0].key, secret);
+		assert_eq!(loaded[0].record.key_hint, "...xY9z");
+		assert!(credentials.load("b").unwrap().is_empty());
+		let encrypted: String = storage
+			.conn
+			.lock()
+			.unwrap()
+			.query_row(
+				"SELECT secret FROM owner_credentials WHERE owner = 'a' AND provider = 'zai'",
+				[],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert!(!encrypted.contains(secret));
+		let bytes = base64::engine::general_purpose::STANDARD.decode(&encrypted).unwrap();
+		assert_eq!(bytes.len(), 12 + secret.len() + 16);
+		assert!(!bytes.windows(secret.len()).any(|window| window == secret.as_bytes()));
+		assert!(!serde_json::to_string(&loaded[0].record).unwrap().contains(secret));
+		assert!(Credentials::new(storage.clone(), Some("invalid")).is_err());
+		storage
+			.update_credentials(
+				"a",
+				CredentialChange::Record {
+					provider: "zai".into(),
+					secret: loaded[0].record.secret.clone(),
+					error: None,
+				},
+			)
+			.unwrap();
+		assert!(storage.owner_credentials("a").unwrap()[0].last_used_at.is_some());
+		let old_secret = loaded[0].record.secret.clone();
+		storage
+			.update_credentials(
+				"a",
+				CredentialChange::Record {
+					provider: "zai".into(),
+					secret: old_secret.clone(),
+					error: Some(CredentialError {
+						at: 1,
+						status: 401,
+						message: "Unauthorized".into(),
+					}),
+				},
+			)
+			.unwrap();
+		storage
+			.update_credentials("a", credentials.put("a", "zai", secret).unwrap())
+			.unwrap();
+		let rows = storage.owner_credentials("a").unwrap();
+		assert_eq!(rows[0].position, 0);
+		assert!(rows[0].last_error.is_none());
+		assert_ne!(rows[0].secret, encrypted, "each write uses a random nonce");
+		storage
+			.update_credentials(
+				"a",
+				CredentialChange::Record {
+					provider: "zai".into(),
+					secret: old_secret,
+					error: Some(CredentialError {
+						at: 2,
+						status: 500,
+						message: "old call".into(),
+					}),
+				},
+			)
+			.unwrap();
+		assert!(storage.owner_credentials("a").unwrap()[0].last_error.is_none());
+		for order in [
+			vec!["zai"],
+			vec!["zai", "ollama", "missing"],
+			vec!["zai", "zai", "openai"],
+		] {
+			let result = storage.update_credentials(
+				"a",
+				CredentialChange::Order(order.into_iter().map(String::from).collect()),
+			);
+			assert!(matches!(
+				result.err().unwrap().downcast_ref::<CredentialInputError>(),
+				Some(CredentialInputError::InvalidOrder)
+			));
+		}
+		let rows = storage
+			.update_credentials(
+				"a",
+				CredentialChange::Order(vec!["openai".into(), "zai".into(), "ollama".into()]),
+			)
+			.unwrap();
+		assert_eq!(
+			rows.iter().map(|r| r.provider.as_str()).collect::<Vec<_>>(),
+			["openai", "zai", "ollama"]
+		);
+		let rows = storage
+			.update_credentials("a", CredentialChange::Delete("zai".into()))
+			.unwrap();
+		assert_eq!(rows.iter().map(|r| r.position).collect::<Vec<_>>(), [0, 1]);
+		assert!(storage
+			.update_credentials("a", CredentialChange::Delete("zai".into()))
+			.is_err());
+		let wrong_key = base64::engine::general_purpose::STANDARD.encode([8; 32]);
+		assert!(Credentials::new(storage.clone(), Some(&wrong_key))
+			.unwrap()
+			.load("a")
+			.is_err());
+		storage
+			.conn
+			.lock()
+			.unwrap()
+			.execute("UPDATE owner_credentials SET secret = 'corrupt' WHERE owner = 'a'", [])
+			.unwrap();
+		// A fresh instance: raw SQL bypasses the cache of `credentials`.
+		let error = Credentials::new(storage.clone(), Some(&encryption_key))
+			.unwrap()
+			.load("a")
+			.err()
+			.unwrap()
+			.to_string();
+		assert!(error.contains("Cannot decrypt owner credential"));
+		assert!(!error.contains(secret));
+		storage.update_credentials("a", CredentialChange::Clear).unwrap();
+		assert!(!storage.has_credentials().unwrap());
+	}
+
+	#[test]
+	fn short_credentials_are_not_disclosed_as_hints() {
+		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		let key = base64::engine::general_purpose::STANDARD.encode([7; 32]);
+		let credentials = Credentials::new(storage.clone(), Some(&key)).unwrap();
+		for secret in ["x", "abcd", "🔑"] {
+			let rows = credentials
+				.update("a", credentials.put("a", "zai", secret).unwrap())
+				.unwrap();
+			assert_eq!(rows[0].key_hint, "...");
+			assert_eq!(credentials.load("a").unwrap()[0].key, secret);
+		}
+	}
+
+	#[test]
+	fn credential_ciphertext_cannot_be_moved_between_owners_or_providers() {
+		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		let key = base64::engine::general_purpose::STANDARD.encode([7; 32]);
+		let credentials = Credentials::new(storage.clone(), Some(&key)).unwrap();
+		storage
+			.update_credentials("a", credentials.put("a", "zai", "secret-original").unwrap())
+			.unwrap();
+		storage
+			.conn
+			.lock()
+			.unwrap()
+			.execute("UPDATE owner_credentials SET owner = 'b'", [])
+			.unwrap();
+		assert!(credentials.load("b").is_err());
+		storage
+			.conn
+			.lock()
+			.unwrap()
+			.execute("UPDATE owner_credentials SET owner = 'a', provider = 'ollama'", [])
+			.unwrap();
+		assert!(credentials.load("a").is_err());
 	}
 }

@@ -146,6 +146,13 @@ Schema is created automatically on first connection. `OCTOHUB_DB_URL` overrides
 the config file. If `api_key` is omitted, client endpoints run open and admin
 endpoints are disabled (a warning is printed at startup).
 
+Owner BYOK for configured chat aliases is available through the
+[credential admin API](doc/06-api-admin.md#owner-provider-credentials-byok).
+Set `OCTOHUB_CREDENTIALS_KEY` to base64 of 32 random bytes before storing owner
+provider keys. Credentials are encrypted in all three database backends;
+requests with matching owner credentials use only those lanes and report
+`usage.byok: true`. See the [startup rules](doc/03-configuration.md#owner-credential-encryption).
+
 Full reference: [doc/03 — Configuration](doc/03-configuration.md).
 
 ## Authentication

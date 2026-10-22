@@ -1,3 +1,4 @@
+use super::credentials::{apply_change, decode_error, Credential, CredentialChange};
 use super::{
 	decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models, encode_auto_map,
 	encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
@@ -127,6 +128,21 @@ impl MysqlStorage {
                 owner VARCHAR(64) PRIMARY KEY,
                 map JSON NOT NULL,
                 updated_at BIGINT UNSIGNED NOT NULL
+            )",
+		)?;
+		conn.query_drop(
+			"CREATE TABLE IF NOT EXISTS owner_credentials (
+                owner VARCHAR(64) NOT NULL,
+                provider VARCHAR(32) NOT NULL,
+                secret TEXT NOT NULL,
+                key_hint TEXT NOT NULL,
+                position BIGINT NOT NULL,
+                created_at BIGINT NOT NULL,
+                last_used_at BIGINT,
+                last_error_at BIGINT,
+                last_error_status BIGINT,
+                last_error_message JSON,
+                PRIMARY KEY (owner, provider)
             )",
 		)?;
 		Ok(())
@@ -276,7 +292,80 @@ fn effective_limit(limit: u32) -> u32 {
 	}
 }
 
+fn read_credentials(conn: &mut impl Queryable, owner: &str, locked: bool) -> Result<Vec<Credential>> {
+	let query = if locked {
+		"SELECT provider, secret, key_hint, position, created_at, last_used_at,
+                last_error_at, last_error_status, last_error_message FROM owner_credentials WHERE owner = ? ORDER BY position FOR UPDATE"
+	} else {
+		"SELECT provider, secret, key_hint, position, created_at, last_used_at,
+                last_error_at, last_error_status, last_error_message FROM owner_credentials WHERE owner = ? ORDER BY position"
+	};
+	let rows: Vec<mysql::Row> = conn.exec(query, (owner,))?;
+	rows.into_iter()
+		.map(|row| {
+			let (provider, secret, key_hint, position, created_at, last_used_at, at, status, message) =
+				mysql::from_row_opt(row).map_err(|_| anyhow::anyhow!("Invalid owner credential row"))?;
+			let message: Option<String> = message;
+			let message = message.map(|message| serde_json::from_str(&message)).transpose()?;
+			Ok(Credential {
+				provider,
+				secret,
+				key_hint,
+				position,
+				created_at,
+				last_used_at,
+				last_error: decode_error(at, status, message)?,
+			})
+		})
+		.collect()
+}
+
 impl Storage for MysqlStorage {
+	fn has_credentials(&self) -> Result<bool> {
+		let mut conn = self.pool.get_conn()?;
+		let exists: Option<bool> = conn.query_first("SELECT EXISTS(SELECT 1 FROM owner_credentials)")?;
+		exists.context("Missing credential existence result")
+	}
+	fn owner_credentials(&self, owner: &str) -> Result<Vec<Credential>> {
+		read_credentials(&mut self.pool.get_conn()?, owner, false)
+	}
+	fn update_credentials(&self, owner: &str, change: CredentialChange) -> Result<Vec<Credential>> {
+		let mut conn = self.pool.get_conn()?;
+		let mut tx = conn.start_transaction(
+			mysql::TxOpts::default().set_isolation_level(Some(mysql::IsolationLevel::Serializable)),
+		)?;
+		let mut rows = read_credentials(&mut tx, owner, true)?;
+		apply_change(&mut rows, change)?;
+		tx.exec_drop("DELETE FROM owner_credentials WHERE owner = ?", (owner,))?;
+		for row in &rows {
+			// JSON preserves Unicode upstream messages on the deployment's latin1 tables.
+			let message = row
+				.last_error
+				.as_ref()
+				.map(|error| serde_json::to_string(&error.message))
+				.transpose()?;
+			tx.exec_drop(
+				"INSERT INTO owner_credentials (owner, provider, secret, key_hint, position, created_at,
+                 last_used_at, last_error_at, last_error_status, last_error_message)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				(
+					owner,
+					&row.provider,
+					&row.secret,
+					&row.key_hint,
+					row.position,
+					row.created_at,
+					row.last_used_at,
+					row.last_error.as_ref().map(|e| e.at),
+					row.last_error.as_ref().map(|e| i64::from(e.status)),
+					message,
+				),
+			)?;
+		}
+		tx.commit()?;
+		Ok(rows)
+	}
+
 	fn create_api_key(
 		&self,
 		name: &str,

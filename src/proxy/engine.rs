@@ -25,6 +25,7 @@ use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
 pub const MODEL_FORBIDDEN_MARKER: &str = "model_not_allowed_for_key";
 /// Marker for owner-budget exhaustion — the handler maps it to HTTP 429.
 pub const OWNER_LIMIT_MARKER: &str = "owner_concurrency_exhausted";
+const CREDENTIAL_ERROR_MAX_CHARS: usize = 300;
 
 #[derive(Debug)]
 pub enum ProxyTimeoutError {
@@ -187,6 +188,7 @@ pub struct EvaluationOutcome {
 /// `main`), so each request reads a fresh snapshot instead of a value frozen
 /// at startup.
 pub struct ProxyEngine {
+	pub(crate) credentials: Arc<crate::auth::Credentials>,
 	pub(crate) storage: Arc<dyn Storage>,
 	/// Startup config load time stays fixed even when SIGHUP replaces the model map.
 	pub(crate) config_loaded_at: u64,
@@ -211,8 +213,10 @@ impl ProxyEngine {
 		config: crate::Live<Config>,
 		limiter: crate::Live<ProviderLimiter>,
 		config_loaded_at: u64,
+		credentials: Arc<crate::auth::Credentials>,
 	) -> Self {
 		Self {
+			credentials,
 			storage,
 			config_loaded_at,
 			config,
@@ -418,12 +422,30 @@ impl ProxyEngine {
 		//    skipped; all exhausted → 429 with Retry-After (`pick_admitted`).
 		//    With `failover_on_error`, a provider-side failure moves to the
 		//    next candidate instead of surfacing to the client.
-		let mut candidates = config
-			.model_candidates(&routed_model)
-			.with_context(|| format!("Failed to resolve model '{}'", routed_model))?;
-		if let Some(ref sticky) = sticky_provider {
-			prefer_provider(&mut candidates, sticky);
-		}
+		let owner_credentials = match api_key.owner.clone() {
+			Some(owner) => {
+				let credentials = self.credentials.clone();
+				tokio::task::spawn_blocking(move || credentials.load(&owner)).await??
+			}
+			None => Arc::default(),
+		};
+		let byok_candidates = if !owner_credentials.is_empty() {
+			byok_candidates(config.ordered_model_candidates(&routed_model)?, &owner_credentials)
+		} else {
+			Vec::new()
+		};
+		let byok = !byok_candidates.is_empty();
+		let mut candidates = if byok {
+			byok_candidates
+		} else {
+			let mut candidates = config
+				.model_candidates(&routed_model)
+				.with_context(|| format!("Failed to resolve model '{}'", routed_model))?;
+			if let Some(ref sticky) = sticky_provider {
+				prefer_provider(&mut candidates, sticky);
+			}
+			candidates
+		};
 		// A JSON-schema request only goes to lanes that guarantee the shape;
 		// the rest would approximate it with a forced tool call that can miss
 		// required fields. No such lane is an error, never an unenforced answer.
@@ -441,14 +463,28 @@ impl ProxyEngine {
 		}
 
 		let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
-		let (provider_name, resolved_model, provider, provider_response, upstream_duration) = loop {
-			let (provider_name, resolved_model) = pick_admitted(
-				&self.rate_tracker,
-				&self.provider_health,
-				&config,
-				candidates.clone(),
-				&routed_model,
-			)?;
+		let (provider_name, resolved_model, provider, mut provider_response, upstream_duration) = loop {
+			let (provider_name, resolved_model) = if byok {
+				candidates.first().context("BYOK candidates exhausted")?.clone()
+			} else {
+				pick_admitted(
+					&self.rate_tracker,
+					&self.provider_health,
+					&config,
+					candidates.clone(),
+					&routed_model,
+				)?
+			};
+			let credential = if byok {
+				Some(
+					owner_credentials
+						.iter()
+						.find(|c| c.record.provider.eq_ignore_ascii_case(&provider_name))
+						.context("Missing credential for BYOK lane")?,
+				)
+			} else {
+				None
+			};
 
 			// Record provider in request span
 			tracing::Span::current().record("provider", provider_name.as_str());
@@ -508,6 +544,11 @@ impl ProxyEngine {
 					req.max_output_tokens,
 				);
 
+				if let Some(credential) = credential {
+					params = params.with_api_key(credential.key.clone());
+					// Each credential gets one attempt; the owner lane loop owns failover.
+					params.max_retries = 0;
+				}
 				if let Some(tools) = tools {
 					params.tools = Some(tools);
 				}
@@ -600,7 +641,11 @@ impl ProxyEngine {
 
 			match attempt {
 				Ok((provider, response, duration)) => {
-					self.provider_health.record_success(&provider_name);
+					if let Some(credential) = credential {
+						self.record_credential(api_key, credential, None).await?;
+					} else {
+						self.provider_health.record_success(&provider_name);
+					}
 					break (provider_name, resolved_model, provider, response, duration);
 				}
 				Err(err) => {
@@ -616,6 +661,33 @@ impl ProxyEngine {
 							modality = %modality_err.modality,
 							"provider does not support modality — skipping to next candidate"
 						);
+						continue;
+					}
+
+					if let Some(credential) = credential {
+						if matches!(
+							err.downcast_ref::<ProxyTimeoutError>(),
+							Some(ProxyTimeoutError::ProviderQueue { .. })
+						) {
+							return Err(err);
+						}
+						let failure = ByokFailure::from_upstream(&err, &provider_name, &owner_credentials)?;
+						self.record_credential(
+							api_key,
+							credential,
+							Some(crate::storage::credentials::CredentialError {
+								at: crate::storage::now_unix() as i64,
+								status: failure.status.as_u16(),
+								message: failure.message.chars().take(CREDENTIAL_ERROR_MAX_CHARS).collect(),
+							}),
+						)
+						.await?;
+						candidates.remove(0);
+						if !failure.retryable() || candidates.is_empty() {
+							return Err(failure.into());
+						}
+						crate::metrics::record_failover(&provider_name);
+						tracing::warn!(provider = %provider_name, status = failure.status.as_u16(), "Owner credential failed; trying next BYOK lane");
 						continue;
 					}
 
@@ -638,6 +710,28 @@ impl ProxyEngine {
 				}
 			}
 		};
+
+		if byok {
+			provider_response.content = redact_credential_text(&provider_response.content, &owner_credentials);
+			if let Some(thinking) = &mut provider_response.thinking {
+				thinking.content = redact_credential_text(&thinking.content, &owner_credentials);
+			}
+			if let Some(tool_calls) = &mut provider_response.tool_calls {
+				for call in tool_calls {
+					call.id = redact_credential_text(&call.id, &owner_credentials);
+					call.name = redact_credential_text(&call.name, &owner_credentials);
+					redact_credential_json(&mut call.arguments, &owner_credentials);
+				}
+			}
+			redact_credential_json(&mut provider_response.exchange.request, &owner_credentials);
+			redact_credential_json(&mut provider_response.exchange.response, &owner_credentials);
+			if let Some(value) = &mut provider_response.structured_output {
+				redact_credential_json(value, &owner_credentials);
+			}
+			if let Some(reason) = &mut provider_response.finish_reason {
+				*reason = redact_credential_text(reason, &owner_credentials);
+			}
+		}
 
 		// 8. Build our response
 		let completion_id = format!("cmpl_{}", Uuid::new_v4().simple());
@@ -687,6 +781,7 @@ impl ProxyEngine {
 
 		let exchange_usage = &provider_response.exchange.usage;
 		let usage = Usage {
+			byok: byok.then_some(true),
 			input_tokens: exchange_usage.as_ref().map(|u| u.input_tokens).unwrap_or(0),
 			output_tokens: exchange_usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
 			cache_read_tokens: exchange_usage.as_ref().and_then(|u| {
@@ -719,10 +814,12 @@ impl ProxyEngine {
 		// request itself was counted at admission, tokens only now that the
 		// provider reported them. `max` covers providers whose total_tokens
 		// is absent (0) but that still report the split counts.
-		self.rate_tracker.record_tokens(
-			&provider_name,
-			usage.total_tokens.max(usage.input_tokens + usage.output_tokens),
-		);
+		if !byok {
+			self.rate_tracker.record_tokens(
+				&provider_name,
+				usage.total_tokens.max(usage.input_tokens + usage.output_tokens),
+			);
+		}
 
 		let response = CreateCompletionResponse {
 			id: completion_id.clone(),
@@ -744,7 +841,7 @@ impl ProxyEngine {
 		// session_id comes from the chain tail — no extra DB query needed.
 		let session_id = inherited_session_id.unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()));
 
-		let stored = StoredCompletion {
+		let mut stored = StoredCompletion {
 			id: completion_id,
 			api_key_id: api_key.id,
 			session_id,
@@ -762,12 +859,39 @@ impl ProxyEngine {
 			usage: serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
 			created_at: now,
 		};
+		if byok {
+			redact_credential_json(&mut stored.input, &owner_credentials);
+			if let Some(instructions) = &mut stored.instructions {
+				*instructions = redact_credential_text(instructions, &owner_credentials);
+			}
+		}
+
 		let store_start = std::time::Instant::now();
 		let storage = self.storage.clone();
 		tokio::task::spawn_blocking(move || storage.store_completion(&stored)).await??;
 		tracing::Span::current().record("store_ms", store_start.elapsed().as_millis() as u64);
 
 		Ok((response, upstream_duration))
+	}
+
+	async fn record_credential(
+		&self,
+		api_key: &ApiKey,
+		credential: &crate::auth::OwnerCredential,
+		error: Option<crate::storage::credentials::CredentialError>,
+	) -> Result<()> {
+		let owner = api_key.owner.clone().context("BYOK request has no owner")?;
+		let credentials = self.credentials.clone();
+		let change = crate::storage::credentials::CredentialChange::Record {
+			provider: credential.record.provider.clone(),
+			secret: credential.record.secret.clone(),
+			error,
+		};
+		tokio::task::spawn_blocking(move || credentials.update(&owner, change))
+			.await
+			.context("Credential telemetry task failed")?
+			.map_err(|_| anyhow!("Credential telemetry storage failed"))?;
+		Ok(())
 	}
 
 	/// Process an embedding request, attributing usage to the given API key.
@@ -1539,6 +1663,88 @@ impl serde::Serialize for Input {
 	}
 }
 
+fn byok_candidates(
+	candidates: Vec<(String, String)>,
+	credentials: &[crate::auth::OwnerCredential],
+) -> Vec<(String, String)> {
+	let mut lanes: Vec<_> = candidates
+		.into_iter()
+		.filter_map(|lane| {
+			credentials
+				.iter()
+				.find(|c| c.record.provider.eq_ignore_ascii_case(&lane.0))
+				.map(|c| (c.record.position, lane))
+		})
+		.collect();
+	lanes.sort_by_key(|(position, _)| *position);
+	lanes.into_iter().map(|(_, lane)| lane).collect()
+}
+
+fn redact_credential_text(text: &str, credentials: &[crate::auth::OwnerCredential]) -> String {
+	credentials.iter().fold(text.to_owned(), |text, credential| {
+		text.replace(&credential.key, "[REDACTED]")
+	})
+}
+
+fn redact_credential_json(value: &mut serde_json::Value, credentials: &[crate::auth::OwnerCredential]) {
+	match value {
+		serde_json::Value::String(text) => *text = redact_credential_text(text, credentials),
+		serde_json::Value::Array(values) => {
+			for value in values {
+				redact_credential_json(value, credentials);
+			}
+		}
+		serde_json::Value::Object(values) => {
+			*values = std::mem::take(values)
+				.into_iter()
+				.map(|(key, mut value)| {
+					redact_credential_json(&mut value, credentials);
+					(redact_credential_text(&key, credentials), value)
+				})
+				.collect();
+		}
+		_ => {}
+	}
+}
+
+#[derive(Debug)]
+pub(crate) struct ByokFailure {
+	pub status: hyper::StatusCode,
+	message: String,
+	label: &'static str,
+}
+
+impl ByokFailure {
+	fn from_upstream(
+		error: &anyhow::Error,
+		provider: &str,
+		credentials: &[crate::auth::OwnerCredential],
+	) -> Result<Self> {
+		let upstream_message = format!("{error:#}");
+		let status = match error.downcast_ref::<ProxyTimeoutError>() {
+			Some(ProxyTimeoutError::Upstream { .. }) => hyper::StatusCode::GATEWAY_TIMEOUT,
+			_ => match upstream_status_code(&upstream_message) {
+				Some(code) => hyper::StatusCode::from_u16(code).context("Invalid upstream HTTP status")?,
+				None => hyper::StatusCode::BAD_GATEWAY,
+			},
+		};
+		Ok(Self {
+			status,
+			message: redact_credential_text(&upstream_message, credentials),
+			label: crate::auth::byok_provider_label(&provider.to_ascii_lowercase()).context("Unsupported BYOK lane")?,
+		})
+	}
+	fn retryable(&self) -> bool {
+		matches!(self.status.as_u16(), 401 | 403 | 429 | 500..=599)
+	}
+}
+impl std::fmt::Display for ByokFailure {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "Your {} key failed: {}", self.label, self.message)
+	}
+}
+impl std::error::Error for ByokFailure {}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -2018,5 +2224,410 @@ mod tests {
 		assert_eq!(messages.len(), 1);
 		let arr = messages[0].tool_calls.as_ref().unwrap().as_array().unwrap();
 		assert_eq!(arr.len(), 2);
+	}
+}
+
+#[cfg(test)]
+mod byok_tests {
+	use super::*;
+	use crate::auth::{Credentials, OwnerCredential};
+	use crate::storage::credentials::{Credential, CredentialChange};
+	use crate::storage::sqlite::SqliteStorage;
+	use base64::Engine;
+	use std::sync::{Mutex, RwLock};
+	use tracing::instrument::WithSubscriber;
+
+	fn credential(provider: &str, position: i64) -> OwnerCredential {
+		OwnerCredential {
+			key: format!("private-{provider}-key"),
+			record: Credential {
+				provider: provider.into(),
+				secret: "ciphertext".into(),
+				key_hint: "...hint".into(),
+				position,
+				created_at: 1,
+				last_used_at: None,
+				last_error: None,
+			},
+		}
+	}
+
+	#[test]
+	fn lane_order_is_stable_and_never_includes_platform_candidates() {
+		let lanes = vec![
+			("openai".into(), "platform".into()),
+			("ollama".into(), "first".into()),
+			("zai".into(), "second".into()),
+			("ollama".into(), "third".into()),
+		];
+		assert!(byok_candidates(lanes.clone(), &[]).is_empty());
+		assert!(byok_candidates(lanes.clone(), &[credential("anthropic", 0)]).is_empty());
+		assert_eq!(
+			byok_candidates(lanes, &[credential("zai", 1), credential("ollama", 0)]),
+			[
+				("ollama".into(), "first".into()),
+				("ollama".into(), "third".into()),
+				("zai".into(), "second".into())
+			]
+		);
+	}
+
+	#[test]
+	fn failures_preserve_status_and_redact_secrets_and_params() {
+		let credentials = [credential("zai", 0)];
+		for status in [400, 401, 403, 404, 429, 500, 502, 503] {
+			let error = anyhow!("Z.ai API error {status}: rejected private-zai-key");
+			let failure = ByokFailure::from_upstream(&error, "zai", &credentials).unwrap();
+			assert_eq!(failure.status.as_u16(), status);
+			assert_eq!(failure.retryable(), matches!(status, 401 | 403 | 429 | 500..=599));
+			assert!(failure.to_string().starts_with("Your Z.ai key failed: "));
+			assert!(!format!("{failure:?}").contains("private-zai-key"));
+		}
+		let failure = ByokFailure::from_upstream(&anyhow!("connection closed"), "zai", &credentials).unwrap();
+		assert_eq!(failure.status, hyper::StatusCode::BAD_GATEWAY);
+		assert!(failure.retryable());
+		let params = ChatCompletionParams::new(&[Message::user("hello")], "glm-5", 1.0, 1.0, 50, 10)
+			.with_api_key(credentials[0].key.clone());
+		assert!(!format!("{params:?}").contains("private-zai-key"));
+		let mut exchange = serde_json::json!({"request": {"private-zai-key": "Bearer private-zai-key"}, "response": ["private-zai-key"]});
+		redact_credential_json(&mut exchange, &credentials);
+		assert!(!exchange.to_string().contains("private-zai-key"));
+	}
+
+	#[derive(Clone, Default)]
+	struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+	impl std::io::Write for CapturedLogs {
+		fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+			self.0.lock().unwrap().extend_from_slice(bytes);
+			Ok(bytes.len())
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+	impl EnvGuard {
+		fn set(values: &[(&'static str, String)]) -> Self {
+			let previous = values
+				.iter()
+				.map(|(name, value)| {
+					let previous = std::env::var_os(name);
+					std::env::set_var(name, value);
+					(*name, previous)
+				})
+				.collect();
+			Self(previous)
+		}
+	}
+	impl Drop for EnvGuard {
+		fn drop(&mut self) {
+			for (name, value) in &self.0 {
+				match value {
+					Some(value) => std::env::set_var(name, value),
+					None => std::env::remove_var(name),
+				}
+			}
+		}
+	}
+
+	#[derive(Default)]
+	struct Upstream {
+		statuses: std::collections::HashMap<String, u16>,
+		requests: Vec<(String, String)>,
+	}
+
+	fn request(model: &str, previous: Option<&str>) -> CreateCompletionRequest {
+		serde_json::from_value(
+			serde_json::json!({"model": model, "input": "hello", "previous_completion_id": previous}),
+		)
+		.unwrap()
+	}
+
+	#[tokio::test]
+	async fn routing_dispatches_owner_keys_fails_over_and_persists_byok() {
+		use http_body_util::{BodyExt, Full};
+		use hyper::service::service_fn;
+		use hyper_util::rt::TokioIo;
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let upstream = Arc::new(Mutex::new(Upstream::default()));
+		let state = upstream.clone();
+		let server = tokio::spawn(async move {
+			loop {
+				let (socket, _) = listener.accept().await.unwrap();
+				let state = state.clone();
+				tokio::spawn(async move {
+					hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let state = state.clone();
+                        async move {
+                            let path = req.uri().path().to_owned();
+                            let auth = req.headers().get("Authorization").map(|h| h.to_str().unwrap().to_owned()).unwrap_or_default();
+                            let body = req.collect().await.unwrap().to_bytes();
+                            assert!(!String::from_utf8_lossy(&body).contains("owner-private"));
+                            let status = {
+                                let mut state = state.lock().unwrap();
+                                state.requests.push((path.clone(), auth.clone()));
+                                state.statuses.get(&path).copied().unwrap_or(200)
+                            };
+                            let body = if status == 200 {
+                                serde_json::json!({"id":"mock", "object":"chat.completion", "created":1_700_000_000, "model":"glm-5", "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                                    "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":0.01}})
+                            } else {
+                                serde_json::json!({"error":{"message": format!("Rejected {auth} {}", "x".repeat(350))}})
+                            };
+                            Ok::<_, std::convert::Infallible>(hyper::Response::builder().status(status)
+                                .header("content-type", "application/json")
+                                .body(Full::new(bytes::Bytes::from(body.to_string()))).unwrap())
+                        }
+                    })).await.unwrap();
+				});
+			}
+		});
+		let _env = EnvGuard::set(&[
+			("ZAI_API_URL", format!("http://{address}/zai")),
+			("OLLAMA_API_URL", format!("http://{address}/ollama")),
+			("LOCAL_API_URL", format!("http://{address}/platform")),
+			("ZAI_API_KEY", "platform-zai".into()),
+			("OLLAMA_API_KEY", "platform-ollama".into()),
+		]);
+		let config: Config = toml::from_str(
+			r#"
+            [server]
+            api_key = "master"
+            failover_on_error = false
+            [models]
+            face = ["local:glm-5", "ollama:glm-5", "zai:glm-5"]
+            platform = ["local:glm-5"]
+            [auto]
+            default = "face"
+        "#,
+		)
+		.unwrap();
+		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		let key = storage
+			.create_api_key("account key", None, Some("account"), None)
+			.unwrap();
+		let encryption_key = base64::engine::general_purpose::STANDARD.encode([1; 32]);
+		let credentials = Arc::new(Credentials::new(storage.clone(), Some(&encryption_key)).unwrap());
+		let limiter = Arc::new(RwLock::new(Arc::new(ProviderLimiter::from_config(&config))));
+		let config = Arc::new(RwLock::new(Arc::new(config)));
+		let engine = ProxyEngine::new(storage.clone(), config.clone(), limiter, 1, credentials.clone());
+		let (response, _) = engine.process(request("face", None), &key, None, None).await.unwrap();
+		assert!(response.usage.byok.is_none());
+		assert!(serde_json::to_value(&response.usage).unwrap().get("byok").is_none());
+		assert!(!upstream.lock().unwrap().requests[0].1.contains("owner-private"));
+		upstream.lock().unwrap().requests.clear();
+		let (response, _) = engine
+			.process(request("zai:glm-5", None), &key, None, None)
+			.await
+			.unwrap();
+		assert!(response.usage.byok.is_none());
+		assert_eq!(
+			upstream.lock().unwrap().requests,
+			[("/zai".into(), "Bearer platform-zai".into())]
+		);
+		for provider in ["zai", "ollama"] {
+			credentials
+				.update(
+					"account",
+					credentials
+						.put("account", provider, &format!("owner-private-{provider}-key"))
+						.unwrap(),
+				)
+				.unwrap();
+		}
+		upstream.lock().unwrap().requests.clear();
+		let (response, _) = engine
+			.process(request("zai:glm-5", None), &key, None, None)
+			.await
+			.unwrap();
+		assert_eq!(response.usage.byok, Some(true));
+		assert_eq!(
+			storage.get_completion(&response.id).unwrap().unwrap().usage["byok"],
+			true
+		);
+		assert_eq!(
+			upstream.lock().unwrap().requests,
+			[("/zai".into(), "Bearer owner-private-zai-key".into())]
+		);
+		for status in [401, 429, 503] {
+			{
+				let mut state = upstream.lock().unwrap();
+				state.requests.clear();
+				state.statuses.insert("/zai".into(), status);
+			}
+			let error = engine
+				.process(request("zai:glm-5", None), &key, None, None)
+				.await
+				.err()
+				.unwrap();
+			assert_eq!(error.downcast_ref::<ByokFailure>().unwrap().status.as_u16(), status);
+			assert_eq!(
+				upstream.lock().unwrap().requests,
+				[("/zai".into(), "Bearer owner-private-zai-key".into())]
+			);
+		}
+		// Overrides must work without a platform environment key.
+		std::env::remove_var("ZAI_API_KEY");
+		std::env::remove_var("OLLAMA_API_KEY");
+		let mut previous = None;
+		for status in [401, 403, 429, 500, 503] {
+			{
+				let mut state = upstream.lock().unwrap();
+				state.requests.clear();
+				state.statuses.insert("/zai".into(), status);
+			}
+			let logs = CapturedLogs::default();
+			let writer = logs.clone();
+			let subscriber = tracing_subscriber::fmt()
+				.with_max_level(tracing::Level::DEBUG)
+				.with_ansi(false)
+				.without_time()
+				.with_writer(move || writer.clone())
+				.finish();
+			let (response, _) = engine
+				.process(request("auto", previous.as_deref()), &key, None, None)
+				.with_subscriber(subscriber)
+				.await
+				.unwrap();
+			let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+			if matches!(status, 429 | 500..=599) {
+				assert!(
+					captured.contains("API request attempt 1 failed"),
+					"retry log was not captured: {captured}"
+				);
+				assert!(
+					captured.contains("[redacted]"),
+					"retry log did not show redaction: {captured}"
+				);
+			}
+			for secret in ["owner-private-zai-key", "owner-private-ollama-key"] {
+				assert!(!captured.contains(secret), "credential leaked in captured logs");
+			}
+			assert_eq!(response.usage.byok, Some(true));
+			assert!(response.usage.cost.is_some());
+			let stored = storage.get_completion(&response.id).unwrap().unwrap();
+			assert_eq!(stored.usage["byok"], true);
+			assert_eq!(stored.usage["cost"], serde_json::json!(response.usage.cost));
+			assert!(!format!("{stored:?}").contains("owner-private"));
+			previous = Some(response.id.clone());
+			let chat = ChatCompletionResponse::from(response);
+			assert_eq!(serde_json::to_value(chat.usage).unwrap()["byok"], true);
+			assert_eq!(
+				upstream.lock().unwrap().requests,
+				[
+					("/zai".into(), "Bearer owner-private-zai-key".into()),
+					("/ollama".into(), "Bearer owner-private-ollama-key".into())
+				]
+			);
+			let rows = storage.owner_credentials("account").unwrap();
+			assert_eq!(rows[0].last_error.as_ref().unwrap().status, status);
+			assert!(rows[0].last_error.as_ref().unwrap().message.chars().count() <= 300);
+			assert!(!rows[0].last_error.as_ref().unwrap().message.contains("owner-private"));
+			assert!(rows[1].last_used_at.is_some());
+		}
+		// Sticky replay and platform health/rate settings must not reorder the owner lanes.
+		engine
+			.provider_health
+			.record_failure("zai", std::time::Duration::from_secs(100));
+		engine
+			.provider_health
+			.record_failure("zai", std::time::Duration::from_secs(100));
+		engine
+			.provider_health
+			.record_failure("zai", std::time::Duration::from_secs(100));
+		{
+			let mut state = upstream.lock().unwrap();
+			state.requests.clear();
+			state.statuses.insert("/zai".into(), 200);
+		}
+		engine
+			.process(request("face", previous.as_deref()), &key, None, None)
+			.await
+			.unwrap();
+		assert_eq!(upstream.lock().unwrap().requests[0].0, "/zai");
+		for status in [401, 429, 503] {
+			{
+				let mut state = upstream.lock().unwrap();
+				state.requests.clear();
+				state.statuses.insert("/zai".into(), 401);
+				state.statuses.insert("/ollama".into(), status);
+			}
+			let error = engine
+				.process(request("face", None), &key, None, None)
+				.await
+				.err()
+				.unwrap();
+			let failure = error.downcast_ref::<ByokFailure>().unwrap();
+			assert_eq!(failure.status.as_u16(), status);
+			assert!(error.to_string().starts_with("Your Ollama Cloud key failed: "));
+			assert!(!format!("{error:?}").contains("owner-private"));
+			assert_eq!(upstream.lock().unwrap().requests.len(), 2);
+			assert!(upstream
+				.lock()
+				.unwrap()
+				.requests
+				.iter()
+				.all(|(path, _)| path != "/platform"));
+		}
+		upstream.lock().unwrap().statuses.insert("/zai".into(), 400);
+		upstream.lock().unwrap().requests.clear();
+		assert!(engine.process(request("face", None), &key, None, None).await.is_err());
+		assert_eq!(upstream.lock().unwrap().requests.len(), 1);
+		credentials
+			.update("account", CredentialChange::Order(vec!["ollama".into(), "zai".into()]))
+			.unwrap();
+		upstream.lock().unwrap().statuses.clear();
+		upstream.lock().unwrap().requests.clear();
+		engine.process(request("face", None), &key, None, None).await.unwrap();
+		assert_eq!(upstream.lock().unwrap().requests[0].0, "/ollama");
+		let (response, _) = engine
+			.process(request("platform", None), &key, None, None)
+			.await
+			.unwrap();
+		assert!(response.usage.byok.is_none(), "uncovered faces retain platform routing");
+		let other_key = storage
+			.create_api_key("other owner", None, Some("other"), None)
+			.unwrap();
+		let (response, _) = engine
+			.process(request("platform", None), &other_key, None, None)
+			.await
+			.unwrap();
+		assert!(response.usage.byok.is_none());
+		let restricted_key = storage
+			.create_api_key("denied", Some(&[]), Some("account"), None)
+			.unwrap();
+		assert!(engine
+			.process(request("face", None), &restricted_key, None, None)
+			.await
+			.is_err());
+		credentials
+			.update(
+				"account",
+				CredentialChange::Put {
+					provider: "zai".into(),
+					secret: "corrupt".into(),
+					key_hint: "...hint".into(),
+				},
+			)
+			.unwrap();
+		upstream.lock().unwrap().requests.clear();
+		let error = engine
+			.process(request("face", None), &key, None, None)
+			.await
+			.err()
+			.unwrap();
+		assert!(error.to_string().contains("Cannot decrypt owner credential"));
+		assert!(upstream.lock().unwrap().requests.is_empty());
+		credentials.update("account", CredentialChange::Clear).unwrap();
+		let (response, _) = engine
+			.process(request("platform", None), &key, None, None)
+			.await
+			.unwrap();
+		assert!(response.usage.byok.is_none());
+		server.abort();
 	}
 }
