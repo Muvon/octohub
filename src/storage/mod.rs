@@ -347,6 +347,23 @@ pub(crate) fn decode_json_column(raw: Option<String>) -> Option<serde_json::Valu
 	}
 }
 
+/// A storage error's class for logs: the database's own code and state, never the
+/// driver message, which can echo bound values (owner credential secrets among them).
+pub(crate) fn error_class(error: &anyhow::Error) -> String {
+	for cause in error.chain() {
+		if let Some(::mysql::Error::MySqlError(e)) = cause.downcast_ref::<::mysql::Error>() {
+			return format!("mysql {} ({})", e.code, e.state);
+		}
+		if let Some(code) = cause.downcast_ref::<::postgres::Error>().and_then(|e| e.code()) {
+			return format!("postgres {}", code.code());
+		}
+		if let Some(rusqlite::Error::SqliteFailure(e, _)) = cause.downcast_ref::<rusqlite::Error>() {
+			return format!("sqlite {:?}", e.code);
+		}
+	}
+	"not a database error".to_owned()
+}
+
 /// Current unix timestamp in seconds
 pub(crate) fn now_unix() -> u64 {
 	SystemTime::now()
@@ -371,5 +388,22 @@ pub fn from_url(url: &str) -> Result<Arc<dyn Storage>> {
 	} else {
 		// Bare path — treat as SQLite for backward compatibility
 		Ok(Arc::new(sqlite::SqliteStorage::new(url)?))
+	}
+}
+
+#[cfg(test)]
+mod error_class_tests {
+	use super::error_class;
+
+	#[test]
+	fn names_the_database_code_never_the_message() {
+		let failure = rusqlite::Error::SqliteFailure(
+			rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+			Some("UNIQUE failed: secret-value".to_owned()),
+		);
+		let class = error_class(&anyhow::Error::new(failure).context("storing credential"));
+		assert_eq!(class, "sqlite ConstraintViolation");
+		assert!(!class.contains("secret-value"));
+		assert_eq!(error_class(&anyhow::anyhow!("plain")), "not a database error");
 	}
 }

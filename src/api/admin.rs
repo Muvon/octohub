@@ -768,7 +768,10 @@ where
 				return error_response(status, &input.to_string());
 			}
 			// Database driver errors may contain bound values; never log credential operations verbatim.
-			tracing::error!("Owner credential storage operation failed");
+			tracing::error!(
+				class = %crate::storage::error_class(&error),
+				"Owner credential storage operation failed"
+			);
 			error_response(
 				StatusCode::INTERNAL_SERVER_ERROR,
 				"Owner credential storage operation failed",

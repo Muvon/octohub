@@ -292,15 +292,12 @@ fn effective_limit(limit: u32) -> u32 {
 	}
 }
 
-fn read_credentials(conn: &mut impl Queryable, owner: &str, locked: bool) -> Result<Vec<Credential>> {
-	let query = if locked {
+fn read_credentials(conn: &mut impl Queryable, owner: &str) -> Result<Vec<Credential>> {
+	let rows: Vec<mysql::Row> = conn.exec(
 		"SELECT provider, secret, key_hint, position, created_at, last_used_at,
-                last_error_at, last_error_status, last_error_message FROM owner_credentials WHERE owner = ? ORDER BY position FOR UPDATE"
-	} else {
-		"SELECT provider, secret, key_hint, position, created_at, last_used_at,
-                last_error_at, last_error_status, last_error_message FROM owner_credentials WHERE owner = ? ORDER BY position"
-	};
-	let rows: Vec<mysql::Row> = conn.exec(query, (owner,))?;
+                last_error_at, last_error_status, last_error_message FROM owner_credentials WHERE owner = ? ORDER BY position",
+		(owner,),
+	)?;
 	rows.into_iter()
 		.map(|row| {
 			let (provider, secret, key_hint, position, created_at, last_used_at, at, status, message) =
@@ -320,6 +317,43 @@ fn read_credentials(conn: &mut impl Queryable, owner: &str, locked: bool) -> Res
 		.collect()
 }
 
+/// Replace an owner's rows with `change` applied, in one READ COMMITTED transaction.
+/// The caller holds the owner's named lock, so no other writer interleaves.
+fn rewrite_credentials(conn: &mut mysql::PooledConn, owner: &str, change: CredentialChange) -> Result<Vec<Credential>> {
+	let mut tx = conn
+		.start_transaction(mysql::TxOpts::default().set_isolation_level(Some(mysql::IsolationLevel::ReadCommitted)))?;
+	let mut rows = read_credentials(&mut tx, owner)?;
+	apply_change(&mut rows, change)?;
+	tx.exec_drop("DELETE FROM owner_credentials WHERE owner = ?", (owner,))?;
+	for row in &rows {
+		// JSON preserves Unicode upstream messages on the deployment's latin1 tables.
+		let message = row
+			.last_error
+			.as_ref()
+			.map(|error| serde_json::to_string(&error.message))
+			.transpose()?;
+		tx.exec_drop(
+			"INSERT INTO owner_credentials (owner, provider, secret, key_hint, position, created_at,
+                 last_used_at, last_error_at, last_error_status, last_error_message)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			(
+				owner,
+				&row.provider,
+				&row.secret,
+				&row.key_hint,
+				row.position,
+				row.created_at,
+				row.last_used_at,
+				row.last_error.as_ref().map(|e| e.at),
+				row.last_error.as_ref().map(|e| i64::from(e.status)),
+				message,
+			),
+		)?;
+	}
+	tx.commit()?;
+	Ok(rows)
+}
+
 impl Storage for MysqlStorage {
 	fn has_credentials(&self) -> Result<bool> {
 		let mut conn = self.pool.get_conn()?;
@@ -327,43 +361,19 @@ impl Storage for MysqlStorage {
 		exists.context("Missing credential existence result")
 	}
 	fn owner_credentials(&self, owner: &str) -> Result<Vec<Credential>> {
-		read_credentials(&mut self.pool.get_conn()?, owner, false)
+		read_credentials(&mut self.pool.get_conn()?, owner)
 	}
 	fn update_credentials(&self, owner: &str, change: CredentialChange) -> Result<Vec<Credential>> {
+		// MyRocks (the deployment's engine) rejects SERIALIZABLE and the gap lock a
+		// `WHERE owner = ? FOR UPDATE` prefix read takes, so writers of one owner are
+		// serialized by a named lock instead and the rewrite runs under READ COMMITTED.
+		// SHA1 keeps the name within MySQL's 64-character lock-name limit for any owner.
 		let mut conn = self.pool.get_conn()?;
-		let mut tx = conn.start_transaction(
-			mysql::TxOpts::default().set_isolation_level(Some(mysql::IsolationLevel::Serializable)),
-		)?;
-		let mut rows = read_credentials(&mut tx, owner, true)?;
-		apply_change(&mut rows, change)?;
-		tx.exec_drop("DELETE FROM owner_credentials WHERE owner = ?", (owner,))?;
-		for row in &rows {
-			// JSON preserves Unicode upstream messages on the deployment's latin1 tables.
-			let message = row
-				.last_error
-				.as_ref()
-				.map(|error| serde_json::to_string(&error.message))
-				.transpose()?;
-			tx.exec_drop(
-				"INSERT INTO owner_credentials (owner, provider, secret, key_hint, position, created_at,
-                 last_used_at, last_error_at, last_error_status, last_error_message)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				(
-					owner,
-					&row.provider,
-					&row.secret,
-					&row.key_hint,
-					row.position,
-					row.created_at,
-					row.last_used_at,
-					row.last_error.as_ref().map(|e| e.at),
-					row.last_error.as_ref().map(|e| i64::from(e.status)),
-					message,
-				),
-			)?;
-		}
-		tx.commit()?;
-		Ok(rows)
+		let locked: Option<i64> = conn.exec_first("SELECT GET_LOCK(CONCAT('octohub:cred:', SHA1(?)), 10)", (owner,))?;
+		anyhow::ensure!(locked == Some(1), "Timed out waiting for the owner credential lock");
+		let result = rewrite_credentials(&mut conn, owner, change);
+		conn.exec_drop("SELECT RELEASE_LOCK(CONCAT('octohub:cred:', SHA1(?)))", (owner,))?;
+		result
 	}
 
 	fn create_api_key(
