@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.12.1] - 2026-10-22
+
+### 📋 Release Summary
+
+Requests are now routed according to supported modalities, and blank authentication keys are treated as unconfigured.
+
+### 🐛 Bug Fixes & Stability
+
+- **proxy**: route requests by supported modalities `6d8cc6c4`
+- **auth**: treat blank keys as unconfigured `3158c358`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.12.0] - 2026-10-22
 
 ### 📋 Release Summary
