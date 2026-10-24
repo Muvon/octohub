@@ -260,6 +260,14 @@ Polling is what advances a job — there is no background worker. A job you neve
 poll stays `queued` and its cost is never recorded. A terminal record is served
 from the database with no upstream call.
 
+A job the provider reports finished whose output cannot be read as this
+endpoint's media — a music model posted to the image route, say — ends `failed`
+with `error.category` `invalid_response` and the raw output in
+`error.provider_metadata`. It is never left running. fal endpoints are also
+checked before submission against fal's own model catalog: a route the endpoint
+does not make is refused with `400 media_task_not_supported`, before anything is
+billed.
+
 Records are scoped to the key that created them; another key's id returns 404,
 not 403.
 
@@ -299,7 +307,10 @@ octohub_media_cost_microusd_total{task,model,provider,source}
 octohub_media_cost_unknown_total{task,model,provider}
 ```
 
-`status` is `ok`, `accepted` (202, still running) or `error`. Per-key labels
+`status` is `ok`, `failed`, `expired`, `cancelled`, `accepted` (202, still
+running), `rejected` (refused for the request's own shape or content) or `error`
+(a provider-side failure). Only outcomes feed per-model health; see
+[07 — Observability](./07-observability.md#media-metrics). Per-key labels
 follow the existing `metrics.per_key` switch.
 
 There is no outstanding-jobs gauge. An accurate one would have to count
@@ -318,7 +329,7 @@ Standard OpenAI envelope, `{"error": {"message", "type"}}`.
 |---|---|---|
 | 400 | `invalid_request_error` | bad JSON, bad `size`/`mode`, oversized upload |
 | 400 | `unsupported_parameter` | the adapter cannot honour a parameter and you asked for strict |
-| 400 | `media_task_not_supported` | the provider does not serve that model or task |
+| 400 | `media_task_not_supported` | the provider does not serve that model or task — for fal, its catalog says the endpoint makes other media |
 | 400 | `media_generation_failed` | upstream rejected on content policy or invalid input |
 | 401 | — | missing or revoked key |
 | 403 | `invalid_request_error` | the key's allow-list does not include this model |

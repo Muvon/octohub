@@ -147,6 +147,7 @@ Config and provider concurrency limiter handles are replaced separately. Do not 
 - Hold a provider permit for submit only; release it before long polling. Hold the owner permit through the create request. Submit failover stops once a job has been accepted; polling uses the stored provider and handle.
 - Terminal reads use stored results without another upstream call. Terminal transitions clear the handle. Cancellation is provider-dependent; reuse the existing cancel path rather than introducing a second job state machine.
 - Redact inline binary request payloads before persistence. Preserve result artifacts, warnings, errors, and usage in their existing normalized columns/envelope. There is no background job worker; requests drive polling.
+- Media health counts verdicts on the model only. A job's outcome is recorded once: by the submit that waited for it, or by the poll that finished it (`MediaOutcome::finished_now`). `accepted` (202) and `rejected` (refused for the request's own shape or content, by OctoHub or the provider) never touch health — classify failures by `MediaError` variant (`media_failure_label`), not by HTTP status, because an upstream 4xx is still the model failing.
 
 ## Storage Patterns
 

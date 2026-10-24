@@ -274,11 +274,30 @@ octohub_media_cost_microusd_total{task,model,provider,source}
 octohub_media_cost_unknown_total{task,model,provider}
 ```
 
-`task` is `image`, `video`, `speech` or `transcription`. `status` is `ok`,
-`accepted` (202 — the job is still running) or `error`. `source` on the cost
-counter is `provider` (the upstream reported a dollar amount) or `estimate`
-(computed from octolib's reference rates); requests nothing could price are
-counted in `octohub_media_cost_unknown_total` instead, never as $0.
+`task` is `image`, `video`, `speech` or `transcription`. `status` is one of:
+
+| `status` | Meaning |
+|---|---|
+| `ok` | the job succeeded |
+| `failed`, `expired`, `cancelled` | the job ended that way |
+| `accepted` | 202 — the job is still running |
+| `rejected` | refused for the request's own shape or content (bad parameters, a route the model does not serve, a content-policy refusal), by OctoHub or the provider |
+| `error` | the provider failed, an upstream 4xx included |
+
+An async job is counted twice: `accepted` by its submit, then its outcome by
+the poll that finishes it (once — later reads replay the stored record). Its
+`octohub_media_duration_seconds` is then the job's own run time.
+
+Per-model health on `GET /v1/admin/status` takes only verdicts on the model:
+`ok` counts as a success; `failed`, `expired`, `cancelled` and `error` as
+failures. `accepted` and `rejected` say nothing about the model and are left
+out, so a model whose every job fails reads `down` instead of flapping back to
+`up` on each accepted submit.
+
+`source` on the cost counter is `provider` (the upstream reported a dollar
+amount) or `estimate` (computed from octolib's reference rates); requests
+nothing could price are counted in `octohub_media_cost_unknown_total` instead,
+never as $0.
 
 Spend is counted in millionths of a USD — divide by 1e6 for dollars. It is a
 counter rather than a gauge so Prometheus detects the reset on restart;
