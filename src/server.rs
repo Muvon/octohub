@@ -213,6 +213,7 @@ mod tests {
 
 	/// Wait until connecting to `addr` is refused, which proves the listener
 	/// is closed (a connect that still succeeds raced the close; retry).
+	#[cfg(unix)]
 	async fn wait_refused(addr: SocketAddr, within: Duration) {
 		let deadline = Instant::now() + within;
 		loop {
@@ -229,6 +230,11 @@ mod tests {
 		}
 	}
 
+	// unix-only: Windows answers a connect to a closed port only after ~2 s of
+	// SYN retries, longer than the 500 ms in-flight request, so the probe cannot
+	// see the listener closed while that request still runs. The drain itself is
+	// still covered there by the idle and bound tests below.
+	#[cfg(unix)]
 	#[tokio::test]
 	async fn drain_refuses_new_connections_and_finishes_in_flight_request() {
 		let started = Arc::new(Notify::new());
