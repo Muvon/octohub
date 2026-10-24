@@ -171,6 +171,11 @@ pub struct MediaOutcome {
 	/// True when the operation is still running: the handler answers 202 and
 	/// the client resumes with `GET /v1/media/{id}`.
 	pub accepted: bool,
+	/// True when this call took the job to its outcome upstream. A poll that
+	/// only replayed a stored outcome is false, so the outcome is recorded once.
+	pub finished_now: bool,
+	/// The model as the client asked for it, the key every metric uses.
+	pub alias: String,
 	pub upstream_duration: Duration,
 }
 
@@ -532,6 +537,8 @@ impl ProxyEngine {
 				completed_at: record.completed_at,
 			},
 			accepted,
+			finished_now: !accepted,
+			alias: record.input_model,
 			upstream_duration,
 		}
 	}
@@ -574,6 +581,8 @@ impl ProxyEngine {
 				completed_at: record.completed_at,
 			},
 			accepted: !is_terminal(status),
+			finished_now: false,
+			alias: record.input_model,
 			upstream_duration: Duration::ZERO,
 		}
 	}
@@ -628,6 +637,23 @@ fn warnings_json(normalized: &Normalized) -> Option<serde_json::Value> {
 		return None;
 	}
 	serde_json::to_value(&normalized.warnings).ok()
+}
+
+/// The endpoint family a task belongs to: the metrics `task` label, the same
+/// one a submit records from its endpoint.
+pub fn task_family(task: MediaTask) -> &'static str {
+	match task {
+		MediaTask::TextToImage | MediaTask::ImageEdit | MediaTask::Inpainting | MediaTask::ImageVariation => "image",
+		MediaTask::TextToVideo
+		| MediaTask::ImageToVideo
+		| MediaTask::ReferenceToVideo
+		| MediaTask::VideoExtend
+		| MediaTask::VideoEdit => "video",
+		MediaTask::TextToSpeech => "speech",
+		MediaTask::SpeechToText | MediaTask::SpeechTranslation => "transcription",
+		// octolib's task list is non-exhaustive; a task added there is no family yet.
+		_ => "other",
+	}
 }
 
 fn task_name(task: MediaTask) -> String {

@@ -902,19 +902,26 @@ async fn handle_media_create(
 			media_outcome_response(outcome)
 		}
 		Err(e) => {
+			let response = media_error_response(&e);
 			crate::metrics::record_media(crate::metrics::MediaCall {
 				task: task_label,
 				model: &model_label,
 				// The call never reached an upstream, so there is no provider
 				// to attribute the failure to.
 				provider: "unknown",
-				status: "error",
+				// A request refused for its own content (a 4xx) says nothing
+				// about the model's health.
+				status: if response.status().is_client_error() {
+					"rejected"
+				} else {
+					"error"
+				},
 				duration: std::time::Duration::ZERO,
 				usage: None,
 				api_key_id: Some(api_key.id),
 				per_key,
 			});
-			media_error_response(&e)
+			response
 		}
 	}
 }
@@ -986,7 +993,24 @@ pub async fn handle_media_get(
 		// Absent OR owned by another key: both read as 404 so record ids
 		// cannot be probed across tenants.
 		Ok(None) => error_response_typed(StatusCode::NOT_FOUND, "Media record not found", "not_found"),
-		Ok(Some(outcome)) => media_outcome_response(outcome),
+		Ok(Some(outcome)) => {
+			// The poll that finishes an async job is that job's real outcome, so
+			// it goes through the same funnel as a submit; a model whose jobs fail
+			// then reads as failing on `/v1/admin/status`.
+			if outcome.finished_now {
+				crate::metrics::record_media(crate::metrics::MediaCall {
+					task: crate::proxy::media::task_family(outcome.response.task),
+					model: &outcome.alias,
+					provider: &outcome.response.provider,
+					status: media_status_label(outcome.response.status),
+					duration: outcome.upstream_duration,
+					usage: outcome.response.usage.as_ref(),
+					api_key_id: Some(api_key.id),
+					per_key: engine.config().metrics.per_key,
+				});
+			}
+			media_outcome_response(outcome)
+		}
 		Err(e) => media_error_response(&e),
 	}
 }

@@ -392,8 +392,14 @@ pub fn record_media(call: MediaCall<'_>) {
 		per_key,
 	} = call;
 	// Same funnel as completions and embeddings, so `/v1/admin/status` sees
-	// media traffic too. A 202 is not a failure — the job is live.
-	crate::health::record(model, provider, matches!(status, "ok" | "accepted"), duration, status);
+	// media traffic too. Two statuses are no verdict on the model: a 202
+	// (`accepted`) is a live job whose outcome is recorded by the call that
+	// finishes it — counted as a success it would reset the failure streak of a
+	// model whose jobs all fail — and a request refused for its own content
+	// (`rejected`) says nothing about the model at all.
+	if !matches!(status, "accepted" | "rejected") {
+		crate::health::record(model, provider, status == "ok", duration, status);
+	}
 
 	let task = task.to_owned();
 	let model = model.to_owned();
@@ -451,5 +457,50 @@ pub fn record_media(call: MediaCall<'_>) {
 			)
 			.increment(1);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn media(model: &str, status: &str) {
+		record_media(MediaCall {
+			task: "image",
+			model,
+			provider: "fal",
+			status,
+			duration: Duration::from_millis(10),
+			usage: None,
+			api_key_id: None,
+			per_key: false,
+		});
+	}
+
+	fn health_of(model: &str) -> Option<serde_json::Value> {
+		crate::health::snapshot()["models"]
+			.as_array()?
+			.iter()
+			.find(|m| m["model"] == model)
+			.cloned()
+	}
+
+	/// Only a job's outcome is a verdict on the model. A live job (202) and a
+	/// request refused for its own content (4xx) leave its status alone, so a
+	/// model whose every job fails reads as down instead of flapping back to up
+	/// on each accepted submit.
+	#[test]
+	fn media_health_counts_outcomes_only() {
+		media("m-media-outcomes", "accepted");
+		media("m-media-outcomes", "rejected");
+		assert!(health_of("m-media-outcomes").is_none());
+
+		media("m-media-outcomes", "failed");
+		media("m-media-outcomes", "accepted");
+		media("m-media-outcomes", "failed");
+		assert_eq!(health_of("m-media-outcomes").expect("recorded")["status"], "down");
+
+		media("m-media-outcomes", "ok");
+		assert_eq!(health_of("m-media-outcomes").expect("recorded")["status"], "up");
 	}
 }
