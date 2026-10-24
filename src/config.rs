@@ -100,6 +100,44 @@ pub struct MediaProviderConfig {
 	pub api_base: Option<String>,
 }
 
+/// The media endpoint families, as `[media_model_tasks]` names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaFamily {
+	Image,
+	Video,
+	Speech,
+	Transcription,
+}
+
+impl MediaFamily {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Image => "image",
+			Self::Video => "video",
+			Self::Speech => "speech",
+			Self::Transcription => "transcription",
+		}
+	}
+
+	/// The route that serves this family, named in the mismatch error so a
+	/// client learns where the model belongs.
+	pub fn endpoint(self) -> &'static str {
+		match self {
+			Self::Image => "POST /v1/images/generations",
+			Self::Video => "POST /v1/videos",
+			Self::Speech => "POST /v1/audio/speech",
+			Self::Transcription => "POST /v1/audio/transcriptions",
+		}
+	}
+}
+
+impl std::fmt::Display for MediaFamily {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
+
 /// The base-URL environment variable each octolib media adapter reads.
 pub const MEDIA_API_BASE_ENVS: &[(&str, &str)] = &[
 	("elevenlabs", "ELEVENLABS_API_URL"),
@@ -142,6 +180,14 @@ pub struct Config {
 	/// is octolib's (`media::reference_pricing`), so nothing else lives here.
 	#[serde(default)]
 	pub media_models: HashMap<String, Vec<String>>,
+	/// The endpoint family each `[media_models]` alias serves. Gateway adapters
+	/// such as fal accept any model on any route, so without this a music model
+	/// posted to `/v1/images/generations` is paid for upstream and its output
+	/// can never be read as an image. A declared alias is refused on every other
+	/// endpoint and described for its own task on `GET /v1/media/models`; an
+	/// alias left out is checked by neither.
+	#[serde(default)]
+	pub media_model_tasks: HashMap<String, MediaFamily>,
 	/// Evaluation model mappings — same shape and resolution as `models`.
 	/// Providers are octolib's evaluation adapters (`typesafe`, `cloudflare`);
 	/// pricing is octolib's, so nothing else lives here.
@@ -495,6 +541,7 @@ impl Config {
 			models: HashMap::new(),
 			embedding_models: HashMap::new(),
 			media_models: HashMap::new(),
+			media_model_tasks: HashMap::new(),
 			evaluation_models: HashMap::new(),
 			auto: HashMap::new(),
 			providers: HashMap::new(),
@@ -613,6 +660,11 @@ impl Config {
 						supported.join(", ")
 					);
 				}
+			}
+		}
+		for alias in self.media_model_tasks.keys() {
+			if !self.media_models.contains_key(alias) {
+				anyhow::bail!("[media_model_tasks].{} names no [media_models] alias", alias);
 			}
 		}
 		for name in self.media_providers.keys() {
@@ -790,6 +842,7 @@ mod tests {
 			models: HashMap::new(),
 			embedding_models: HashMap::new(),
 			media_models: HashMap::new(),
+			media_model_tasks: HashMap::new(),
 			evaluation_models: HashMap::new(),
 			auto: HashMap::new(),
 			providers,
@@ -812,6 +865,7 @@ mod tests {
 				.collect(),
 			embedding_models: HashMap::new(),
 			media_models: HashMap::new(),
+			media_model_tasks: HashMap::new(),
 			evaluation_models: HashMap::new(),
 			auto: auto.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
 			providers: HashMap::new(),
@@ -889,6 +943,7 @@ mod tests {
 			models,
 			embedding_models: HashMap::new(),
 			media_models: HashMap::new(),
+			media_model_tasks: HashMap::new(),
 			evaluation_models: HashMap::new(),
 			auto: HashMap::new(),
 			providers: HashMap::new(),
@@ -966,6 +1021,7 @@ mod tests {
 				.iter()
 				.map(|(k, v)| (k.to_string(), v.iter().map(|e| e.to_string()).collect::<Vec<_>>()))
 				.collect(),
+			media_model_tasks: HashMap::new(),
 			models: models
 				.iter()
 				.map(|(k, v)| (k.to_string(), vec![v.to_string()]))
@@ -1016,6 +1072,34 @@ mod tests {
 		assert!(c.validate_media().is_err());
 	}
 
+	/// A misspelt alias would leave the real one unchecked, so it fails at boot.
+	#[test]
+	fn media_model_tasks_parse_and_must_name_a_media_alias() {
+		let config: Config = toml::from_str(
+			r#"
+            [media_models]
+            music = ["fal:fal-ai/elevenlabs/music"]
+
+            [media_model_tasks]
+            music = "speech"
+            "#,
+		)
+		.unwrap();
+		assert!(config.validate_media().is_ok());
+		assert_eq!(config.media_model_tasks["music"], MediaFamily::Speech);
+
+		let mut c = media_config(&[("music", &["fal:fal-ai/elevenlabs/music"])], &[]);
+		c.media_model_tasks.insert("musik".to_string(), MediaFamily::Speech);
+		assert!(c
+			.validate_media()
+			.unwrap_err()
+			.to_string()
+			.contains("[media_model_tasks].musik"));
+
+		// Only the four endpoint families are valid values.
+		assert!(toml::from_str::<Config>("[media_model_tasks]\nmusic = \"music\"\n").is_err());
+	}
+
 	#[test]
 	fn evaluation_models_are_validated_like_media() {
 		fn base() -> Config {
@@ -1024,6 +1108,7 @@ mod tests {
 				models: HashMap::new(),
 				embedding_models: HashMap::new(),
 				media_models: HashMap::new(),
+				media_model_tasks: HashMap::new(),
 				evaluation_models: HashMap::new(),
 				auto: HashMap::new(),
 				providers: HashMap::new(),

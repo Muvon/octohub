@@ -1882,6 +1882,7 @@ mod tests {
 			models: HashMap::new(),
 			embedding_models: HashMap::new(),
 			media_models: HashMap::new(),
+			media_model_tasks: HashMap::new(),
 			evaluation_models: HashMap::new(),
 			auto: HashMap::new(),
 			providers,

@@ -757,6 +757,13 @@ fn classify_media_error(error: &anyhow::Error) -> (StatusCode, String, &'static 
 			"media_task_not_supported",
 		);
 	}
+	if let Some(mismatch) = error.downcast_ref::<crate::proxy::media::MediaFamilyMismatch>() {
+		return (
+			StatusCode::BAD_REQUEST,
+			mismatch.to_string(),
+			"media_task_not_supported",
+		);
+	}
 
 	let Some(media) = error.downcast_ref::<MediaError>() else {
 		// Not an octolib media failure — reuse the shared engine classifier so
