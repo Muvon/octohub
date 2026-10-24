@@ -757,13 +757,6 @@ fn classify_media_error(error: &anyhow::Error) -> (StatusCode, String, &'static 
 			"media_task_not_supported",
 		);
 	}
-	if let Some(mismatch) = error.downcast_ref::<crate::proxy::media::MediaFamilyMismatch>() {
-		return (
-			StatusCode::BAD_REQUEST,
-			mismatch.to_string(),
-			"media_task_not_supported",
-		);
-	}
 
 	let Some(media) = error.downcast_ref::<MediaError>() else {
 		// Not an octolib media failure — reuse the shared engine classifier so
@@ -835,17 +828,53 @@ fn media_error_response(error: &anyhow::Error) -> Response<BoxBody> {
 
 /// The metric label for a finished call. `terminal` is not the same as
 /// `succeeded` — a job that came back Failed or Expired must not land in the
-/// success bucket and drag its cost along with it.
-fn media_status_label(status: octolib::media::OperationStatus) -> &'static str {
-	use octolib::media::OperationStatus;
-	match status {
+/// success bucket and drag its cost along with it. A job the provider refused
+/// for its content is `rejected`: the prompt decided that, not the model.
+fn media_outcome_label(response: &crate::api::media_types::MediaResponse) -> &'static str {
+	use octolib::media::{GenerationFailure, OperationStatus};
+	match response.status {
 		OperationStatus::Succeeded => "ok",
+		OperationStatus::Failed
+			if response
+				.error
+				.clone()
+				.and_then(|error| serde_json::from_value::<GenerationFailure>(error).ok())
+				.is_some_and(|failure| refused_for_content(&failure.category)) =>
+		{
+			"rejected"
+		}
 		OperationStatus::Failed => "failed",
 		OperationStatus::Expired => "expired",
 		OperationStatus::Cancelled => "cancelled",
 		// Queued, Running, CancellationRequested — the caller got a 202.
 		_ => "accepted",
 	}
+}
+
+/// The metric label for a call that failed outright. Only a failure on the
+/// provider's side is evidence about the model, an upstream 4xx included: a
+/// request refused for its own shape or content, or refused by octohub before
+/// any provider saw it, is `rejected`.
+fn media_failure_label(error: &anyhow::Error) -> &'static str {
+	use octolib::media::MediaError;
+	match error.downcast_ref::<MediaError>() {
+		Some(
+			MediaError::InvalidModelFormat(_)
+			| MediaError::InvalidRequest(_)
+			| MediaError::SourceTooLarge { .. }
+			| MediaError::UnsupportedParameter { .. }
+			| MediaError::UnsupportedTask { .. },
+		) => "rejected",
+		Some(MediaError::RemoteFailure(failure)) if refused_for_content(&failure.category) => "rejected",
+		Some(_) => "error",
+		None if classify_media_error(error).0.is_client_error() => "rejected",
+		None => "error",
+	}
+}
+
+fn refused_for_content(category: &octolib::media::FailureCategory) -> bool {
+	use octolib::media::FailureCategory;
+	matches!(category, FailureCategory::ContentPolicy | FailureCategory::InvalidInput)
 }
 
 /// Render a media outcome: 200 when terminal, 202 while the job is still live.
@@ -893,7 +922,7 @@ async fn handle_media_create(
 				task: task_label,
 				model: &model_label,
 				provider: &outcome.response.provider,
-				status: media_status_label(outcome.response.status),
+				status: media_outcome_label(&outcome.response),
 				duration: outcome.upstream_duration,
 				usage: outcome.response.usage.as_ref(),
 				api_key_id: Some(api_key.id),
@@ -902,26 +931,19 @@ async fn handle_media_create(
 			media_outcome_response(outcome)
 		}
 		Err(e) => {
-			let response = media_error_response(&e);
 			crate::metrics::record_media(crate::metrics::MediaCall {
 				task: task_label,
 				model: &model_label,
 				// The call never reached an upstream, so there is no provider
 				// to attribute the failure to.
 				provider: "unknown",
-				// A request refused for its own content (a 4xx) says nothing
-				// about the model's health.
-				status: if response.status().is_client_error() {
-					"rejected"
-				} else {
-					"error"
-				},
+				status: media_failure_label(&e),
 				duration: std::time::Duration::ZERO,
 				usage: None,
 				api_key_id: Some(api_key.id),
 				per_key,
 			});
-			response
+			media_error_response(&e)
 		}
 	}
 }
@@ -1002,8 +1024,14 @@ pub async fn handle_media_get(
 					task: crate::proxy::media::task_family(outcome.response.task),
 					model: &outcome.alias,
 					provider: &outcome.response.provider,
-					status: media_status_label(outcome.response.status),
-					duration: outcome.upstream_duration,
+					status: media_outcome_label(&outcome.response),
+					// The job's own run time, not this one poll's round trip.
+					duration: std::time::Duration::from_secs(
+						outcome
+							.response
+							.completed_at
+							.map_or(0, |done| done.saturating_sub(outcome.response.created_at)),
+					),
 					usage: outcome.response.usage.as_ref(),
 					api_key_id: Some(api_key.id),
 					per_key: engine.config().metrics.per_key,
@@ -1108,6 +1136,37 @@ mod tests {
 	use crate::storage::sqlite::SqliteStorage;
 	use anyhow::Context;
 	use std::sync::RwLock;
+
+	/// Only a provider-side failure is evidence about the model: a route the
+	/// model does not serve or a prompt the provider's policy refuses is not,
+	/// while an upstream 4xx is — a model answering 404 to every submit is down.
+	#[test]
+	fn media_failures_count_against_the_model_only_when_the_provider_failed() {
+		use octolib::media::{FailureCategory, GenerationFailure, MediaError, MediaTask};
+		let refused = anyhow::anyhow!(MediaError::UnsupportedTask {
+			provider: "fal".to_string(),
+			model: "fal-ai/elevenlabs/music".to_string(),
+			task: MediaTask::TextToImage,
+		});
+		assert_eq!(media_failure_label(&refused), "rejected");
+
+		let policy = anyhow::anyhow!(MediaError::RemoteFailure(GenerationFailure {
+			category: FailureCategory::ContentPolicy,
+			message: "refused".to_string(),
+			provider_code: None,
+			http_status: None,
+			request_id: None,
+			provider_metadata: serde_json::Value::Null,
+		}));
+		assert_eq!(media_failure_label(&policy), "rejected");
+
+		let gone = anyhow::anyhow!(MediaError::Api {
+			provider: "fal".to_string(),
+			status: 404,
+			message: "application not found".to_string(),
+		});
+		assert_eq!(media_failure_label(&gone), "error");
+	}
 
 	fn models_engine() -> (Arc<ProxyEngine>, crate::Live<Config>) {
 		let config: Config = toml::from_str(

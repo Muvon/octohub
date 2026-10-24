@@ -11,7 +11,6 @@
 //! from `media::reference_pricing` and report it on `MediaUsage`; OctoHub reads
 //! `best_available_cost()` and records it, exactly as it does for completions.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -24,7 +23,7 @@ use octolib::media::{
 use uuid::Uuid;
 
 use crate::api::media_types::*;
-use crate::config::{Config, MediaFamily};
+use crate::config::Config;
 use crate::proxy::engine::{ensure_model_allowed, is_provider_fault, pick_admitted, ProxyEngine};
 use crate::storage::{ApiKey, StoredMedia};
 
@@ -75,20 +74,15 @@ impl MediaRequest {
 		&self.common().model
 	}
 
-	/// The endpoint family this request arrived on.
-	fn family(&self) -> MediaFamily {
-		match self {
-			Self::Image(_) => MediaFamily::Image,
-			Self::Video(_) => MediaFamily::Video,
-			Self::Speech(_) => MediaFamily::Speech,
-			Self::Transcription(_) => MediaFamily::Transcription,
-		}
-	}
-
 	/// Coarse task label for metrics. Deliberately the endpoint's task family
 	/// rather than the exact `MediaTask`, to keep label cardinality bounded.
 	pub fn task_label(&self) -> &'static str {
-		self.family().as_str()
+		match self {
+			Self::Image(_) => "image",
+			Self::Video(_) => "video",
+			Self::Speech(_) => "speech",
+			Self::Transcription(_) => "transcription",
+		}
 	}
 
 	/// The request as persisted: identical to what the client sent, minus any
@@ -302,7 +296,6 @@ impl ProxyEngine {
 		let task = request.task()?;
 
 		ensure_model_allowed(api_key, &input_model)?;
-		ensure_family(&config.media_model_tasks, &input_model, request.family())?;
 		reject_reserved_options(&common.provider_options).map_err(bad_request)?;
 
 		// Held for the whole request — submit, wait and persist — so a tenant's
@@ -496,7 +489,7 @@ impl ProxyEngine {
 				let Some((provider, model)) = entry.split_once(':') else {
 					continue;
 				};
-				let descriptor = describe(provider, model, config.media_model_tasks.get(alias).copied());
+				let descriptor = describe(provider, model);
 				let price = octolib::media::get_reference_pricing(provider, model).map(|p| {
 					serde_json::json!({
 						"unit": p.unit,
@@ -840,63 +833,14 @@ async fn cancel_once(provider_name: &str, handle: &JobHandle) -> Result<()> {
 	}
 }
 
-/// Describe a configured model for the family its alias serves. An undeclared
-/// alias is probed through the image trait, which every adapter implements —
-/// so a gateway adapter such as fal reads every undeclared model as image.
-fn describe(provider: &str, model: &str, family: Option<MediaFamily>) -> serde_json::Value {
-	let descriptor =
-		match family.unwrap_or(MediaFamily::Image) {
-			MediaFamily::Image => MediaProviderFactory::create_image_provider(provider)
-				.map(|a| serde_json::to_value(a.capabilities(model))),
-			MediaFamily::Video => MediaProviderFactory::create_video_provider(provider)
-				.map(|a| serde_json::to_value(a.capabilities(model))),
-			MediaFamily::Speech => MediaProviderFactory::create_speech_provider(provider)
-				.map(|a| serde_json::to_value(a.capabilities(model))),
-			MediaFamily::Transcription => MediaProviderFactory::create_transcription_provider(provider)
-				.map(|a| serde_json::to_value(a.capabilities(model))),
-		};
-	match descriptor {
-		Ok(Ok(value)) => value,
-		_ => serde_json::Value::Null,
+fn describe(provider: &str, model: &str) -> serde_json::Value {
+	// Any of the four traits answers `capabilities` for the same model; image
+	// is used as the probe because every adapter implements it.
+	match MediaProviderFactory::create_image_provider(provider) {
+		Ok(adapter) => serde_json::to_value(adapter.capabilities(model)).unwrap_or(serde_json::Value::Null),
+		Err(_) => serde_json::Value::Null,
 	}
 }
-
-/// Refuse a declared alias on another family's endpoint before anything is
-/// submitted: the upstream would bill the job, and its output could never be
-/// read back as this endpoint's media.
-fn ensure_family(tasks: &HashMap<String, MediaFamily>, alias: &str, requested: MediaFamily) -> Result<()> {
-	match tasks.get(alias) {
-		Some(&serves) if serves != requested => Err(anyhow!(MediaFamilyMismatch {
-			alias: alias.to_string(),
-			serves,
-			requested,
-		})),
-		_ => Ok(()),
-	}
-}
-
-/// `[media_model_tasks]` declares this alias for another endpoint family.
-#[derive(Debug)]
-pub struct MediaFamilyMismatch {
-	pub alias: String,
-	pub serves: MediaFamily,
-	pub requested: MediaFamily,
-}
-
-impl std::fmt::Display for MediaFamilyMismatch {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(
-			f,
-			"media model '{}' makes {}, not {}; send it to {}",
-			self.alias,
-			self.serves,
-			self.requested,
-			self.serves.endpoint()
-		)
-	}
-}
-
-impl std::error::Error for MediaFamilyMismatch {}
 
 fn image_provider(name: &str, model: &str) -> Result<Box<dyn ImageGenerationProvider>> {
 	let provider = MediaProviderFactory::create_image_provider(name).map_err(media_error)?;
@@ -1178,33 +1122,5 @@ mod tests {
 			serde_json::from_value(stored["artifacts"].clone()).expect("artifacts decode");
 		assert_eq!(artifacts.len(), 1);
 		assert_eq!(artifacts[0].media_type, "image/png");
-	}
-
-	/// The prod case (2026-10-23): a music model posted to the image endpoint was
-	/// billed upstream and could never be read back. A declared alias is refused
-	/// on every other endpoint; an undeclared one is left alone.
-	#[test]
-	fn a_declared_alias_is_refused_on_another_family_endpoint() {
-		let tasks = HashMap::from([("eleven-music".to_string(), MediaFamily::Speech)]);
-
-		let error = ensure_family(&tasks, "eleven-music", MediaFamily::Image).unwrap_err();
-		let mismatch = error.downcast_ref::<MediaFamilyMismatch>().expect("typed mismatch");
-		assert_eq!(mismatch.serves, MediaFamily::Speech);
-		assert!(error.to_string().contains("POST /v1/audio/speech"), "{error}");
-
-		assert!(ensure_family(&tasks, "eleven-music", MediaFamily::Speech).is_ok());
-		assert!(ensure_family(&tasks, "flux", MediaFamily::Image).is_ok());
-		assert!(ensure_family(&tasks, "fal:fal-ai/flux/dev", MediaFamily::Video).is_ok());
-	}
-
-	/// fal serves any model on any trait, so the declared family is what makes
-	/// a video model describe itself as video.
-	#[test]
-	fn describe_uses_the_declared_family() {
-		let video = describe("fal", "bytedance/seedance-2.0/text-to-video", Some(MediaFamily::Video));
-		assert_eq!(video["tasks"], serde_json::json!(["text_to_video"]));
-
-		let undeclared = describe("fal", "bytedance/seedance-2.0/text-to-video", None);
-		assert_eq!(undeclared["tasks"], serde_json::json!(["text_to_image"]));
 	}
 }
