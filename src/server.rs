@@ -218,8 +218,10 @@ mod tests {
 		loop {
 			match TcpStream::connect(addr).await {
 				Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return,
-				Err(e) => panic!("unexpected connect error: {e}"),
-				Ok(_) => {
+				// Linux resets a connect that was queued in the backlog as the
+				// listener closed: it raced the close too.
+				Err(e) if e.kind() != std::io::ErrorKind::ConnectionReset => panic!("unexpected connect error: {e}"),
+				_ => {
 					assert!(Instant::now() < deadline, "listener still accepting after shutdown");
 					tokio::time::sleep(Duration::from_millis(5)).await;
 				}
