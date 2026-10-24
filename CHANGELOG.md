@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.13.2] - 2026-10-24
+
+### 📋 Release Summary
+
+Media-family models can now be routed through the appropriate media path, with media health recorded from terminal outcomes and corrected media error metrics. Server shutdown now tolerates connection resets during races.
+
+### 🚨 Breaking Changes
+
+- **media**: correct media routing and error metrics `37c97470`
+
+### ✨ New Features & Enhancements
+
+- **media**: support media-family model routing `679ce993`
+
+### 🔧 Improvements & Optimizations
+
+- **server**: gate drain connection test on Unix `8fb3d6bb`
+- **dependencies**: update octolib to 0.45.3 `9985741e`
+
+### 🐛 Bug Fixes & Stability
+
+- **server**: allow connection resets during shutdown race `4af05548`
+- **media**: record media health from terminal outcomes `a894aeed`
+
+### 📚 Documentation & Examples
+
+- **media**: document media health and outcome handling `2ce03ebb`
+
 ## [0.13.1] - 2026-10-24
 
 ### 🔧 Improvements & Optimizations
