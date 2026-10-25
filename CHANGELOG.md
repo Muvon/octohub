@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.14.0] - 2026-10-25
+
+### 📋 Release Summary
+
+Configurable model routing strategies are now supported.
+
+### ✨ New Features & Enhancements
+
+- **proxy**: support configurable model routing strategies `8c718a2d`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib to 0.45.5 `f93f0d3c`
+- **release**: upgrade release Rust toolchain `dd10c4ca`
+
 ## [0.13.2] - 2026-10-24
 
 ### 📋 Release Summary
