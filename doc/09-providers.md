@@ -258,6 +258,39 @@ remaining candidates, and `provider_error_cooldown_secs` to
 deprioritize repeatedly-failing providers — see
 [failover and cooldown](#failover-and-cooldown-server-knobs-both-off-by-default).
 
+### Ordered aliases (`[routing]`)
+
+An alias can name a primary and its fallbacks instead of spreading load:
+
+```toml
+[models]
+"mimo-v2.6-flash" = ["xiaomi:mimo-v2.6-flash", "openrouter:xiaomi/mimo-v2.6-flash"]
+
+[routing]
+default = "rotate"                 # every alias not listed below (the default)
+
+[routing.models]
+"mimo-v2.6-flash" = "ordered"
+```
+
+For an `ordered` alias:
+
+- A **new** conversation takes the first lane, in list order, that can serve
+  it now. Lanes with every `concurrency` permit in use, an exhausted rate
+  window, or an error cooldown move behind the rest. When every lane is busy
+  the first one still takes the request, and it queues there.
+- A **continuing** conversation (`previous_completion_id`) stays on the
+  provider that served its last turn, busy or not, because the prompt cache
+  lives there. It moves only when that provider's rate windows are exhausted
+  or the call fails.
+- A **provider-side** failure (the same set `failover_on_error` reacts to:
+  timeout, connect, 401/403, 404, 429, 5xx) re-sends the request to the next
+  lane even when `failover_on_error` is off. The conversation then continues
+  on that lane. A 400 never fails over.
+
+Every `[routing.models]` key must be a `[models]` alias; an unknown key or
+strategy fails the config at load. Rotating aliases behave exactly as above.
+
 ## Adding a new provider
 
 OctoHub itself is provider-agnostic. To add a new provider, you add it

@@ -53,6 +53,15 @@ impl ProviderLimiter {
 		sem.clone().acquire_owned().await.ok()
 	}
 
+	/// Whether every concurrency permit of `provider` is in use right now, so a
+	/// request sent there would queue. Unlimited providers never are. A snapshot,
+	/// not a reservation: the permit can be taken before the caller acquires it.
+	pub fn is_saturated(&self, provider: &str) -> bool {
+		self.semaphores
+			.get(&provider.to_ascii_lowercase())
+			.is_some_and(|(_, sem)| sem.available_permits() == 0)
+	}
+
 	/// Snapshot of all configured providers: (name, available_permits, configured_max).
 	pub fn snapshot(&self) -> Vec<(String, usize, usize)> {
 		self.semaphores
@@ -391,6 +400,7 @@ mod tests {
 			metrics: Default::default(),
 			media: Default::default(),
 			media_providers: HashMap::new(),
+			routing: Default::default(),
 		};
 		ProviderLimiter::from_config(&config)
 	}
@@ -407,6 +417,21 @@ mod tests {
 		let limiter = limiter_with("ollama", 1);
 		let permit = limiter.acquire("OLLAMA").await;
 		assert!(permit.is_some());
+	}
+
+	#[tokio::test]
+	async fn saturation_reads_free_permits_without_taking_one() {
+		let limiter = limiter_with("xiaomi", 1);
+		assert!(!limiter.is_saturated("xiaomi"));
+		assert!(!limiter.is_saturated("xiaomi"), "checking must not consume the permit");
+		let held = limiter.acquire("XIAOMI").await;
+		assert!(limiter.is_saturated("Xiaomi"), "case-insensitive like acquire");
+		drop(held);
+		assert!(!limiter.is_saturated("xiaomi"));
+		assert!(
+			!limiter.is_saturated("openrouter"),
+			"an unlimited provider is never full"
+		);
 	}
 
 	#[tokio::test]

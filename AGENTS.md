@@ -101,6 +101,7 @@ Use existing handler authentication, parsing, filtering, and error helpers when 
 | `server.shutdown_timeout_secs` | `900` (SIGTERM drain bound; must be > 0 and cover owner queue + attempts × (provider queue + upstream)) |
 | `server.failover_on_error` | `false` |
 | `server.provider_error_cooldown_secs` | `0` (disabled) |
+| `routing.default` | `rotate` (`ordered` per alias in `[routing.models]`: first available lane, fails over on provider faults) |
 | `logging.format` | `auto` |
 | `metrics.enabled`, `metrics.bind`, `metrics.per_key` | `true`, `127.0.0.1:9090`, `false` |
 | `media.max_source_bytes`, `media.max_response_bytes` | 20 MiB, 100 MiB |

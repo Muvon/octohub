@@ -16,7 +16,7 @@ use octolib::llm::{
 use uuid::Uuid;
 
 use crate::api::types::*;
-use crate::config::Config;
+use crate::config::{Config, LaneStrategy};
 use crate::proxy::limiter::{OwnerLimiter, ProviderHealth, ProviderLimiter, ProviderRateTracker};
 use crate::storage::{ApiKey, Storage, StoredCompletion, StoredEmbedding};
 
@@ -549,8 +549,9 @@ impl ProxyEngine {
 		//    provider is preferred (provider-side prompt caches are per
 		//    provider); candidates whose rate windows are exhausted are
 		//    skipped; all exhausted → 429 with Retry-After (`pick_admitted`).
-		//    With `failover_on_error`, a provider-side failure moves to the
-		//    next candidate instead of surfacing to the client.
+		//    With `failover_on_error` — or on an `ordered` alias, whose list
+		//    names its fallbacks — a provider-side failure moves to the next
+		//    candidate instead of surfacing to the client.
 		let owner_credentials = match api_key.owner.clone() {
 			Some(owner) => {
 				let credentials = self.credentials.clone();
@@ -564,14 +565,26 @@ impl ProxyEngine {
 			Vec::new()
 		};
 		let byok = !byok_candidates.is_empty();
+		let strategy = config.lane_strategy(&routed_model);
 		let mut candidates = if byok {
 			byok_candidates
 		} else {
-			let mut candidates = config
-				.model_candidates(&routed_model)
-				.with_context(|| format!("Failed to resolve model '{}'", routed_model))?;
-			if let Some(ref sticky) = sticky_provider {
-				prefer_provider(&mut candidates, sticky);
+			let mut candidates = match strategy {
+				LaneStrategy::Rotate => config.model_candidates(&routed_model),
+				LaneStrategy::Ordered => config.ordered_model_candidates(&routed_model),
+			}
+			.with_context(|| format!("Failed to resolve model '{}'", routed_model))?;
+			let continuing = sticky_provider
+				.as_deref()
+				.filter(|sticky| candidates.iter().any(|(p, _)| p.eq_ignore_ascii_case(sticky)));
+			match continuing {
+				Some(sticky) => prefer_provider(&mut candidates, sticky),
+				// A new conversation on an ordered alias takes the first lane with
+				// a free slot instead of queueing behind a busy primary. A
+				// continuing one keeps its lane and waits for it, since its prompt
+				// cache lives there.
+				None if strategy == LaneStrategy::Ordered => deprioritize_saturated(&mut candidates, &limiter),
+				None => {}
 			}
 			candidates
 		};
@@ -821,7 +834,10 @@ impl ProxyEngine {
 					// The failed provider is out for THIS request either way —
 					// never re-picked within one failover loop.
 					candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
-					if !(config.server.failover_on_error && provider_fault) || candidates.is_empty() {
+					// An ordered alias's list names its fallbacks, so its lanes fail
+					// over even where the deployment leaves failover off.
+					let failover = config.server.failover_on_error || strategy == LaneStrategy::Ordered;
+					if !(failover && provider_fault) || candidates.is_empty() {
 						return Err(err);
 					}
 					crate::metrics::record_failover(&provider_name);
@@ -1695,6 +1711,13 @@ fn prefer_provider(candidates: &mut [(String, String)], provider: &str) {
 	candidates.sort_by_key(|(p, _)| !p.eq_ignore_ascii_case(provider));
 }
 
+/// Move lanes whose concurrency is full behind the rest (stable, so list order
+/// holds within each group). Deprioritized, not removed: when every lane is
+/// busy the first one still takes the request and it queues there.
+fn deprioritize_saturated(candidates: &mut [(String, String)], limiter: &ProviderLimiter) {
+	candidates.sort_by_key(|(provider, _)| limiter.is_saturated(provider));
+}
+
 /// After a modality mismatch, only another host for the same resolved model is
 /// a valid failover. A different model under the alias must never receive the
 /// request implicitly.
@@ -1889,6 +1912,7 @@ mod tests {
 			metrics: Default::default(),
 			media: Default::default(),
 			media_providers: HashMap::new(),
+			routing: Default::default(),
 		}
 	}
 
@@ -2147,6 +2171,40 @@ mod tests {
 		// Turn 2: sticky provider's window exhausted — fall through, don't fail.
 		let picked = pick(&tracker, &config, candidates, "m").unwrap();
 		assert_eq!(picked.0, "openai");
+	}
+
+	#[tokio::test]
+	async fn saturated_lanes_move_behind_free_ones_in_list_order() {
+		let config = config_with_provider(
+			"xiaomi",
+			ProviderConfig {
+				concurrency: Some(1),
+				..Default::default()
+			},
+		);
+		let limiter = ProviderLimiter::from_config(&config);
+		let ordered = vec![
+			candidate("xiaomi", "m"),
+			candidate("openrouter", "m"),
+			candidate("groq", "m"),
+		];
+
+		let mut free = ordered.clone();
+		deprioritize_saturated(&mut free, &limiter);
+		assert_eq!(free, ordered, "a lane with a free slot keeps its priority");
+
+		let _busy = limiter.acquire("xiaomi").await;
+		let mut busy = ordered.clone();
+		deprioritize_saturated(&mut busy, &limiter);
+		assert_eq!(
+			busy,
+			vec![
+				candidate("openrouter", "m"),
+				candidate("groq", "m"),
+				candidate("xiaomi", "m")
+			],
+			"a full primary goes last, the rest keep list order"
+		);
 	}
 
 	#[test]
@@ -2886,6 +2944,117 @@ mod byok_tests {
 			.await
 			.unwrap();
 		assert!(response.usage.byok.is_none());
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn ordered_alias_prefers_its_first_lane_fails_over_and_keeps_the_session() {
+		use http_body_util::{BodyExt, Full};
+		use hyper::service::service_fn;
+		use hyper_util::rt::TokioIo;
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let upstream = Arc::new(Mutex::new(Upstream::default()));
+		let state = upstream.clone();
+		let server = tokio::spawn(async move {
+			loop {
+				let (socket, _) = listener.accept().await.unwrap();
+				let state = state.clone();
+				tokio::spawn(async move {
+					hyper::server::conn::http1::Builder::new()
+						.serve_connection(
+							TokioIo::new(socket),
+							service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+								let state = state.clone();
+								async move {
+									let path = req.uri().path().to_owned();
+									req.collect().await.unwrap();
+									let status = {
+										let mut state = state.lock().unwrap();
+										state.requests.push((path.clone(), String::new()));
+										state.statuses.get(&path).copied().unwrap_or(200)
+									};
+									let body = if status == 200 {
+										serde_json::json!({"id":"mock", "object":"chat.completion", "created":1_700_000_000, "model":"m", "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+											"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":0.01}})
+									} else {
+										serde_json::json!({"error":{"message":"rejected"}})
+									};
+									Ok::<_, std::convert::Infallible>(
+										hyper::Response::builder()
+											.status(status)
+											.header("content-type", "application/json")
+											.body(Full::new(bytes::Bytes::from(body.to_string())))
+											.unwrap(),
+									)
+								}
+							}),
+						)
+						.await
+						.unwrap();
+				});
+			}
+		});
+		// groq/fireworks: providers no other engine test points at a mock, so the
+		// process-wide env this sets cannot race a parallel test.
+		let _env = EnvGuard::set(&[
+			("GROQ_API_URL", format!("http://{address}/primary")),
+			("FIREWORKS_API_URL", format!("http://{address}/fallback")),
+			("GROQ_API_KEY", "primary-key".into()),
+			("FIREWORKS_API_KEY", "fallback-key".into()),
+		]);
+		let config: Config = toml::from_str(
+			r#"
+            [server]
+            api_key = "master"
+            failover_on_error = false
+            [models]
+            face = ["groq:m", "fireworks:m"]
+            [routing.models]
+            face = "ordered"
+        "#,
+		)
+		.unwrap();
+		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		let key = storage.create_api_key("key", None, None, None).unwrap();
+		let encryption_key = base64::engine::general_purpose::STANDARD.encode([1; 32]);
+		let credentials = Arc::new(Credentials::new(storage.clone(), Some(&encryption_key)).unwrap());
+		let limiter = Arc::new(RwLock::new(Arc::new(ProviderLimiter::from_config(&config))));
+		let config = Arc::new(RwLock::new(Arc::new(config)));
+		let engine = ProxyEngine::new(storage, config, limiter, 1, credentials);
+		let paths = || -> Vec<String> {
+			let mut state = upstream.lock().unwrap();
+			state.requests.drain(..).map(|(path, _)| path).collect()
+		};
+
+		// New conversations always start on the first lane; rotation would put
+		// one of eight on the fallback with probability 1 - 2^-8.
+		for _ in 0..8 {
+			engine.process(request("face", None), &key, None, None).await.unwrap();
+		}
+		assert_eq!(paths(), vec!["/primary"; 8]);
+
+		// The primary cannot serve (revoked key): the same call moves on, with
+		// failover_on_error off.
+		upstream.lock().unwrap().statuses.insert("/primary".into(), 401);
+		let (moved, _) = engine.process(request("face", None), &key, None, None).await.unwrap();
+		assert_eq!(paths(), vec!["/primary", "/fallback"]);
+
+		// Once the primary recovers, the moved conversation stays where its cache
+		// is, and a new one goes back to the primary.
+		upstream.lock().unwrap().statuses.clear();
+		engine
+			.process(request("face", Some(&moved.id)), &key, None, None)
+			.await
+			.unwrap();
+		assert_eq!(paths(), vec!["/fallback"]);
+		engine.process(request("face", None), &key, None, None).await.unwrap();
+		assert_eq!(paths(), vec!["/primary"]);
+
+		// A 400 is the request's own fault: no lane would take it, so no failover.
+		upstream.lock().unwrap().statuses.insert("/primary".into(), 400);
+		assert!(engine.process(request("face", None), &key, None, None).await.is_err());
+		assert_eq!(paths(), vec!["/primary"]);
 		server.abort();
 	}
 }

@@ -290,6 +290,12 @@ per_key = false
 # Self-hosted with a local model
 "local-llama" = ["ollama:llama3.3:70b-instruct-q5_K_M"]
 
+# Primary + fallback instead of a random pick (see 09 — Providers, "Ordered aliases")
+"my-primary" = ["anthropic:claude-opus-4-1", "openai:gpt-5"]
+
+[routing.models]
+"my-primary" = "ordered"
+
 [embedding_models]
 "voyage" = ["voyage:voyage-4"]
 

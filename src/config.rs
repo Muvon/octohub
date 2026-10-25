@@ -176,6 +176,9 @@ pub struct Config {
 	/// Per-adapter media endpoint overrides, keyed by octolib provider name.
 	#[serde(default)]
 	pub media_providers: HashMap<String, MediaProviderConfig>,
+	/// Lane strategy per `[models]` alias (rotate by default).
+	#[serde(default)]
+	pub routing: RoutingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,6 +277,34 @@ impl ProviderConfig {
 	}
 }
 
+/// How a `[models]` alias orders its lanes. Either way a request that
+/// continues a chain goes back to the lane that served it first, where its
+/// provider-side prompt cache lives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaneStrategy {
+	/// Start at a random lane so load spreads across mirrors.
+	#[default]
+	Rotate,
+	/// The list is a priority: a new conversation takes the first lane that
+	/// can serve it now — not cooling, rate windows open, a free concurrency
+	/// slot — and a provider-side failure moves the request to the next lane
+	/// even without `failover_on_error`.
+	Ordered,
+}
+
+/// `[routing]`: which [`LaneStrategy`] each `[models]` alias uses.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingConfig {
+	/// Strategy for every alias not listed in `models`.
+	#[serde(default)]
+	pub default: LaneStrategy,
+	/// Per-alias overrides; every key must be a `[models]` alias.
+	#[serde(default)]
+	pub models: HashMap<String, LaneStrategy>,
+}
+
 fn default_host() -> String {
 	"127.0.0.1".to_string()
 }
@@ -367,6 +398,7 @@ impl Config {
 			config.validate_auto()?;
 			config.validate_media()?;
 			config.validate_evaluation()?;
+			config.validate_routing()?;
 			// Override with environment variables if set
 			if let Ok(master_key) = env::var("OCTOHUB_MASTER_KEY") {
 				config.server.api_key = master_key;
@@ -391,6 +423,22 @@ impl Config {
 	/// (probably unknown) model name — old behavior, untouched.
 	pub fn is_auto(&self, model: &str) -> bool {
 		!self.auto.is_empty() && model == AUTO_MODEL
+	}
+
+	/// The lane strategy `[routing]` gives a `[models]` alias.
+	pub fn lane_strategy(&self, model: &str) -> LaneStrategy {
+		self.routing.models.get(model).copied().unwrap_or(self.routing.default)
+	}
+
+	/// Fail at load on a `[routing.models]` key that names no `[models]` alias —
+	/// a typo would otherwise leave that alias silently rotating.
+	fn validate_routing(&self) -> Result<()> {
+		for alias in self.routing.models.keys() {
+			if !self.models.contains_key(alias) {
+				anyhow::bail!("[routing.models].{} is not defined in [models]", alias);
+			}
+		}
+		Ok(())
 	}
 
 	/// Fail loudly at load on an `[auto]` section that cannot work. Every value
@@ -502,6 +550,7 @@ impl Config {
 			metrics: MetricsConfig::default(),
 			media: MediaConfig::default(),
 			media_providers: HashMap::new(),
+			routing: RoutingConfig::default(),
 		};
 		apply_server_overrides(&mut config.server, |name| env::var(name).ok())?;
 		Self::apply_env_overrides(&mut config);
@@ -741,6 +790,67 @@ mod tests {
 	}
 
 	#[test]
+	fn routing_strategy_defaults_to_rotate_and_overrides_per_alias() {
+		let config: Config = toml::from_str(
+			r#"
+            [server]
+            api_key = ""
+            [models]
+            mimo = ["xiaomi:mimo-v2.6-flash", "openrouter:xiaomi/mimo-v2.6-flash"]
+            glm = ["zai:glm-5.3", "ollama:glm-5.3"]
+            [routing.models]
+            mimo = "ordered"
+            "#,
+		)
+		.unwrap();
+		assert!(config.validate_routing().is_ok());
+		assert_eq!(config.lane_strategy("mimo"), LaneStrategy::Ordered);
+		assert_eq!(config.lane_strategy("glm"), LaneStrategy::Rotate);
+		assert_eq!(config.lane_strategy("unlisted"), LaneStrategy::Rotate);
+		assert_eq!(
+			config.ordered_model_candidates("mimo").unwrap()[0],
+			("xiaomi".to_string(), "mimo-v2.6-flash".to_string()),
+			"ordered candidates start at the first lane"
+		);
+
+		let flipped: Config = toml::from_str(
+			r#"
+            [server]
+            api_key = ""
+            [models]
+            glm = ["zai:glm-5.3"]
+            [routing]
+            default = "ordered"
+            [routing.models]
+            glm = "rotate"
+            "#,
+		)
+		.unwrap();
+		assert_eq!(flipped.lane_strategy("other"), LaneStrategy::Ordered);
+		assert_eq!(flipped.lane_strategy("glm"), LaneStrategy::Rotate);
+	}
+
+	#[test]
+	fn routing_rejects_unknown_strategies_keys_and_aliases() {
+		for bad in [
+			"[routing.models]\nmimo = \"primary\"",
+			"[routing]\nstrategy = \"ordered\"",
+		] {
+			let toml = format!("[server]\napi_key = \"\"\n[models]\nmimo = [\"xiaomi:m\"]\n{bad}\n");
+			assert!(toml::from_str::<Config>(&toml).is_err(), "accepted: {bad}");
+		}
+		let typo: Config = toml::from_str(
+			"[server]\napi_key = \"\"\n[models]\nmimo = [\"xiaomi:m\"]\n[routing.models]\nmim0 = \"ordered\"\n",
+		)
+		.unwrap();
+		assert!(typo
+			.validate_routing()
+			.unwrap_err()
+			.to_string()
+			.contains("[routing.models].mim0"));
+	}
+
+	#[test]
 	fn provider_rate_limits_deserialize_from_toml() {
 		let config: Config = toml::from_str(
 			r#"
@@ -797,6 +907,7 @@ mod tests {
 			metrics: Default::default(),
 			media: Default::default(),
 			media_providers: HashMap::new(),
+			routing: RoutingConfig::default(),
 		};
 		assert!(config.provider_config("openai").is_some());
 		assert!(config.provider_config("OPENAI").is_some());
@@ -819,6 +930,7 @@ mod tests {
 			metrics: Default::default(),
 			media: Default::default(),
 			media_providers: HashMap::new(),
+			routing: RoutingConfig::default(),
 		}
 	}
 
@@ -896,6 +1008,7 @@ mod tests {
 			metrics: Default::default(),
 			media: Default::default(),
 			media_providers: HashMap::new(),
+			routing: RoutingConfig::default(),
 		};
 
 		let mut candidates = config.model_candidates("fast").unwrap();
@@ -979,6 +1092,7 @@ mod tests {
 			metrics: Default::default(),
 			media: Default::default(),
 			media_providers: HashMap::new(),
+			routing: RoutingConfig::default(),
 		}
 	}
 
@@ -1031,6 +1145,7 @@ mod tests {
 				metrics: Default::default(),
 				media: Default::default(),
 				media_providers: HashMap::new(),
+				routing: RoutingConfig::default(),
 			}
 		}
 
