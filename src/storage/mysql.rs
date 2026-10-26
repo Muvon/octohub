@@ -205,7 +205,7 @@ fn read_api_key_masked(row: mysql::Row) -> ApiKey {
 		key: String::new(),
 		key_hint: row.get("key_hint").unwrap_or_default(),
 		status: row.get("status").unwrap_or_default(),
-		allowed_models: decode_allowed_models(row.get("allowed_models")),
+		allowed_models: decode_allowed_models(row.get("allowed_models").unwrap_or_default()),
 		owner: row.get("owner").unwrap_or_default(),
 		owner_concurrency: row.get("owner_concurrency").unwrap_or_default(),
 		created_at: row.get("created_at").unwrap_or_default(),
@@ -500,7 +500,7 @@ impl Storage for MysqlStorage {
 			key: r.get("key").unwrap_or_default(),
 			key_hint: r.get("key_hint").unwrap_or_default(),
 			status: r.get("status").unwrap_or_default(),
-			allowed_models: decode_allowed_models(r.get("allowed_models")),
+			allowed_models: decode_allowed_models(r.get("allowed_models").unwrap_or_default()),
 			owner: r.get("owner").unwrap_or_default(),
 			owner_concurrency: r.get("owner_concurrency").unwrap_or_default(),
 			created_at: r.get("created_at").unwrap_or_default(),
@@ -911,5 +911,42 @@ impl Storage for MysqlStorage {
 
 		results.sort_by(|a, b| a.period.cmp(&b.period).then(a.key_id.cmp(&b.key_id)));
 		Ok(results)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Needs a real MySQL: `OCTOHUB_TEST_MYSQL_URL=mysql://user:pass@host/db`. Skipped when unset.
+	fn storage() -> Option<MysqlStorage> {
+		let url = std::env::var("OCTOHUB_TEST_MYSQL_URL").ok()?;
+		Some(MysqlStorage::new(&url).expect("OCTOHUB_TEST_MYSQL_URL must reach a MySQL server"))
+	}
+
+	#[test]
+	fn unrestricted_key_authenticates_and_lists() {
+		let Some(storage) = storage() else {
+			eprintln!("skipped: OCTOHUB_TEST_MYSQL_URL is not set");
+			return;
+		};
+		let open = storage.create_api_key("unrestricted", None, None, None).unwrap();
+		let found = storage
+			.get_api_key_by_key(&open.key)
+			.unwrap()
+			.expect("unrestricted key not found");
+		assert_eq!(found.allowed_models, None);
+		assert_eq!(found.owner, None);
+		assert_eq!(found.owner_concurrency, None);
+		assert_eq!(storage.get_api_key(open.id).unwrap().unwrap().allowed_models, None);
+		assert!(storage.list_api_keys().unwrap().iter().any(|k| k.id == open.id));
+
+		let locked = storage.create_api_key("locked", Some(&[][..]), None, None).unwrap();
+		let found = storage.get_api_key_by_key(&locked.key).unwrap().unwrap();
+		assert_eq!(
+			found.allowed_models,
+			Some(vec![]),
+			"an empty list stays an explicit lockout"
+		);
 	}
 }
