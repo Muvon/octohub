@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.2] - 2026-10-26
+
+### 📋 Release Summary
+
+MySQL now correctly handles nullable allowed model values.
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update locked dependency versions `8aaac181`
+
+### 🐛 Bug Fixes & Stability
+
+- **mysql**: handle nullable allowed model values `b3ae7e35`
+
 ## [0.14.1] - 2026-10-26
 
 ### 📋 Release Summary
