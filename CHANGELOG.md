@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.1] - 2026-10-26
+
+### 📋 Release Summary
+
+Media routing failover now follows the configured order.
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: upgrade octolib to 0.46.0 `5f0836ee`
+
+### 🐛 Bug Fixes & Stability
+
+- **media**: support ordered media routing failover `0d5ef328`
+
 ## [0.14.0] - 2026-10-25
 
 ### 📋 Release Summary
