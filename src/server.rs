@@ -172,10 +172,11 @@ mod tests {
 
 	const REQUEST: &[u8] = b"GET /slow HTTP/1.1\r\nHost: octohub\r\n\r\n";
 
-	/// A handler that signals `started`, waits `delay`, then answers `done`.
-	fn slow_handler(
+	/// A handler that signals `started`, then answers `done` once `release` is
+	/// notified: the test, not a timer, decides when the request ends.
+	fn gated_handler(
 		started: Arc<Notify>,
-		delay: Duration,
+		release: Arc<Notify>,
 	) -> impl Fn(Request<Incoming>, SocketAddr) -> std::pin::Pin<Box<dyn Future<Output = Response<BoxBody>> + Send>>
 	       + Clone
 	       + Send
@@ -183,9 +184,10 @@ mod tests {
 	       + 'static {
 		move |_req, _remote| {
 			let started = started.clone();
+			let release = release.clone();
 			Box::pin(async move {
 				started.notify_one();
-				tokio::time::sleep(delay).await;
+				release.notified().await;
 				Response::new(Full::new(Bytes::from_static(b"done")))
 			})
 		}
@@ -231,14 +233,14 @@ mod tests {
 	}
 
 	// unix-only: Windows answers a connect to a closed port only after ~2 s of
-	// SYN retries, longer than the 500 ms in-flight request, so the probe cannot
-	// see the listener closed while that request still runs. The drain itself is
-	// still covered there by the idle and bound tests below.
+	// SYN retries, so the refusal probe is too slow to run there. The drain
+	// itself is still covered there by the idle and bound tests below.
 	#[cfg(unix)]
 	#[tokio::test]
 	async fn drain_refuses_new_connections_and_finishes_in_flight_request() {
 		let started = Arc::new(Notify::new());
-		let (addr, shutdown, server) = start(slow_handler(started.clone(), Duration::from_millis(500)));
+		let release = Arc::new(Notify::new());
+		let (addr, shutdown, server) = start(gated_handler(started.clone(), release.clone()));
 
 		let mut in_flight = TcpStream::connect(addr).await.unwrap();
 		in_flight.write_all(REQUEST).await.unwrap();
@@ -254,6 +256,7 @@ mod tests {
 		);
 
 		// (b) The in-flight response arrives whole.
+		release.notify_one();
 		let mut response = Vec::new();
 		in_flight.read_to_end(&mut response).await.unwrap();
 		let response = String::from_utf8(response).unwrap();
@@ -271,7 +274,7 @@ mod tests {
 	#[tokio::test]
 	async fn drain_closes_idle_connections_at_once() {
 		let started = Arc::new(Notify::new());
-		let (addr, shutdown, server) = start(slow_handler(started, Duration::from_secs(60)));
+		let (addr, shutdown, server) = start(gated_handler(started, Arc::new(Notify::new())));
 
 		// Connected but no request sent: nothing to finish.
 		let mut idle = TcpStream::connect(addr).await.unwrap();
@@ -297,7 +300,7 @@ mod tests {
 	#[tokio::test]
 	async fn drain_bound_reports_connections_left_open() {
 		let started = Arc::new(Notify::new());
-		let (addr, shutdown, server) = start(slow_handler(started.clone(), Duration::from_secs(60)));
+		let (addr, shutdown, server) = start(gated_handler(started.clone(), Arc::new(Notify::new())));
 
 		let mut stuck = TcpStream::connect(addr).await.unwrap();
 		stuck.write_all(REQUEST).await.unwrap();
