@@ -12,9 +12,11 @@ For the design rationale behind these choices, see
 
 ## Configuration
 
-Media aliases work exactly like `[models]` — an alias mapped to a list of
-`provider:model` mirrors, picked in rotation, with fallthrough when one is rate
-limited:
+Media aliases map to lists of `provider:model` mirrors, rotating with fallthrough
+when one is rate limited unless `[routing.models].<alias> = "ordered"` selects
+the first available lane and enables submit failover even with `failover_on_error`
+off. Unlisted aliases keep rotating regardless of `[routing].default`, and
+accepted jobs stay on their provider for polling:
 
 ```toml
 [media_models]

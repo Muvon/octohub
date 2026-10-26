@@ -267,7 +267,7 @@ An alias can name a primary and its fallbacks instead of spreading load:
 "mimo-v2.6-flash" = ["xiaomi:mimo-v2.6-flash", "openrouter:xiaomi/mimo-v2.6-flash"]
 
 [routing]
-default = "rotate"                 # every alias not listed below (the default)
+default = "rotate"                 # completion aliases not listed below (the default)
 
 [routing.models]
 "mimo-v2.6-flash" = "ordered"
@@ -288,8 +288,10 @@ For an `ordered` alias:
   lane even when `failover_on_error` is off. The conversation then continues
   on that lane. A 400 never fails over.
 
-Every `[routing.models]` key must be a `[models]` alias; an unknown key or
-strategy fails the config at load. Rotating aliases behave exactly as above.
+Every `[routing.models]` key must name a `[models]` or `[media_models]` alias;
+an unknown key or strategy fails the config at load. Ordered media aliases use
+the same lane priority and submit failover, then poll only the accepted lane;
+media aliases without an override keep rotating regardless of `[routing].default`.
 
 ## Adding a new provider
 

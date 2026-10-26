@@ -138,7 +138,7 @@ pub struct Config {
 	#[serde(default)]
 	pub embedding_models: HashMap<String, Vec<String>>,
 	/// Media model mappings — identical shape and resolution to `models`:
-	/// alias -> list of `provider:model` mirrors, tried in rotation. Pricing
+	/// alias -> list of `provider:model` mirrors, rotated unless ordered. Pricing
 	/// is octolib's (`media::reference_pricing`), so nothing else lives here.
 	#[serde(default)]
 	pub media_models: HashMap<String, Vec<String>>,
@@ -176,7 +176,7 @@ pub struct Config {
 	/// Per-adapter media endpoint overrides, keyed by octolib provider name.
 	#[serde(default)]
 	pub media_providers: HashMap<String, MediaProviderConfig>,
-	/// Lane strategy per `[models]` alias (rotate by default).
+	/// Lane strategy per completion or media alias (rotate by default).
 	#[serde(default)]
 	pub routing: RoutingConfig,
 }
@@ -277,7 +277,7 @@ impl ProviderConfig {
 	}
 }
 
-/// How a `[models]` alias orders its lanes. Either way a request that
+/// How a completion or media alias orders its lanes. Either way a completion that
 /// continues a chain goes back to the lane that served it first, where its
 /// provider-side prompt cache lives.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -293,14 +293,14 @@ pub enum LaneStrategy {
 	Ordered,
 }
 
-/// `[routing]`: which [`LaneStrategy`] each `[models]` alias uses.
+/// `[routing]`: which [`LaneStrategy`] each completion or media alias uses.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
-	/// Strategy for every alias not listed in `models`.
+	/// Strategy for completion aliases not listed in `models`.
 	#[serde(default)]
 	pub default: LaneStrategy,
-	/// Per-alias overrides; every key must be a `[models]` alias.
+	/// Per-alias overrides; keys name `[models]` or `[media_models]` aliases.
 	#[serde(default)]
 	pub models: HashMap<String, LaneStrategy>,
 }
@@ -425,17 +425,27 @@ impl Config {
 		!self.auto.is_empty() && model == AUTO_MODEL
 	}
 
-	/// The lane strategy `[routing]` gives a `[models]` alias.
+	/// Media aliases keep rotation unless explicitly overridden; the routing
+	/// default has historically applied only to completions.
 	pub fn lane_strategy(&self, model: &str) -> LaneStrategy {
-		self.routing.models.get(model).copied().unwrap_or(self.routing.default)
+		self.routing.models.get(model).copied().unwrap_or_else(|| {
+			if self.media_models.contains_key(model) {
+				LaneStrategy::Rotate
+			} else {
+				self.routing.default
+			}
+		})
 	}
 
-	/// Fail at load on a `[routing.models]` key that names no `[models]` alias —
+	/// Fail at load on a `[routing.models]` key that names no completion or media alias —
 	/// a typo would otherwise leave that alias silently rotating.
 	fn validate_routing(&self) -> Result<()> {
 		for alias in self.routing.models.keys() {
-			if !self.models.contains_key(alias) {
-				anyhow::bail!("[routing.models].{} is not defined in [models]", alias);
+			if !self.models.contains_key(alias) && !self.media_models.contains_key(alias) {
+				anyhow::bail!(
+					"[routing.models].{} is not defined in [models] or [media_models]",
+					alias
+				);
 			}
 		}
 		Ok(())
@@ -574,9 +584,14 @@ impl Config {
 		self.candidates_from_map(model, &self.embedding_models, "embedding model", true)
 	}
 
-	/// Media counterpart of [`model_candidates`](Self::model_candidates).
+	/// Media candidates follow the alias's lane strategy.
 	pub fn media_model_candidates(&self, model: &str) -> Result<Vec<(String, String)>> {
-		self.candidates_from_map(model, &self.media_models, "media model", true)
+		self.candidates_from_map(
+			model,
+			&self.media_models,
+			"media model",
+			self.lane_strategy(model) == LaneStrategy::Rotate,
+		)
 	}
 
 	/// Evaluation counterpart of [`model_candidates`](Self::model_candidates).
@@ -828,6 +843,63 @@ mod tests {
 		.unwrap();
 		assert_eq!(flipped.lane_strategy("other"), LaneStrategy::Ordered);
 		assert_eq!(flipped.lane_strategy("glm"), LaneStrategy::Rotate);
+	}
+
+	#[test]
+	fn media_routing_loads_ordered_alias_and_preserves_lane_order() {
+		let path = std::env::temp_dir().join(format!("octohub-media-routing-{}.toml", uuid::Uuid::new_v4()));
+		std::fs::write(
+			&path,
+			r#"
+			[media_models]
+			flux = ["fal:fal-ai/flux/dev", "replicate:black-forest-labs/flux-1.1-pro"]
+			[routing.models]
+			flux = "ordered"
+			"#,
+		)
+		.unwrap();
+		let loaded = Config::load(Some(path.to_str().unwrap().to_string()));
+		std::fs::remove_file(path).unwrap();
+		let config = loaded.unwrap();
+		assert_eq!(config.lane_strategy("flux"), LaneStrategy::Ordered);
+		let expected = vec![
+			("fal".to_string(), "fal-ai/flux/dev".to_string()),
+			("replicate".to_string(), "black-forest-labs/flux-1.1-pro".to_string()),
+		];
+		for _ in 0..32 {
+			assert_eq!(config.media_model_candidates("flux").unwrap(), expected);
+		}
+	}
+
+	#[test]
+	fn media_routing_without_override_keeps_rotation() {
+		let mut config = media_config(
+			&[(
+				"flux",
+				&[
+					"fal:fal-ai/flux/dev",
+					"replicate:black-forest-labs/flux-1.1-pro",
+					"runway:gen4_image",
+				],
+			)],
+			&[],
+		);
+		for default in [LaneStrategy::Rotate, LaneStrategy::Ordered] {
+			config.routing.default = default;
+			assert_eq!(config.lane_strategy("flux"), LaneStrategy::Rotate);
+			let mut starts = std::collections::HashSet::new();
+			for _ in 0..256 {
+				let candidates = config.media_model_candidates("flux").unwrap();
+				starts.insert(candidates[0].0.clone());
+				let mut providers: Vec<_> = candidates.into_iter().map(|(provider, _)| provider).collect();
+				providers.sort();
+				assert_eq!(providers, vec!["fal", "replicate", "runway"]);
+			}
+			assert!(
+				starts.len() > 1,
+				"unlisted media aliases still rotate their starting lane"
+			);
+		}
 	}
 
 	#[test]

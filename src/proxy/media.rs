@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use octolib::media::{
-	ImageGenerationProvider, ImageGenerationRequest, ImageGenerationResult, JobHandle, MediaError,
+	FailureCategory, ImageGenerationProvider, ImageGenerationRequest, ImageGenerationResult, JobHandle, MediaError,
 	MediaProviderFactory, MediaTask, MediaUsage, Operation, OperationStatus, ProviderWarning, RequestOptions,
 	SafetyReport, SpeechSynthesisProvider, SpeechSynthesisRequest, SpeechSynthesisResult, TranscriptionProvider,
 	TranscriptionRequest, TranscriptionResult, VideoGenerationProvider, VideoGenerationRequest, VideoGenerationResult,
@@ -23,8 +23,10 @@ use octolib::media::{
 use uuid::Uuid;
 
 use crate::api::media_types::*;
-use crate::config::Config;
-use crate::proxy::engine::{ensure_model_allowed, is_provider_fault, pick_admitted, ProxyEngine};
+use crate::config::{Config, LaneStrategy};
+use crate::proxy::engine::{
+	deprioritize_saturated, ensure_model_allowed, pick_admitted, ProxyEngine, ProxyTimeoutError,
+};
 use crate::storage::{ApiKey, StoredMedia};
 
 /// One media request in any of the four task shapes.
@@ -283,7 +285,56 @@ fn request_options(config: &Config, common: &MediaCommon) -> RequestOptions {
 }
 
 fn bad_request(message: impl std::fmt::Display) -> anyhow::Error {
-	anyhow!("Invalid request: {message}")
+	anyhow!(MediaError::InvalidRequest(message.to_string()))
+}
+
+fn media_status_is_provider_fault(status: u16) -> bool {
+	matches!(status, 401..=403 | 408 | 429 | 500..=599)
+}
+
+fn is_media_provider_fault(error: &anyhow::Error) -> bool {
+	let Some(media) = error.downcast_ref::<MediaError>() else {
+		return matches!(
+			error.downcast_ref::<ProxyTimeoutError>(),
+			Some(ProxyTimeoutError::Upstream { .. })
+		);
+	};
+	match media {
+		MediaError::InvalidModelFormat(_)
+		| MediaError::UnsupportedProvider(_)
+		| MediaError::UnsupportedTask { .. }
+		| MediaError::UnsupportedParameter { .. }
+		| MediaError::InvalidRequest(_)
+		| MediaError::WrongJobHandle { .. }
+		| MediaError::LocalWaitCancelled { .. }
+		| MediaError::SourceTooLarge { .. }
+		| MediaError::Base64(_) => false,
+		MediaError::Api { status, .. } => media_status_is_provider_fault(*status),
+		MediaError::RemoteFailure(failure) => {
+			!matches!(
+				failure.category,
+				FailureCategory::Unsupported
+					| FailureCategory::ContentPolicy
+					| FailureCategory::InvalidInput
+					| FailureCategory::Cancelled
+			) && match failure.http_status {
+				Some(status) => media_status_is_provider_fault(status),
+				None => true,
+			}
+		}
+		MediaError::MissingApiKey(_)
+		| MediaError::Authentication { .. }
+		| MediaError::Permission { .. }
+		| MediaError::InsufficientCredits { .. }
+		| MediaError::RateLimit { .. }
+		| MediaError::InvalidResponse { .. }
+		| MediaError::WaitTimeout { .. }
+		| MediaError::ArtifactTooLarge { .. }
+		| MediaError::ResponseTooLarge { .. }
+		| MediaError::Io(_)
+		| MediaError::Transport(_)
+		| MediaError::Json(_) => true,
+	}
 }
 
 impl ProxyEngine {
@@ -308,13 +359,18 @@ impl ProxyEngine {
 
 		let cooldown = Duration::from_secs(config.server.provider_error_cooldown_secs);
 		let limiter = self.limiter();
+		let strategy = config.lane_strategy(&input_model);
 
 		let (provider_name, resolved_model, mut normalized, upstream_duration) = loop {
+			let mut available = candidates.clone();
+			if strategy == LaneStrategy::Ordered {
+				deprioritize_saturated(&mut available, &limiter);
+			}
 			let (provider_name, resolved_model) = pick_admitted(
 				&self.rate_tracker,
 				&self.provider_health,
 				&config,
-				candidates.clone(),
+				available,
 				&input_model,
 			)?;
 			tracing::Span::current().record("provider", provider_name.as_str());
@@ -326,7 +382,7 @@ impl ProxyEngine {
 				let permit = tokio::time::timeout(queue_timeout, limiter.acquire(&provider_name))
 					.await
 					.map_err(|_| {
-						anyhow!(crate::proxy::engine::ProxyTimeoutError::ProviderQueue {
+						anyhow!(ProxyTimeoutError::ProviderQueue {
 							provider: provider_name.clone(),
 							timeout: queue_timeout,
 						})
@@ -345,12 +401,13 @@ impl ProxyEngine {
 					break (provider_name, resolved_model, normalized, duration);
 				}
 				Err(err) => {
-					let provider_fault = is_provider_fault(&err);
+					let provider_fault = is_media_provider_fault(&err);
 					if provider_fault {
 						self.provider_health.record_failure(&provider_name, cooldown);
 					}
 					candidates.retain(|(p, _)| !p.eq_ignore_ascii_case(&provider_name));
-					if !(config.server.failover_on_error && provider_fault) || candidates.is_empty() {
+					let failover = config.server.failover_on_error || strategy == LaneStrategy::Ordered;
+					if !(failover && provider_fault) || candidates.is_empty() {
 						return Err(err);
 					}
 					crate::metrics::record_failover(&provider_name);
@@ -905,7 +962,371 @@ fn media_error(error: MediaError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::auth::Credentials;
+	use crate::proxy::limiter::ProviderLimiter;
+	use crate::storage::sqlite::SqliteStorage;
+	use crate::storage::Storage;
 	use octolib::media::{ArtifactSource, MediaArtifact, MediaKind, UsageLineItem, UsageUnit};
+	use std::sync::{Arc, Mutex, RwLock};
+
+	struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+	impl EnvGuard {
+		fn set(values: &[(&'static str, String)]) -> Self {
+			Self(
+				values
+					.iter()
+					.map(|(name, value)| {
+						let previous = std::env::var_os(name);
+						std::env::set_var(name, value);
+						(*name, previous)
+					})
+					.collect(),
+			)
+		}
+	}
+
+	impl Drop for EnvGuard {
+		fn drop(&mut self) {
+			for (name, value) in &self.0 {
+				match value {
+					Some(value) => std::env::set_var(name, value),
+					None => std::env::remove_var(name),
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn media_routing_fault_classifier_uses_typed_rejections_and_statuses() {
+		let classify = |media, expected| {
+			let error = media_error(media).context("media submit failed");
+			assert_eq!(is_media_provider_fault(&error), expected, "{error:#}");
+		};
+		for status in [400, 404, 413, 422] {
+			classify(
+				MediaError::Api {
+					provider: "fal".into(),
+					status,
+					message: "rejected".into(),
+				},
+				false,
+			);
+		}
+		for status in [401, 402, 403, 408, 429, 500, 502, 503, 504, 529] {
+			classify(
+				MediaError::Api {
+					provider: "fal".into(),
+					status,
+					message: "unavailable".into(),
+				},
+				true,
+			);
+		}
+		for media in [
+			MediaError::InvalidRequest("invalid input".into()),
+			MediaError::UnsupportedParameter {
+				provider: "fal".into(),
+				parameter: "size".into(),
+				reason: "unsupported".into(),
+			},
+			MediaError::UnsupportedTask {
+				provider: "fal".into(),
+				model: "audio-model".into(),
+				task: MediaTask::TextToImage,
+			},
+			MediaError::SourceTooLarge { actual: 2, maximum: 1 },
+		] {
+			classify(media, false);
+		}
+		for media in [
+			MediaError::Authentication {
+				provider: "fal".into(),
+				message: "revoked key".into(),
+			},
+			MediaError::Permission {
+				provider: "fal".into(),
+				message: "model denied".into(),
+			},
+			MediaError::InsufficientCredits {
+				provider: "fal".into(),
+				message: "quota".into(),
+			},
+			MediaError::RateLimit {
+				provider: "fal".into(),
+				message: "rate limit".into(),
+				retry_after_secs: None,
+			},
+			MediaError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+			MediaError::WaitTimeout {
+				handle: Box::new(normalized(OperationStatus::Running, None).handle.unwrap()),
+			},
+		] {
+			classify(media, true);
+		}
+		for (category, http_status, expected) in [
+			(FailureCategory::ContentPolicy, None, false),
+			(FailureCategory::ContentPolicy, Some(403), false),
+			(FailureCategory::InvalidInput, None, false),
+			(FailureCategory::Unsupported, None, false),
+			(FailureCategory::RemoteJob, Some(400), false),
+			(FailureCategory::RemoteJob, Some(404), false),
+			(FailureCategory::RemoteJob, Some(413), false),
+			(FailureCategory::RemoteJob, Some(422), false),
+			(FailureCategory::Authentication, Some(401), true),
+			(FailureCategory::RateLimit, Some(429), true),
+			(FailureCategory::Transport, None, true),
+		] {
+			classify(
+				MediaError::RemoteFailure(octolib::media::GenerationFailure {
+					category,
+					message: "generation failed".into(),
+					provider_code: None,
+					http_status,
+					request_id: None,
+					provider_metadata: serde_json::Value::Null,
+				}),
+				expected,
+			);
+		}
+		assert!(!is_media_provider_fault(&bad_request("invalid geometry")));
+		assert!(!is_media_provider_fault(&anyhow!(MediaTaskUnsupported {
+			provider: "fal".into(),
+			model: "audio-model".into()
+		})));
+		assert!(!is_media_provider_fault(&anyhow!(ProxyTimeoutError::ProviderQueue {
+			provider: "fal".into(),
+			timeout: Duration::from_secs(1),
+		})));
+		assert!(is_media_provider_fault(&anyhow!(ProxyTimeoutError::Upstream {
+			provider: "fal".into(),
+			timeout: Duration::from_secs(1),
+		})));
+	}
+
+	#[tokio::test]
+	async fn media_routing_ordered_submit_prefers_primary_fails_over_and_polls_accepted_lane() {
+		use http_body_util::{BodyExt, Full};
+		use hyper::service::service_fn;
+		use hyper_util::rt::TokioIo;
+
+		const PRIMARY: &str = "/primary/fal-ai/flux/dev";
+		const FALLBACK: &str = "/fallback/models/black-forest-labs/flux-1.1-pro/predictions";
+		const POLL: &str = "/fallback/predictions/job-1";
+		const THIRD: &str = "/third/text_to_image";
+
+		struct Upstream {
+			primary_status: u16,
+			requests: Vec<String>,
+			primary_barrier: Option<Arc<tokio::sync::Barrier>>,
+		}
+
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let upstream = Arc::new(Mutex::new(Upstream {
+			primary_status: 200,
+			requests: Vec::new(),
+			primary_barrier: None,
+		}));
+		let state = upstream.clone();
+		let server = tokio::spawn(async move {
+			loop {
+				let (socket, _) = listener.accept().await.unwrap();
+				let state = state.clone();
+				tokio::spawn(async move {
+					hyper::server::conn::http1::Builder::new()
+						.serve_connection(
+							TokioIo::new(socket),
+							service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+								let state = state.clone();
+								async move {
+									let path = req.uri().path().to_string();
+									req.collect().await.unwrap();
+									let barrier = if path == PRIMARY {
+										state.lock().unwrap().primary_barrier.take()
+									} else {
+										None
+									};
+									if let Some(barrier) = barrier {
+										barrier.wait().await;
+										barrier.wait().await;
+									}
+									let (status, body) = {
+										let mut state = state.lock().unwrap();
+										match path.as_str() {
+											"/catalog" => (
+												200,
+												serde_json::json!({"models": [{
+													"endpoint_id": "fal-ai/flux/dev", "metadata": {"category": "text-to-image"}
+												}]}),
+											),
+											"/fallback/models/black-forest-labs/flux-1.1-pro" => (
+												200,
+												serde_json::json!({
+													"latest_version": {"openapi_schema": {"components": {"schemas": {"Input": {
+														"type": "object", "properties": {"prompt": {"type": "string"}}
+													}}}}}
+												}),
+											),
+											PRIMARY => {
+												state.requests.push(path);
+												let body = if state.primary_status == 200 {
+													serde_json::json!({"request_id": "primary-job", "queue_position": 0})
+												} else {
+													serde_json::json!({"detail": "rejected"})
+												};
+												(state.primary_status, body)
+											}
+											FALLBACK => {
+												state.requests.push(path);
+												(201, serde_json::json!({"id": "job-1", "status": "starting"}))
+											}
+											POLL => {
+												state.requests.push(path);
+												(
+													200,
+													serde_json::json!({"id": "job-1", "status": "succeeded",
+													"output": ["https://cdn.example.test/image.png"]}),
+												)
+											}
+											THIRD => {
+												state.requests.push(path);
+												(200, serde_json::json!({"id": "third-job"}))
+											}
+											_ => panic!("unexpected upstream path: {path}"),
+										}
+									};
+									Ok::<_, std::convert::Infallible>(
+										hyper::Response::builder()
+											.status(status)
+											.header("content-type", "application/json")
+											.body(Full::new(bytes::Bytes::from(body.to_string())))
+											.unwrap(),
+									)
+								}
+							}),
+						)
+						.await
+						.unwrap();
+				});
+			}
+		});
+		// No other proxy test sets these media adapter variables.
+		let _env = EnvGuard::set(&[
+			("FAL_API_URL", format!("http://{address}/primary")),
+			("FAL_MODELS_URL", format!("http://{address}/catalog")),
+			("FAL_API_KEY", "primary-key".into()),
+			("REPLICATE_API_URL", format!("http://{address}/fallback")),
+			("REPLICATE_API_KEY", "fallback-key".into()),
+			("RUNWAY_API_URL", format!("http://{address}/third")),
+			("RUNWAY_API_KEY", "third-key".into()),
+		]);
+		let config: Config = toml::from_str(
+			r#"
+			[server]
+			api_key = "master"
+			failover_on_error = false
+			provider_queue_timeout_secs = 1
+			provider_error_cooldown_secs = 60
+			[media_models]
+			flux = ["fal:fal-ai/flux/dev", "replicate:black-forest-labs/flux-1.1-pro", "runway:gen4_image"]
+			[routing.models]
+			flux = "ordered"
+			[providers.fal]
+			concurrency = 1
+			[providers.replicate]
+			concurrency = 1
+			"#,
+		)
+		.unwrap();
+		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		let key = storage.create_api_key("key", None, None, None).unwrap();
+		let credentials = Arc::new(Credentials::new(storage.clone(), None).unwrap());
+		let limiter = Arc::new(ProviderLimiter::from_config(&config));
+		let engine = ProxyEngine::new(
+			storage,
+			Arc::new(RwLock::new(Arc::new(config))),
+			Arc::new(RwLock::new(limiter.clone())),
+			1,
+			credentials,
+		);
+		let request = || {
+			image_request(serde_json::json!({
+				"model": "flux", "prompt": "a red panda", "wait": false, "size": "1024x1024"
+			}))
+		};
+		let paths = || std::mem::take(&mut upstream.lock().unwrap().requests);
+
+		for _ in 0..8 {
+			let outcome = engine.process_media(request(), &key).await.unwrap();
+			assert_eq!(outcome.response.provider, "fal");
+			assert!(outcome.accepted);
+		}
+		assert_eq!(paths(), vec![PRIMARY; 8]);
+
+		let busy = limiter.acquire("fal").await;
+		let outcome = engine.process_media(request(), &key).await.unwrap();
+		assert_eq!(outcome.response.provider, "replicate");
+		assert_eq!(paths(), vec![FALLBACK]);
+		drop(busy);
+
+		for _ in 0..3 {
+			engine.provider_health.record_failure("fal", Duration::from_secs(60));
+		}
+		let outcome = engine.process_media(request(), &key).await.unwrap();
+		assert_eq!(outcome.response.provider, "replicate");
+		assert_eq!(paths(), vec![FALLBACK]);
+		engine.provider_health.record_success("fal");
+
+		for status in [400, 404, 413, 422] {
+			upstream.lock().unwrap().primary_status = status;
+			for _ in 0..3 {
+				let error = engine.process_media(request(), &key).await.err().unwrap();
+				assert!(
+					matches!(error.downcast_ref::<MediaError>(), Some(MediaError::Api { status: actual, .. }) if *actual == status)
+				);
+				assert_eq!(paths(), vec![PRIMARY]);
+			}
+			assert!(!engine.provider_health.is_cooling("fal"));
+		}
+
+		for status in [401, 429] {
+			upstream.lock().unwrap().primary_status = status;
+			let moved = engine.process_media(request(), &key).await.unwrap();
+			assert_eq!(moved.response.provider, "replicate");
+			assert_eq!(paths(), vec![PRIMARY, FALLBACK]);
+			engine.provider_health.record_success("fal");
+		}
+
+		upstream.lock().unwrap().primary_status = 401;
+		let barrier = Arc::new(tokio::sync::Barrier::new(2));
+		upstream.lock().unwrap().primary_barrier = Some(barrier.clone());
+		let saturate_second = async {
+			barrier.wait().await;
+			let busy = limiter.acquire("replicate").await;
+			barrier.wait().await;
+			busy
+		};
+		let (outcome, busy) = tokio::join!(engine.process_media(request(), &key), saturate_second);
+		assert_eq!(outcome.unwrap().response.provider, "runway");
+		assert_eq!(paths(), vec![PRIMARY, THIRD]);
+		drop(busy);
+		engine.provider_health.record_success("fal");
+
+		let moved = engine.process_media(request(), &key).await.unwrap();
+		assert_eq!(moved.response.provider, "replicate");
+		assert!(moved.accepted);
+		assert_eq!(paths(), vec![PRIMARY, FALLBACK]);
+
+		upstream.lock().unwrap().primary_status = 200;
+		let polled = engine.poll_media(&moved.response.id, &key).await.unwrap().unwrap();
+		assert_eq!(polled.response.provider, "replicate");
+		assert_eq!(polled.response.status, OperationStatus::Succeeded);
+		assert_eq!(paths(), vec![POLL]);
+		engine.poll_media(&moved.response.id, &key).await.unwrap().unwrap();
+		assert!(paths().is_empty());
+		server.abort();
+	}
 
 	fn image_request(json: serde_json::Value) -> MediaRequest {
 		MediaRequest::Image(Box::new(serde_json::from_value(json).expect("valid image request")))

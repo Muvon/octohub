@@ -114,8 +114,10 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 # concurrency = 4
 
 # ── Media ────────────────────────────────────────────────────────────────────
-# Media aliases work exactly like [models]: alias -> list of "provider:model"
-# mirrors, picked in rotation. Providers: elevenlabs, fal, openrouter,
+# Media aliases map to lists of "provider:model" mirrors, rotating unless
+# [routing.models].<alias> = "ordered": first available lane, submit failover
+# even with failover_on_error off; accepted jobs keep their lane for polling.
+# Providers: elevenlabs, fal, openrouter,
 # replicate, runway. Pricing is not configured here — octolib resolves a rate
 # from its own reference table and reports it on the response.
 #

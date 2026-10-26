@@ -311,8 +311,11 @@ concurrency = 30  # stay under the 60-rps published limit
 
 ## `[media_models]`
 
-Media aliases, identical in shape and resolution to `[models]`: an alias mapped
-to a list of `provider:model` mirrors, picked in rotation with fallthrough.
+Media aliases map to lists of `provider:model` mirrors, rotating with fallthrough
+unless `[routing.models].<alias> = "ordered"` selects the first available lane
+and enables submit failover even with `failover_on_error` off. Aliases without
+an override keep rotating regardless of `[routing].default`; accepted jobs
+stay on their provider for polling.
 
 ```toml
 [media_models]

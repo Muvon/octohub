@@ -1714,7 +1714,7 @@ fn prefer_provider(candidates: &mut [(String, String)], provider: &str) {
 /// Move lanes whose concurrency is full behind the rest (stable, so list order
 /// holds within each group). Deprioritized, not removed: when every lane is
 /// busy the first one still takes the request and it queues there.
-fn deprioritize_saturated(candidates: &mut [(String, String)], limiter: &ProviderLimiter) {
+pub(crate) fn deprioritize_saturated(candidates: &mut [(String, String)], limiter: &ProviderLimiter) {
 	candidates.sort_by_key(|(provider, _)| limiter.is_saturated(provider));
 }
 
