@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::{Request, Response, StatusCode};
 
 use crate::api::types::{
@@ -51,6 +51,31 @@ fn error_response_typed(status: StatusCode, message: &str, error_type: &str) -> 
 			}
 		}),
 	)
+}
+
+/// Largest request body a client endpoint accepts. A stored completion carries
+/// the request twice (`input` and `exchange.request`) plus the answer in one
+/// INSERT, and MySQL's default `max_allowed_packet` is 64 MiB: a bigger body
+/// would pay for the upstream call and then fail to store. Rejected up front
+/// with 413 instead.
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+async fn read_body<B>(req: Request<B>) -> Result<Bytes, Box<Response<BoxBody>>>
+where
+	B: hyper::body::Body,
+	B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+	match Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES).collect().await {
+		Ok(collected) => Ok(collected.to_bytes()),
+		Err(e) if e.is::<LengthLimitError>() => Err(Box::new(error_response(
+			StatusCode::PAYLOAD_TOO_LARGE,
+			&format!("Request body exceeds {} MiB", MAX_REQUEST_BODY_BYTES / (1024 * 1024)),
+		))),
+		Err(e) => Err(Box::new(error_response(
+			StatusCode::BAD_REQUEST,
+			&format!("Failed to read request body: {}", e),
+		))),
+	}
 }
 
 /// The `error.type` discriminator for an engine failure. Conditions a caller
@@ -146,12 +171,9 @@ pub async fn handle_create_completion(
 	let purpose = model_purpose(&req);
 	let attribution = attribution_headers(&req);
 
-	// Read body
-	let body_bytes = match req.collect().await {
-		Ok(collected) => collected.to_bytes(),
-		Err(e) => {
-			return error_response(StatusCode::BAD_REQUEST, &format!("Failed to read request body: {}", e));
-		}
+	let body_bytes = match read_body(req).await {
+		Ok(bytes) => bytes,
+		Err(response) => return *response,
 	};
 
 	// Parse request
@@ -245,11 +267,9 @@ pub async fn handle_create_embedding(
 	};
 	tracing::Span::current().record("api_key_id", api_key.id);
 
-	let body_bytes = match req.collect().await {
-		Ok(collected) => collected.to_bytes(),
-		Err(e) => {
-			return error_response(StatusCode::BAD_REQUEST, &format!("Failed to read request body: {}", e));
-		}
+	let body_bytes = match read_body(req).await {
+		Ok(bytes) => bytes,
+		Err(response) => return *response,
 	};
 
 	let create_req: CreateEmbeddingRequest = match serde_json::from_slice(&body_bytes) {
@@ -328,11 +348,9 @@ pub async fn handle_create_evaluation(
 	};
 	tracing::Span::current().record("api_key_id", api_key.id);
 
-	let body_bytes = match req.collect().await {
-		Ok(collected) => collected.to_bytes(),
-		Err(e) => {
-			return error_response(StatusCode::BAD_REQUEST, &format!("Failed to read request body: {}", e));
-		}
+	let body_bytes = match read_body(req).await {
+		Ok(bytes) => bytes,
+		Err(response) => return *response,
 	};
 
 	let create_req: CreateEvaluationRequest = match serde_json::from_slice(&body_bytes) {
@@ -517,12 +535,9 @@ pub async fn handle_chat_completion(
 	let purpose = model_purpose(&req);
 	let attribution = attribution_headers(&req);
 
-	// Read body
-	let body_bytes = match req.collect().await {
-		Ok(collected) => collected.to_bytes(),
-		Err(e) => {
-			return error_response(StatusCode::BAD_REQUEST, &format!("Failed to read request body: {}", e));
-		}
+	let body_bytes = match read_body(req).await {
+		Ok(bytes) => bytes,
+		Err(response) => return *response,
 	};
 
 	// Parse classic chat request
@@ -900,9 +915,9 @@ async fn handle_media_create(
 		Err(response) => return *response,
 	};
 
-	let body_bytes = match req.collect().await {
-		Ok(collected) => collected.to_bytes(),
-		Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("Failed to read request body: {}", e)),
+	let body_bytes = match read_body(req).await {
+		Ok(bytes) => bytes,
+		Err(response) => return *response,
 	};
 
 	let media_request = match build(&body_bytes) {
@@ -1212,6 +1227,21 @@ mod tests {
 
 	async fn response_json(response: Response<BoxBody>) -> serde_json::Value {
 		serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+	}
+
+	#[tokio::test]
+	async fn request_body_over_the_cap_is_413_before_any_work() {
+		let body = |len: usize| Request::new(Full::new(Bytes::from(vec![b' '; len])));
+		assert_eq!(
+			read_body(body(MAX_REQUEST_BODY_BYTES)).await.unwrap().len(),
+			MAX_REQUEST_BODY_BYTES
+		);
+		let response = read_body(body(MAX_REQUEST_BODY_BYTES + 1)).await.unwrap_err();
+		assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+		assert_eq!(
+			response_json(response).await,
+			serde_json::json!({"error": {"message": "Request body exceeds 16 MiB", "type": "invalid_request_error"}})
+		);
 	}
 
 	#[tokio::test]

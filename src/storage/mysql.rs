@@ -62,7 +62,7 @@ impl MysqlStorage {
                 provider VARCHAR(255) NOT NULL,
                 input JSON NOT NULL,
                 output JSON NOT NULL,
-                instructions TEXT,
+                instructions LONGTEXT,
                 exchange JSON NOT NULL,
                 `usage` JSON NOT NULL,
                 created_at BIGINT UNSIGNED NOT NULL,
@@ -72,6 +72,17 @@ impl MysqlStorage {
                 INDEX idx_completions_created (created_at)
             )",
 		)?;
+		// TEXT holds 64 KB: a longer system prompt passed the upstream call (and
+		// its cost) and then failed this INSERT with "Data too long". `input` is
+		// JSON, which has no such cap; the prompt must not have one either.
+		let instructions_type: Option<String> = conn.exec_first(
+			"SELECT data_type FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = 'completions' AND column_name = 'instructions'",
+			(),
+		)?;
+		if instructions_type.as_deref() != Some("longtext") {
+			conn.query_drop("ALTER TABLE completions MODIFY instructions LONGTEXT")?;
+		}
 		conn.query_drop(
 			"CREATE TABLE IF NOT EXISTS embeddings (
                 id VARCHAR(255) PRIMARY KEY,
