@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.3] - 2026-10-27
+
+### 📋 Release Summary
+
+Abandoned media jobs are now settled in the background.
+
+### ✨ New Features & Enhancements
+
+- **media**: settle abandoned media jobs in background `a5ecc586`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update locked dependency versions `74838d23`
+
 ## [0.14.2] - 2026-10-26
 
 ### 📋 Release Summary
