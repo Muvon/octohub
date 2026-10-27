@@ -258,9 +258,11 @@ curl -s http://127.0.0.1:8080/v1/media/med_01J… \
 # → 200 {"status":"succeeded","artifacts":[…]}
 ```
 
-Polling is what advances a job — there is no background worker. A job you never
-poll stays `queued` and its cost is never recorded. A terminal record is served
-from the database with no upstream call.
+Polling advances a job, and a background sweep (every 60 s) polls the jobs
+nobody polls: an open job older than five minutes is polled once per pass, and
+one still unfinished after 24 hours is marked `failed`. A terminal record is
+served from the database with no upstream call and is never rewritten, so the
+first outcome stored, `completed_at` included, is the one that is billed.
 
 A job the provider reports finished whose output cannot be read as this
 endpoint's media — a music model posted to the image route, say — ends `failed`

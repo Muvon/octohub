@@ -11,14 +11,16 @@
 //! from `media::reference_pricing` and report it on `MediaUsage`; OctoHub reads
 //! `best_available_cost()` and records it, exactly as it does for completions.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use octolib::media::{
-	FailureCategory, ImageGenerationProvider, ImageGenerationRequest, ImageGenerationResult, JobHandle, MediaError,
-	MediaProviderFactory, MediaTask, MediaUsage, Operation, OperationStatus, ProviderWarning, RequestOptions,
-	SafetyReport, SpeechSynthesisProvider, SpeechSynthesisRequest, SpeechSynthesisResult, TranscriptionProvider,
-	TranscriptionRequest, TranscriptionResult, VideoGenerationProvider, VideoGenerationRequest, VideoGenerationResult,
+	FailureCategory, GenerationFailure, ImageGenerationProvider, ImageGenerationRequest, ImageGenerationResult,
+	JobHandle, MediaError, MediaProviderFactory, MediaTask, MediaUsage, Operation, OperationStatus, ProviderWarning,
+	RequestOptions, SafetyReport, SpeechSynthesisProvider, SpeechSynthesisRequest, SpeechSynthesisResult,
+	TranscriptionProvider, TranscriptionRequest, TranscriptionResult, VideoGenerationProvider, VideoGenerationRequest,
+	VideoGenerationResult,
 };
 use uuid::Uuid;
 
@@ -28,6 +30,15 @@ use crate::proxy::engine::{
 	deprioritize_saturated, ensure_model_allowed, pick_admitted, ProxyEngine, ProxyTimeoutError,
 };
 use crate::storage::{ApiKey, StoredMedia};
+
+/// How often the abandoned-job sweep runs.
+const MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Rows handled per sweep pass, so one pass stays bounded however big the backlog.
+const MEDIA_SWEEP_BATCH: u32 = 50;
+/// Younger jobs still belong to a client that is waiting or polling.
+const MEDIA_SWEEP_MIN_AGE_SECS: u64 = 5 * 60;
+/// A job the provider has not finished by now never will; stop polling it.
+const MEDIA_ABANDONED_AFTER_SECS: u64 = 24 * 60 * 60;
 
 /// One media request in any of the four task shapes.
 pub enum MediaRequest {
@@ -461,6 +472,7 @@ impl ProxyEngine {
 			apply(&mut record, &normalized);
 			let storage = self.storage.clone();
 			let to_update = record.clone();
+			// A sweep that settled this row first wins; the write is then a no-op.
 			tokio::task::spawn_blocking(move || storage.update_media(&to_update)).await??;
 		}
 
@@ -481,13 +493,7 @@ impl ProxyEngine {
 			return Ok(Some(self.stored_outcome(record)));
 		}
 
-		let handle: JobHandle = serde_json::from_value(
-			record
-				.handle
-				.clone()
-				.ok_or_else(|| anyhow!("media record has no resumable handle"))?,
-		)
-		.context("stored media handle is not a valid JobHandle")?;
+		let handle = stored_handle(&record)?;
 
 		let started = Instant::now();
 		let normalized = poll_once(&record.provider, &handle).await?;
@@ -495,7 +501,14 @@ impl ProxyEngine {
 
 		let storage = self.storage.clone();
 		let to_update = record.clone();
-		tokio::task::spawn_blocking(move || storage.update_media(&to_update)).await??;
+		let written = tokio::task::spawn_blocking(move || storage.update_media(&to_update)).await??;
+		if !written {
+			// Another poll or the sweep settled this job first. Its stored outcome
+			// is the one billing reads, so serve that instead of ours.
+			if let Some(stored) = self.finished_elsewhere(id, api_key.id).await? {
+				return Ok(Some(self.stored_outcome(stored)));
+			}
+		}
 
 		Ok(Some(self.finish(record, normalized, started.elapsed())))
 	}
@@ -512,13 +525,7 @@ impl ProxyEngine {
 		if terminal_name(&record.status) {
 			return Ok(Some(self.stored_outcome(record)));
 		}
-		let handle: JobHandle = serde_json::from_value(
-			record
-				.handle
-				.clone()
-				.ok_or_else(|| anyhow!("media record has no resumable handle"))?,
-		)
-		.context("stored media handle is not a valid JobHandle")?;
+		let handle = stored_handle(&record)?;
 
 		cancel_once(&record.provider, &handle).await?;
 		record.status = status_name(OperationStatus::Cancelled);
@@ -527,8 +534,68 @@ impl ProxyEngine {
 
 		let storage = self.storage.clone();
 		let to_update = record.clone();
-		tokio::task::spawn_blocking(move || storage.update_media(&to_update)).await??;
+		let written = tokio::task::spawn_blocking(move || storage.update_media(&to_update)).await??;
+		if !written {
+			// The job finished while the cancel was in flight; the stored outcome stands.
+			if let Some(stored) = self.finished_elsewhere(id, api_key.id).await? {
+				return Ok(Some(self.stored_outcome(stored)));
+			}
+		}
 		Ok(Some(self.stored_outcome(record)))
+	}
+
+	/// The stored row, when another writer has already taken it terminal.
+	async fn finished_elsewhere(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {
+		let storage = self.storage.clone();
+		let lookup_id = id.to_string();
+		let record = tokio::task::spawn_blocking(move || storage.get_media(&lookup_id, api_key_id)).await??;
+		Ok(record.filter(|record| terminal_name(&record.status)))
+	}
+
+	/// One pass of the abandoned-job sweep: advance jobs whose client stopped
+	/// polling, so a job the provider finished (and charged us for) still lands
+	/// as a billable row. Returns how many jobs reached a terminal state.
+	///
+	/// A job that is still not terminal after `MEDIA_ABANDONED_AFTER_SECS` is
+	/// failed. Terminal rows are write-once in storage, so this is safe against
+	/// a client poll or another instance sweeping the same row.
+	pub async fn sweep_media(&self) -> Result<usize> {
+		let now = now_unix();
+		let storage = self.storage.clone();
+		let created_before = now.saturating_sub(MEDIA_SWEEP_MIN_AGE_SECS);
+		let stale =
+			tokio::task::spawn_blocking(move || storage.list_stale_media(created_before, MEDIA_SWEEP_BATCH)).await??;
+
+		let mut settled = 0;
+		for mut record in stale {
+			let polled = match stored_handle(&record) {
+				Ok(handle) => poll_once(&record.provider, &handle).await,
+				Err(error) => Err(error),
+			};
+			match &polled {
+				Ok(normalized) => apply(&mut record, normalized),
+				// One bad row must not stop the pass; it is retried next tick
+				// and abandoned once it is old enough.
+				Err(error) => tracing::warn!(
+					id = %record.id,
+					provider = %record.provider,
+					error = %error,
+					"media sweep could not poll job"
+				),
+			}
+			if !terminal_name(&record.status) && now.saturating_sub(record.created_at) >= MEDIA_ABANDONED_AFTER_SECS {
+				abandon(&mut record, now);
+			}
+
+			let storage = self.storage.clone();
+			let to_update = record.clone();
+			let written = tokio::task::spawn_blocking(move || storage.update_media(&to_update)).await??;
+			if written && terminal_name(&record.status) {
+				settled += 1;
+				tracing::info!(id = %record.id, status = %record.status, "media sweep settled job");
+			}
+		}
+		Ok(settled)
 	}
 
 	/// Capability descriptors for every configured media candidate, plus the
@@ -659,6 +726,47 @@ fn apply(record: &mut StoredMedia, normalized: &Normalized) {
 	}
 	if is_terminal(normalized.status) && record.completed_at.is_none() {
 		record.completed_at = Some(now_unix());
+	}
+}
+
+/// The resumable `JobHandle` a stored non-terminal row carries.
+fn stored_handle(record: &StoredMedia) -> Result<JobHandle> {
+	serde_json::from_value(
+		record
+			.handle
+			.clone()
+			.ok_or_else(|| anyhow!("media record has no resumable handle"))?,
+	)
+	.context("stored media handle is not a valid JobHandle")
+}
+
+/// Give up on a job the provider never finished.
+fn abandon(record: &mut StoredMedia, now: u64) {
+	record.status = status_name(OperationStatus::Failed);
+	record.handle = None;
+	record.completed_at = Some(now);
+	record.error = Some(failure_json(&GenerationFailure {
+		category: FailureCategory::Expired,
+		message: "abandoned: provider never finished".to_string(),
+		provider_code: None,
+		http_status: None,
+		request_id: None,
+		provider_metadata: serde_json::Value::Null,
+	}));
+}
+
+/// Background task: settle media jobs whose client stopped polling.
+pub async fn media_sweep_loop(engine: Arc<ProxyEngine>) {
+	let mut ticker = tokio::time::interval(MEDIA_SWEEP_INTERVAL);
+	// A slow pass delays the next one rather than queueing a burst behind it.
+	ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	loop {
+		ticker.tick().await;
+		match engine.sweep_media().await {
+			Ok(settled) if settled > 0 => tracing::info!(settled, "media sweep pass finished"),
+			Ok(_) => {}
+			Err(error) => tracing::error!(error = %error, "media sweep pass failed"),
+		}
 	}
 }
 
@@ -1543,5 +1651,170 @@ mod tests {
 			serde_json::from_value(stored["artifacts"].clone()).expect("artifacts decode");
 		assert_eq!(artifacts.len(), 1);
 		assert_eq!(artifacts[0].media_type, "image/png");
+	}
+
+	fn engine_with_storage() -> (ProxyEngine, Arc<SqliteStorage>) {
+		let config: Config = toml::from_str("[server]\napi_key = \"master\"").unwrap();
+		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		let credentials = Arc::new(Credentials::new(storage.clone(), None).unwrap());
+		let limiter = Arc::new(ProviderLimiter::from_config(&config));
+		let engine = ProxyEngine::new(
+			storage.clone(),
+			Arc::new(RwLock::new(Arc::new(config))),
+			Arc::new(RwLock::new(limiter)),
+			1,
+			credentials,
+		);
+		(engine, storage)
+	}
+
+	/// The storage backends hard-code this list in SQL; it has to stay octolib's.
+	#[test]
+	fn storage_terminal_status_list_matches_octolib() {
+		for status in [
+			OperationStatus::Queued,
+			OperationStatus::Running,
+			OperationStatus::Succeeded,
+			OperationStatus::Failed,
+			OperationStatus::CancellationRequested,
+			OperationStatus::Cancelled,
+			OperationStatus::Expired,
+		] {
+			let listed = crate::storage::TERMINAL_MEDIA_STATUSES_SQL.contains(&format!("'{}'", status_name(status)));
+			assert_eq!(listed, status.is_terminal(), "{status:?}");
+		}
+	}
+
+	/// OpenRouter's video endpoint: `vid-done` has finished, `vid-slow` never does.
+	async fn serve_video_jobs() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+		use http_body_util::Full;
+		use hyper::service::service_fn;
+		use hyper_util::rt::TokioIo;
+
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let server = tokio::spawn(async move {
+			loop {
+				let (socket, _) = listener.accept().await.unwrap();
+				tokio::spawn(async move {
+					hyper::server::conn::http1::Builder::new()
+						.serve_connection(
+							TokioIo::new(socket),
+							service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+								let body = match req.uri().path() {
+									"/videos/vid-done" => serde_json::json!({
+										"id": "vid-done", "status": "completed",
+										"unsigned_urls": ["https://cdn.example.test/v.mp4"]
+									}),
+									"/videos/vid-slow" => {
+										serde_json::json!({"id": "vid-slow", "status": "in_progress"})
+									}
+									other => panic!("unexpected upstream path: {other}"),
+								};
+								Ok::<_, std::convert::Infallible>(
+									hyper::Response::builder()
+										.status(200)
+										.header("content-type", "application/json")
+										.body(Full::new(bytes::Bytes::from(body.to_string())))
+										.unwrap(),
+								)
+							}),
+						)
+						.await
+						.unwrap();
+				});
+			}
+		});
+		(address, server)
+	}
+
+	fn live_video_row(id: &str, remote_id: &str, api_key_id: i64, age_secs: u64) -> StoredMedia {
+		let mut row = record();
+		row.id = id.to_string();
+		row.api_key_id = api_key_id;
+		row.task = task_name(MediaTask::TextToVideo);
+		row.status = status_name(OperationStatus::Running);
+		row.provider = "openrouter".to_string();
+		row.resolved_model = "google/veo-3.1".to_string();
+		row.created_at = now_unix() - age_secs;
+		row.handle = Some(
+			serde_json::to_value(JobHandle {
+				provider: "openrouter".to_string(),
+				model: "google/veo-3.1".to_string(),
+				task: MediaTask::TextToVideo,
+				remote_id: remote_id.to_string(),
+				cost_estimate: None,
+				warnings: Vec::new(),
+				expected_outputs: None,
+			})
+			.unwrap(),
+		);
+		row
+	}
+
+	/// A caller that stopped polling must not leave a finished, already-charged
+	/// job unbilled, and a job the provider never finishes must not stay open.
+	#[tokio::test]
+	async fn sweep_settles_stale_jobs_and_fails_abandoned_ones() {
+		const HOUR_SECS: u64 = 60 * 60;
+
+		let (address, server) = serve_video_jobs().await;
+		// No other test sets these; the OpenRouter adapter reads them from the process environment.
+		let _env = EnvGuard::set(&[
+			("OPENROUTER_MEDIA_API_URL", format!("http://{address}")),
+			("OPENROUTER_API_KEY", "sweep-key".into()),
+		]);
+		let (engine, storage) = engine_with_storage();
+		let key = storage.create_api_key("key", None, None, None).unwrap();
+		for row in [
+			live_video_row("med_done", "vid-done", key.id, 10 * 60),
+			live_video_row("med_fresh", "vid-done", key.id, 30),
+			live_video_row("med_slow", "vid-slow", key.id, 10 * 60),
+			live_video_row("med_abandoned", "vid-slow", key.id, 25 * HOUR_SECS),
+		] {
+			storage.store_media(&row).unwrap();
+		}
+		// A writer that read the row before the sweep settled it.
+		let racer = storage.get_media("med_done", key.id).unwrap().unwrap();
+		let get = |id: &str| storage.get_media(id, key.id).unwrap().unwrap();
+
+		assert_eq!(engine.sweep_media().await.unwrap(), 2);
+
+		let done = get("med_done");
+		assert_eq!(done.status, "succeeded");
+		assert!(done.handle.is_none());
+		let completed_at = done
+			.completed_at
+			.expect("billing drains succeeded rows by completed_at");
+
+		// Under five minutes old: still its client's to poll.
+		let fresh = get("med_fresh");
+		assert_eq!(fresh.status, "running");
+		assert!(fresh.handle.is_some());
+		// Polled, still running, not old enough to give up on.
+		let slow = get("med_slow");
+		assert_eq!(slow.status, "running");
+		assert!(slow.handle.is_some());
+
+		let abandoned = get("med_abandoned");
+		assert_eq!(abandoned.status, "failed");
+		assert!(abandoned.handle.is_none());
+		let reason = abandoned.error.expect("failure recorded")["message"].to_string();
+		assert!(reason.contains("abandoned: provider never finished"), "{reason}");
+
+		// The stale copy cannot rewrite the settled row.
+		let mut late = racer;
+		late.status = status_name(OperationStatus::Failed);
+		late.completed_at = Some(completed_at + 999);
+		assert!(!storage.update_media(&late).unwrap());
+		let kept = get("med_done");
+		assert_eq!(kept.status, "succeeded");
+		assert_eq!(kept.completed_at, Some(completed_at));
+
+		// Settled rows leave the queue; the slow one is polled again and stays open.
+		assert_eq!(engine.sweep_media().await.unwrap(), 0);
+		assert_eq!(get("med_done").completed_at, Some(completed_at));
+		assert_eq!(get("med_slow").status, "running");
+		server.abort();
 	}
 }

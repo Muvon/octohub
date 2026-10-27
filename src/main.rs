@@ -153,6 +153,10 @@ async fn main() -> anyhow::Result<()> {
 		credentials,
 	));
 
+	// A media job only advances when its client polls; this settles the ones
+	// whose client left, so a finished job is still billed.
+	tokio::spawn(proxy::media::media_sweep_loop(engine.clone()));
+
 	let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
 	let listener = server::bind(addr).with_context(|| format!("Failed to bind {addr}"))?;
 	let signal = server::shutdown_signal().context("Failed to install shutdown signal handlers")?;

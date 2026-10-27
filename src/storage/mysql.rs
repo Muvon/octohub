@@ -2,7 +2,7 @@ use super::credentials::{apply_change, decode_error, Credential, CredentialChang
 use super::{
 	decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models, encode_auto_map,
 	encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-	StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow,
+	StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow, TERMINAL_MEDIA_STATUSES_SQL,
 };
 use anyhow::{Context, Result};
 use mysql::prelude::*;
@@ -669,13 +669,19 @@ impl Storage for MysqlStorage {
 		Ok(())
 	}
 
-	fn update_media(&self, record: &StoredMedia) -> Result<()> {
+	fn update_media(&self, record: &StoredMedia) -> Result<bool> {
 		let mut conn = self.pool.get_conn()?;
 		// Only the mutable half is written: identity, ownership and the
 		// original request are immutable once the job has been submitted.
+		// The status guard makes a terminal row write-once: billing reads
+		// `succeeded` rows by `completed_at`, so a second writer (poll, sweep,
+		// another instance) must not touch it.
 		conn.exec_drop(
-			"UPDATE media SET status = ?, handle = ?, result = ?, `usage` = ?, \
-             warnings = ?, error = ?, completed_at = ? WHERE id = ?",
+			format!(
+				"UPDATE media SET status = ?, handle = ?, result = ?, `usage` = ?, \
+                 warnings = ?, error = ?, completed_at = ? \
+                 WHERE id = ? AND status NOT IN ({TERMINAL_MEDIA_STATUSES_SQL})"
+			),
 			(
 				&record.status,
 				encode_json_column(record.handle.as_ref()),
@@ -687,7 +693,22 @@ impl Storage for MysqlStorage {
 				&record.id,
 			),
 		)?;
-		Ok(())
+		// MySQL counts changed rows, so a no-op rewrite of a live row also reads
+		// 0. Callers only act on `false` after re-reading the row, which makes
+		// that harmless; a terminal transition always changes `status`.
+		Ok(conn.affected_rows() > 0)
+	}
+
+	fn list_stale_media(&self, created_before: u64, limit: u32) -> Result<Vec<StoredMedia>> {
+		let mut conn = self.pool.get_conn()?;
+		let rows: Vec<mysql::Row> = conn.exec(
+			format!(
+				"SELECT * FROM media WHERE status NOT IN ({TERMINAL_MEDIA_STATUSES_SQL}) \
+                 AND handle IS NOT NULL AND created_at < ? ORDER BY created_at ASC LIMIT ?"
+			),
+			(created_before, limit),
+		)?;
+		rows.into_iter().map(read_media).collect()
 	}
 
 	fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {

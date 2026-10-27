@@ -2,7 +2,7 @@ use super::credentials::{apply_change, decode_error, Credential, CredentialChang
 use super::{
 	decode_auto_map, encode_allowed_models, encode_auto_map, encode_json_column, generate_api_key, make_key_hint,
 	now_unix, ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia,
-	TimeBucket, UsageRow,
+	TimeBucket, UsageRow, TERMINAL_MEDIA_STATUSES_SQL,
 };
 use anyhow::{Context, Result};
 use postgres::NoTls;
@@ -689,7 +689,7 @@ impl Storage for PostgresStorage {
 		Ok(())
 	}
 
-	fn update_media(&self, record: &StoredMedia) -> Result<()> {
+	fn update_media(&self, record: &StoredMedia) -> Result<bool> {
 		let mut client = self.pool.get().context("PostgreSQL connection failed")?;
 		let handle = encode_json_column(record.handle.as_ref());
 		let result = encode_json_column(record.result.as_ref());
@@ -699,9 +699,15 @@ impl Storage for PostgresStorage {
 		let completed_at = record.completed_at.map(|v| v as i64);
 		// Only the mutable half is written: identity, ownership and the
 		// original request are immutable once the job has been submitted.
-		client.execute(
-			"UPDATE media SET status = $1, handle = $2::jsonb, result = $3::jsonb, usage = $4::jsonb, \
-             warnings = $5::jsonb, error = $6::jsonb, completed_at = $7 WHERE id = $8",
+		// The status guard makes a terminal row write-once: billing reads
+		// `succeeded` rows by `completed_at`, so a second writer (poll, sweep,
+		// another instance) must not touch it.
+		let updated = client.execute(
+			&format!(
+				"UPDATE media SET status = $1, handle = $2::jsonb, result = $3::jsonb, usage = $4::jsonb, \
+                 warnings = $5::jsonb, error = $6::jsonb, completed_at = $7 \
+                 WHERE id = $8 AND status NOT IN ({TERMINAL_MEDIA_STATUSES_SQL})"
+			),
 			&[
 				&record.status,
 				&handle,
@@ -713,7 +719,21 @@ impl Storage for PostgresStorage {
 				&record.id,
 			],
 		)?;
-		Ok(())
+		Ok(updated > 0)
+	}
+
+	fn list_stale_media(&self, created_before: u64, limit: u32) -> Result<Vec<StoredMedia>> {
+		let mut client = self.pool.get().context("PostgreSQL connection failed")?;
+		let created_before = created_before as i64;
+		let limit = i64::from(limit);
+		let rows = client.query(
+			&format!(
+				"SELECT * FROM media WHERE status NOT IN ({TERMINAL_MEDIA_STATUSES_SQL}) \
+                 AND handle IS NOT NULL AND created_at < $1 ORDER BY created_at ASC LIMIT $2"
+			),
+			&[&created_before, &limit],
+		)?;
+		Ok(rows.iter().map(read_media).collect())
 	}
 
 	fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {

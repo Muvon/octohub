@@ -2,7 +2,7 @@ use super::credentials::{apply_change, decode_error, Credential, CredentialChang
 use super::{
 	decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models, encode_auto_map,
 	encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-	StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow,
+	StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow, TERMINAL_MEDIA_STATUSES_SQL,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -701,13 +701,19 @@ impl Storage for SqliteStorage {
 		Ok(())
 	}
 
-	fn update_media(&self, record: &StoredMedia) -> Result<()> {
+	fn update_media(&self, record: &StoredMedia) -> Result<bool> {
 		let conn = lock_conn(&self.conn)?;
 		// Only the mutable half is written: identity, ownership and the
 		// original request are immutable once the job has been submitted.
-		conn.execute(
-			"UPDATE media SET status = ?1, handle = ?2, result = ?3, usage = ?4, \
-             warnings = ?5, error = ?6, completed_at = ?7 WHERE id = ?8",
+		// The status guard makes a terminal row write-once: billing reads
+		// `succeeded` rows by `completed_at`, so a second writer (poll, sweep,
+		// another instance) must not touch it.
+		let updated = conn.execute(
+			&format!(
+				"UPDATE media SET status = ?1, handle = ?2, result = ?3, usage = ?4, \
+                 warnings = ?5, error = ?6, completed_at = ?7 \
+                 WHERE id = ?8 AND status NOT IN ({TERMINAL_MEDIA_STATUSES_SQL})"
+			),
 			rusqlite::params![
 				record.status,
 				encode_json_column(record.handle.as_ref()),
@@ -719,7 +725,19 @@ impl Storage for SqliteStorage {
 				record.id,
 			],
 		)?;
-		Ok(())
+		Ok(updated > 0)
+	}
+
+	fn list_stale_media(&self, created_before: u64, limit: u32) -> Result<Vec<StoredMedia>> {
+		let conn = lock_conn(&self.conn)?;
+		let mut stmt = conn.prepare(&format!(
+			"SELECT id, api_key_id, task, status, input_model, resolved_model, provider, \
+             request, handle, result, usage, warnings, error, created_at, completed_at \
+             FROM media WHERE status NOT IN ({TERMINAL_MEDIA_STATUSES_SQL}) \
+             AND handle IS NOT NULL AND created_at < ?1 ORDER BY created_at ASC LIMIT ?2"
+		))?;
+		let rows = stmt.query_map(rusqlite::params![created_before, limit], read_media)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 	}
 
 	fn get_media(&self, id: &str, api_key_id: i64) -> Result<Option<StoredMedia>> {
@@ -1352,6 +1370,65 @@ mod tests {
 		assert!(storage.get_media("med_1", owner.id).unwrap().is_some());
 		assert!(storage.get_media("med_1", other.id).unwrap().is_none());
 		assert!(storage.get_media("med_missing", owner.id).unwrap().is_none());
+	}
+
+	/// Billing drains `succeeded` rows by `completed_at`: a second writer must
+	/// neither flip the status nor move the timestamp.
+	#[test]
+	fn update_media_never_rewrites_a_terminal_row() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		storage
+			.store_media(&make_stored_media("med_1", key.id, "running"))
+			.unwrap();
+
+		let mut done = make_stored_media("med_1", key.id, "succeeded");
+		done.handle = None;
+		done.completed_at = Some(1700000042);
+		assert!(storage.update_media(&done).unwrap(), "a live row is written");
+
+		let mut late = done.clone();
+		late.status = "failed".to_string();
+		late.completed_at = Some(1700009999);
+		assert!(!storage.update_media(&late).unwrap(), "the second writer is a no-op");
+
+		let reread = storage.get_media("med_1", key.id).unwrap().unwrap();
+		assert_eq!(reread.status, "succeeded");
+		assert_eq!(reread.completed_at, Some(1700000042));
+	}
+
+	#[test]
+	fn list_stale_media_returns_old_live_rows_that_can_still_be_resumed() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		let row = |id: &str, status: &str, created_at: u64, resumable: bool| {
+			let mut row = make_stored_media(id, key.id, status);
+			row.created_at = created_at;
+			if !resumable {
+				row.handle = None;
+			}
+			row
+		};
+		for stored in [
+			row("med_newer", "running", 200, true),
+			row("med_oldest", "queued", 100, true),
+			row("med_young", "running", 1000, true),
+			row("med_done", "succeeded", 100, true),
+			row("med_no_handle", "running", 100, false),
+		] {
+			storage.store_media(&stored).unwrap();
+		}
+
+		let ids = |limit| -> Vec<String> {
+			storage
+				.list_stale_media(500, limit)
+				.unwrap()
+				.into_iter()
+				.map(|r| r.id)
+				.collect()
+		};
+		assert_eq!(ids(50), vec!["med_oldest", "med_newer"]);
+		assert_eq!(ids(1), vec!["med_oldest"]);
 	}
 
 	#[test]

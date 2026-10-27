@@ -140,6 +140,12 @@ pub struct StoredMedia {
 	pub completed_at: Option<u64>,
 }
 
+/// SQL list of the `status` values that end a media job (octolib
+/// `OperationStatus::is_terminal`). Billing drains `succeeded` rows by
+/// `completed_at`, so every backend refuses to rewrite a row in one of these
+/// states; a unit test pins this list to octolib's.
+pub(crate) const TERMINAL_MEDIA_STATUSES_SQL: &str = "'succeeded', 'failed', 'cancelled', 'expired'";
+
 /// Aggregated usage row for reporting
 #[derive(Debug, Clone)]
 pub struct UsageRow {
@@ -245,8 +251,15 @@ pub trait Storage: Send + Sync {
 	/// Insert a submitted media job. Called BEFORE any waiting, so a restart
 	/// can still find and resume work that has already been paid for upstream.
 	fn store_media(&self, record: &StoredMedia) -> Result<()>;
-	/// Overwrite the mutable half of a media row after a status change.
-	fn update_media(&self, record: &StoredMedia) -> Result<()>;
+	/// Overwrite the mutable half of a media row after a status change, unless
+	/// the row is already terminal. Returns whether the row was written: `false`
+	/// means another writer (a client poll, the sweep, another instance) got
+	/// there first and the stored outcome stands, `completed_at` included.
+	fn update_media(&self, record: &StoredMedia) -> Result<bool>;
+	/// Non-terminal rows that still carry a resumable handle and were created
+	/// before `created_before`, oldest first, at most `limit`. Not scoped to a
+	/// key: this feeds the abandoned-job sweep.
+	fn list_stale_media(&self, created_before: u64, limit: u32) -> Result<Vec<StoredMedia>>;
 	/// Fetch a media record scoped to its owning key. A different key's id
 	/// reads as absent — the caller turns that into a 404, never a 403, so
 	/// record ids cannot be probed across tenants.
