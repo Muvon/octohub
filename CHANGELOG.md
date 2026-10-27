@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.14.5] - 2026-10-27
+
+### 📋 Release Summary
+
+Request bodies are now limited, instruction storage supports wider values, and oversized-body test response handling is aligned.
+
+### 🐛 Bug Fixes & Stability
+
+- **api**: align oversized-body test response handling `6810d0b4`
+- **api-storage**: limit request bodies and widen instruction storage `9b9ea840`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.14.3] - 2026-10-27
 
 ### 📋 Release Summary

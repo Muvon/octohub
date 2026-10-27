@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "octohub"
-version = "0.14.4"
+version = "0.14.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
