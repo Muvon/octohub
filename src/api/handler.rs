@@ -1239,7 +1239,7 @@ mod tests {
 		let response = read_body(body(MAX_REQUEST_BODY_BYTES + 1)).await.unwrap_err();
 		assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 		assert_eq!(
-			response_json(response).await,
+			response_json(*response).await,
 			serde_json::json!({"error": {"message": "Request body exceeds 16 MiB", "type": "invalid_request_error"}})
 		);
 	}

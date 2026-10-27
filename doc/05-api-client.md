@@ -181,6 +181,7 @@ The HTTP status code is computed by `classify_engine_error` at
 | Anything else (upstream failure, internal error) | `500 Internal Server Error` | The full `anyhow` chain via `{:#}` formatting |
 | Missing/invalid `Authorization` header | `401 Unauthorized` | `"Missing API key"` or `"Invalid or revoked API key"` |
 | `serde_json` parse failure on the body | `400 Bad Request` | `"Invalid request JSON: …"` |
+| Request body over 16 MiB (`MAX_REQUEST_BODY_BYTES`) | `413 Payload Too Large` | `"Request body exceeds 16 MiB"` — rejected before any upstream call |
 
 ### A note on retries
 
