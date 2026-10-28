@@ -9,6 +9,11 @@ use mysql::prelude::*;
 use mysql::{Opts, Pool};
 use std::collections::HashMap;
 
+/// Ceiling for one `walk_chain` recursion (`cte_max_recursion_depth`, default
+/// 1000). Far above any chain a context window holds between compressions;
+/// a chain past it is a bug worth an error, not a silent cut.
+const CHAIN_MAX_DEPTH: u32 = 1_000_000;
+
 /// MySQL-backed storage implementation
 pub struct MysqlStorage {
 	pool: Pool,
@@ -578,15 +583,21 @@ impl Storage for MysqlStorage {
 
 	fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
 		let mut conn = self.pool.get_conn()?;
-		// Single recursive CTE — one round-trip regardless of chain depth.
+		// Single recursive CTE — one round-trip regardless of chain depth. MySQL
+		// stops a recursive CTE after cte_max_recursion_depth (1000) rows, and a
+		// tool-heavy session chains one completion per step: prod hit 1001 on
+		// 2026-10-28. The hint lifts the cap for this statement only; compression
+		// restarts the chain, so its real depth stays bounded by the context window.
 		let rows: Vec<mysql::Row> = conn.exec(
-			"WITH RECURSIVE chain AS (\
+			format!(
+				"WITH RECURSIVE chain AS (\
                SELECT * FROM completions WHERE id = ? \
                UNION ALL \
                SELECT c.* FROM completions c \
                JOIN chain ON c.id = chain.previous_completion_id \
              ) \
-             SELECT * FROM chain ORDER BY created_at ASC",
+             SELECT /*+ SET_VAR(cte_max_recursion_depth = {CHAIN_MAX_DEPTH}) */ * FROM chain ORDER BY created_at ASC"
+			),
 			(id,),
 		)?;
 		rows.into_iter().map(read_completion).collect()

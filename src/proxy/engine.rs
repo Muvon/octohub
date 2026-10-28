@@ -432,27 +432,26 @@ impl ProxyEngine {
 			// provider (Anthropic, etc.) where they pass the full history inline in
 			// `input`. Hard-failing would break that workflow. Mirrors OpenAI's
 			// guidance: "retry with full input context and previous_response_id null."
+			// An unknown id walks to an empty chain. A chain that fails to LOAD is not
+			// unknown: its history is stored, and answering from the new input alone
+			// would cut the model's memory without a word (prod 2026-10-28, MySQL's
+			// recursion cap) — that fails the request.
 			let chain_start = std::time::Instant::now();
 			let storage = self.storage.clone();
 			let prev_id = prev_cmpl_id.clone();
-			let chain_result = tokio::task::spawn_blocking(move || storage.walk_chain(&prev_id)).await?;
+			let chain = tokio::task::spawn_blocking(move || storage.walk_chain(&prev_id))
+				.await?
+				.with_context(|| format!("loading the chain of previous_completion_id {prev_cmpl_id}"))?;
 			let chain_ms = chain_start.elapsed().as_millis() as u64;
 			tracing::Span::current().record("chain_ms", chain_ms);
-
-			let chain = match chain_result {
-				Ok(chain) => {
-					resolved_prev_id = Some(prev_cmpl_id.clone());
-					chain
-				}
-				Err(err) => {
-					tracing::warn!(
-						previous_completion_id = %prev_cmpl_id,
-						error = %err,
-						"Unknown previous_completion_id — falling back to inline input only",
-					);
-					Vec::new()
-				}
-			};
+			if chain.is_empty() {
+				tracing::warn!(
+					previous_completion_id = %prev_cmpl_id,
+					"Unknown previous_completion_id — using inline input only",
+				);
+			} else {
+				resolved_prev_id = Some(prev_cmpl_id.clone());
+			}
 
 			// Inherit session_id and the serving provider from the most
 			// recent (last) chain entry.
