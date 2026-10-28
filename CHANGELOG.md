@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.14.7] - 2026-10-28
+
+### 📋 Release Summary
+
+Completion chains are now validated before replay, and errors encountered while loading them are propagated.
+
+### 🐛 Bug Fixes & Stability
+
+- **storage**: validate completion chains before replay `0fa5bd35`
+- **completion-chain**: propagate completion-chain load errors `4fa177cc`
+
 ## [0.14.6] - 2026-10-28
 
 ### 📋 Release Summary
