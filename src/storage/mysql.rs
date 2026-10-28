@@ -588,19 +588,21 @@ impl Storage for MysqlStorage {
 		// tool-heavy session chains one completion per step: prod hit 1001 on
 		// 2026-10-28. The hint lifts the cap for this statement only; compression
 		// restarts the chain, so its real depth stays bounded by the context window.
+		// Ordered by walk depth, not created_at: two links stored in the same second
+		// would otherwise replay in either order.
 		let rows: Vec<mysql::Row> = conn.exec(
 			format!(
 				"WITH RECURSIVE chain AS (\
-               SELECT * FROM completions WHERE id = ? \
+               SELECT *, 0 AS depth FROM completions WHERE id = ? \
                UNION ALL \
-               SELECT c.* FROM completions c \
+               SELECT c.*, chain.depth + 1 FROM completions c \
                JOIN chain ON c.id = chain.previous_completion_id \
              ) \
-             SELECT /*+ SET_VAR(cte_max_recursion_depth = {CHAIN_MAX_DEPTH}) */ * FROM chain ORDER BY created_at ASC"
+             SELECT /*+ SET_VAR(cte_max_recursion_depth = {CHAIN_MAX_DEPTH}) */ * FROM chain ORDER BY depth DESC"
 			),
 			(id,),
 		)?;
-		rows.into_iter().map(read_completion).collect()
+		super::complete_chain(rows.into_iter().map(read_completion).collect::<Result<_>>()?)
 	}
 
 	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {

@@ -521,27 +521,7 @@ impl Storage for SqliteStorage {
 		let mut stmt = conn.prepare(&sql)?;
 		let rows = stmt.query_map(rusqlite::params![id], read_completion)?;
 		let chain = rows.collect::<Result<Vec<_>, _>>()?;
-		// Validate completeness: every non-root row must have its predecessor present.
-		if chain.len() > 1 {
-			let ids: std::collections::HashSet<&str> = chain.iter().map(|c| c.id.as_str()).collect();
-			for c in &chain {
-				if let Some(ref prev_id) = c.previous_completion_id {
-					if !ids.contains(prev_id.as_str()) {
-						anyhow::bail!(
-							"Chain broken: completion {} references missing predecessor {}",
-							c.id,
-							prev_id
-						);
-					}
-				}
-			}
-		} else if let Some(c) = chain.first() {
-			// Single entry: if it has a previous_completion_id the predecessor is missing.
-			if c.previous_completion_id.is_some() {
-				anyhow::bail!("Chain broken: completion {} references missing predecessor", c.id);
-			}
-		}
-		Ok(chain)
+		super::complete_chain(chain)
 	}
 
 	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {

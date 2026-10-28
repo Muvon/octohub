@@ -10,6 +10,23 @@ use rand::RngCore;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A walked chain is whole only when every row's predecessor is in it. The
+/// recursive walk stops at the first previous_completion_id with no row, so a
+/// missing link leaves a SHORTER chain that looks valid; replaying it would
+/// answer with the conversation silently cut. Every backend checks the same way.
+pub(crate) fn complete_chain(chain: Vec<StoredCompletion>) -> Result<Vec<StoredCompletion>> {
+	let ids: std::collections::HashSet<&str> = chain.iter().map(|c| c.id.as_str()).collect();
+	if let Some((id, prev)) = chain.iter().find_map(|c| {
+		c.previous_completion_id
+			.as_deref()
+			.filter(|prev| !ids.contains(prev))
+			.map(|prev| (c.id.as_str(), prev))
+	}) {
+		anyhow::bail!("Chain broken: completion {id} references missing predecessor {prev}");
+	}
+	Ok(chain)
+}
+
 /// Stored API key record
 #[derive(Debug, Clone)]
 pub struct ApiKey {
@@ -235,7 +252,8 @@ pub trait Storage: Send + Sync {
 	fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>>;
 	/// Walk the chain of previous_completion_id links, returning completions oldest-first.
 	/// Only populates the fields needed for chain replay: id, session_id,
-	/// previous_completion_id, input, output, instructions.
+	/// previous_completion_id, input, output, instructions. A chain with a missing
+	/// link is an error ([`complete_chain`]), never a shorter history.
 	fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>>;
 	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>>;
 

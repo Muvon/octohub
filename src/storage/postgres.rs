@@ -527,18 +527,20 @@ impl Storage for PostgresStorage {
 
 	fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
 		let mut client = self.pool.get().context("PostgreSQL connection failed")?;
-		// Single recursive CTE — one round-trip regardless of chain depth.
+		// Single recursive CTE — one round-trip regardless of chain depth. Ordered by
+		// walk depth, not created_at: two links stored in the same second would
+		// otherwise replay in either order.
 		let rows = client.query(
 			"WITH RECURSIVE chain AS (\
-               SELECT * FROM completions WHERE id = $1 \
+               SELECT *, 0 AS depth FROM completions WHERE id = $1 \
                UNION ALL \
-               SELECT c.* FROM completions c \
+               SELECT c.*, chain.depth + 1 FROM completions c \
                JOIN chain ON c.id = chain.previous_completion_id \
              ) \
-             SELECT * FROM chain ORDER BY created_at ASC",
+             SELECT * FROM chain ORDER BY depth DESC",
 			&[&id],
 		)?;
-		Ok(rows.iter().map(read_completion).collect())
+		super::complete_chain(rows.iter().map(read_completion).collect())
 	}
 
 	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {

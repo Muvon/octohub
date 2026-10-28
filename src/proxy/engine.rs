@@ -2652,6 +2652,7 @@ mod byok_tests {
 	struct Upstream {
 		statuses: std::collections::HashMap<String, u16>,
 		requests: Vec<(String, String)>,
+		bodies: Vec<serde_json::Value>,
 	}
 
 	fn request(model: &str, previous: Option<&str>) -> CreateCompletionRequest {
@@ -2661,8 +2662,7 @@ mod byok_tests {
 		.unwrap()
 	}
 
-	#[tokio::test]
-	async fn routing_dispatches_owner_keys_fails_over_and_persists_byok() {
+	async fn mock_upstream() -> (std::net::SocketAddr, Arc<Mutex<Upstream>>, tokio::task::JoinHandle<()>) {
 		use http_body_util::{BodyExt, Full};
 		use hyper::service::service_fn;
 		use hyper_util::rt::TokioIo;
@@ -2685,6 +2685,7 @@ mod byok_tests {
                             let status = {
                                 let mut state = state.lock().unwrap();
                                 state.requests.push((path.clone(), auth.clone()));
+								state.bodies.push(serde_json::from_slice(&body).unwrap());
                                 state.statuses.get(&path).copied().unwrap_or(200)
                             };
                             let body = if status == 200 {
@@ -2701,6 +2702,120 @@ mod byok_tests {
 				});
 			}
 		});
+		(address, upstream, server)
+	}
+
+	struct ChainHarness {
+		engine: ProxyEngine,
+		storage: Arc<SqliteStorage>,
+		key: ApiKey,
+		upstream: Arc<Mutex<Upstream>>,
+		server: tokio::task::JoinHandle<()>,
+		_env: EnvGuard,
+	}
+
+	impl ChainHarness {
+		async fn new(provider: &str, url_env: &'static str, key_env: &'static str) -> Self {
+			let (address, upstream, server) = mock_upstream().await;
+			// Each test uses a different provider so process-wide overrides cannot race.
+			let env = EnvGuard::set(&[(url_env, format!("http://{address}")), (key_env, "mock-key".into())]);
+			let config: Config = toml::from_str(&format!("[models]\nchain = [\"{provider}:m\"]")).unwrap();
+			let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+			let key = storage.create_api_key("key", None, None, None).unwrap();
+			let credentials = Arc::new(Credentials::new(storage.clone(), None).unwrap());
+			let limiter = Arc::new(RwLock::new(Arc::new(ProviderLimiter::from_config(&config))));
+			let config = Arc::new(RwLock::new(Arc::new(config)));
+			let engine = ProxyEngine::new(storage.clone(), config, limiter, 1, credentials);
+			Self {
+				engine,
+				storage,
+				key,
+				upstream,
+				server,
+				_env: env,
+			}
+		}
+	}
+
+	impl Drop for ChainHarness {
+		fn drop(&mut self) {
+			self.server.abort();
+		}
+	}
+
+	#[tokio::test]
+	async fn unknown_previous_completion_id_uses_inline_input_without_dangling_parent() {
+		let h = ChainHarness::new("cerebras", "CEREBRAS_API_URL", "CEREBRAS_API_KEY").await;
+		let (response, _) = h
+			.engine
+			.process(request("chain", Some("missing")), &h.key, None, None)
+			.await
+			.unwrap();
+		let stored = h.storage.get_completion(&response.id).unwrap().unwrap();
+		assert_eq!(stored.previous_completion_id, None);
+		let upstream = h.upstream.lock().unwrap();
+		assert_eq!(upstream.bodies.len(), 1);
+		assert_eq!(
+			upstream.bodies[0]["messages"],
+			serde_json::json!([{"role":"user", "content":"hello"}])
+		);
+	}
+
+	#[tokio::test]
+	async fn broken_previous_completion_chain_fails_before_upstream() {
+		let h = ChainHarness::new("deepseek", "DEEPSEEK_API_URL", "DEEPSEEK_API_KEY").await;
+		let (prior, _) = h
+			.engine
+			.process(request("chain", None), &h.key, None, None)
+			.await
+			.unwrap();
+		let mut broken = h.storage.get_completion(&prior.id).unwrap().unwrap();
+		broken.id = "broken".into();
+		broken.previous_completion_id = Some("missing".into());
+		h.storage.store_completion(&broken).unwrap();
+		h.upstream.lock().unwrap().requests.clear();
+
+		let result = h
+			.engine
+			.process(request("chain", Some("broken")), &h.key, None, None)
+			.await;
+		assert!(
+			h.upstream.lock().unwrap().requests.is_empty(),
+			"a broken chain must never reach the provider"
+		);
+		let Err(error) = result else {
+			panic!("a broken chain must fail the request");
+		};
+		assert_eq!(error.to_string(), "loading the chain of previous_completion_id broken");
+		assert!(format!("{error:#}").contains("Chain broken"));
+	}
+
+	#[tokio::test]
+	async fn known_previous_completion_chain_replays_before_new_input() {
+		let h = ChainHarness::new("moonshot", "MOONSHOT_API_URL", "MOONSHOT_API_KEY").await;
+		let mut first = request("chain", None);
+		first.input = Input::Text("prior question".into());
+		let (prior, _) = h.engine.process(first, &h.key, None, None).await.unwrap();
+		let mut next = request("chain", Some(&prior.id));
+		next.input = Input::Text("follow-up".into());
+		let (response, _) = h.engine.process(next, &h.key, None, None).await.unwrap();
+		let stored = h.storage.get_completion(&response.id).unwrap().unwrap();
+		assert_eq!(stored.previous_completion_id.as_deref(), Some(prior.id.as_str()));
+		let upstream = h.upstream.lock().unwrap();
+		assert_eq!(upstream.bodies.len(), 2);
+		assert_eq!(
+			upstream.bodies[1]["messages"],
+			serde_json::json!([
+				{"role":"user", "content":"prior question"},
+				{"role":"assistant", "content":"hello"},
+				{"role":"user", "content":"follow-up"}
+			])
+		);
+	}
+
+	#[tokio::test]
+	async fn routing_dispatches_owner_keys_fails_over_and_persists_byok() {
+		let (address, upstream, server) = mock_upstream().await;
 		let _env = EnvGuard::set(&[
 			("ZAI_API_URL", format!("http://{address}/zai")),
 			("OLLAMA_API_URL", format!("http://{address}/ollama")),

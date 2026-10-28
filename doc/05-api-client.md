@@ -125,9 +125,11 @@ Practical effects:
 - **The chain always replays from the database**, not from the
   client's memory. A client that lost the conversation history can
   recover it by passing the last `id`.
-- **The chain is loaded once per request.** A circular `previous_completion_id`
-  is not detected — the recursion would terminate on a missing row, not a
-  loop guard.
+- **An unknown ID starts a fresh conversation** using only the inline
+  input. The new completion is stored without a parent link.
+- **A chain that cannot be loaded fails the request** before any upstream
+  provider call, so the model never answers with stored history silently cut.
+- **The chain is loaded once per request.**
 
 ### `text.format` — structured output
 
