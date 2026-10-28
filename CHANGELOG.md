@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.14.6] - 2026-10-28
+
+### 📋 Release Summary
+
+Concurrent MySQL row updates are now serialized. Agent documentation clarifies where to find cloud skill evidence.
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib to 0.47.0 `753f2acc`
+
+### 🐛 Bug Fixes & Stability
+
+- **mysql**: serialize concurrent MySQL row updates `0eddb14e`
+
+### 📚 Documentation & Examples
+
+- **agents**: clarify cloud skill evidence location `f60506ab`
+
 ## [0.14.5] - 2026-10-27
 
 ### 📋 Release Summary
