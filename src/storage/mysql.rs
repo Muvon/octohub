@@ -449,30 +449,50 @@ impl Storage for MysqlStorage {
 	}
 
 	fn revoke_api_key(&self, id: i64) -> Result<bool> {
+		// MyRocks fails overlapping writers of one primary key with error 1062 instead of
+		// queueing them; locking the row first makes them wait (same for the two updates below).
 		let mut conn = self.pool.get_conn()?;
-		conn.exec_drop(
+		let mut tx = conn.start_transaction(
+			mysql::TxOpts::default().set_isolation_level(Some(mysql::IsolationLevel::ReadCommitted)),
+		)?;
+		tx.exec_drop("SELECT id FROM api_keys WHERE id = ? FOR UPDATE", (id,))?;
+		tx.exec_drop(
 			"UPDATE api_keys SET status = 'revoked' WHERE id = ? AND status = 'active'",
 			(id,),
 		)?;
-		Ok(conn.affected_rows() > 0)
+		let updated = tx.affected_rows() > 0;
+		tx.commit()?;
+		Ok(updated)
 	}
 
 	fn update_api_key_models(&self, id: i64, allowed_models: Option<&[String]>) -> Result<bool> {
 		let mut conn = self.pool.get_conn()?;
-		conn.exec_drop(
+		let mut tx = conn.start_transaction(
+			mysql::TxOpts::default().set_isolation_level(Some(mysql::IsolationLevel::ReadCommitted)),
+		)?;
+		tx.exec_drop("SELECT id FROM api_keys WHERE id = ? FOR UPDATE", (id,))?;
+		tx.exec_drop(
 			"UPDATE api_keys SET allowed_models = ? WHERE id = ? AND status = 'active'",
 			(encode_allowed_models(allowed_models), id),
 		)?;
-		Ok(conn.affected_rows() > 0)
+		let updated = tx.affected_rows() > 0;
+		tx.commit()?;
+		Ok(updated)
 	}
 
 	fn update_api_key_owner(&self, id: i64, owner: Option<&str>, owner_concurrency: Option<u32>) -> Result<bool> {
 		let mut conn = self.pool.get_conn()?;
-		conn.exec_drop(
+		let mut tx = conn.start_transaction(
+			mysql::TxOpts::default().set_isolation_level(Some(mysql::IsolationLevel::ReadCommitted)),
+		)?;
+		tx.exec_drop("SELECT id FROM api_keys WHERE id = ? FOR UPDATE", (id,))?;
+		tx.exec_drop(
 			"UPDATE api_keys SET owner = ?, owner_concurrency = ? WHERE id = ? AND status = 'active'",
 			(owner, owner_concurrency, id),
 		)?;
-		Ok(conn.affected_rows() > 0)
+		let updated = tx.affected_rows() > 0;
+		tx.commit()?;
+		Ok(updated)
 	}
 
 	fn get_owner_auto_map(&self, owner: &str) -> Result<Option<std::collections::HashMap<String, String>>> {
@@ -483,18 +503,26 @@ impl Storage for MysqlStorage {
 
 	fn set_owner_auto_map(&self, owner: &str, map: Option<&std::collections::HashMap<String, String>>) -> Result<()> {
 		let mut conn = self.pool.get_conn()?;
+		let mut tx = conn.start_transaction(
+			mysql::TxOpts::default().set_isolation_level(Some(mysql::IsolationLevel::ReadCommitted)),
+		)?;
+		tx.exec_drop(
+			"SELECT owner FROM owner_auto_models WHERE owner = ? FOR UPDATE",
+			(owner,),
+		)?;
 		match map.filter(|m| !m.is_empty()) {
 			Some(m) => {
-				conn.exec_drop(
+				tx.exec_drop(
 					"INSERT INTO owner_auto_models (owner, map, updated_at) VALUES (?, ?, ?) \
                      ON DUPLICATE KEY UPDATE map = VALUES(map), updated_at = VALUES(updated_at)",
 					(owner, encode_auto_map(m), now_unix()),
 				)?;
 			}
 			None => {
-				conn.exec_drop("DELETE FROM owner_auto_models WHERE owner = ?", (owner,))?;
+				tx.exec_drop("DELETE FROM owner_auto_models WHERE owner = ?", (owner,))?;
 			}
 		}
+		tx.commit()?;
 		Ok(())
 	}
 
@@ -980,5 +1008,39 @@ mod tests {
 			Some(vec![]),
 			"an empty list stays an explicit lockout"
 		);
+	}
+
+	/// MyRocks fails overlapping writers of one primary key with error 1062 unless the row is locked first.
+	#[test]
+	fn concurrent_key_updates_queue_on_the_row_lock() {
+		let Some(storage) = storage() else {
+			eprintln!("skipped: OCTOHUB_TEST_MYSQL_URL is not set");
+			return;
+		};
+		// Ok(false) is legitimate here: MySQL reports 0 changed rows when a writer stores the
+		// value already there. Only an Err is the conflict this test exists for.
+		const ROUNDS: usize = 200;
+		const OWNERS: [&str; 8] = [
+			"race-a", "race-b", "race-c", "race-d", "race-e", "race-f", "race-g", "race-h",
+		];
+		let key = storage.create_api_key("race", None, None, None).unwrap();
+		let storage = &storage;
+		std::thread::scope(|scope| {
+			for owner in OWNERS {
+				scope.spawn(move || {
+					let models = vec![owner.to_string()];
+					for _ in 0..ROUNDS {
+						storage.update_api_key_owner(key.id, Some(owner), Some(1)).unwrap();
+						storage.update_api_key_models(key.id, Some(&models)).unwrap();
+					}
+				});
+			}
+		});
+		let row = storage.get_api_key(key.id).unwrap().unwrap();
+		let owner = row.owner.expect("owner written");
+		assert!(OWNERS.contains(&owner.as_str()));
+		let models = row.allowed_models.expect("models written");
+		assert!(models.len() == 1 && OWNERS.contains(&models[0].as_str()));
+		assert_eq!(row.owner_concurrency, Some(1));
 	}
 }
