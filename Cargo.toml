@@ -14,6 +14,8 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful", "http1", "http2"] }
 http-body-util = "0.1"
 bytes = "1"
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake", "connect"] }
+futures-util = { version = "0.3", features = ["sink"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -4,11 +4,9 @@ Base URL: `http://127.0.0.1:8080` (configurable via `octohub.toml`)
 
 ## Authentication
 
-OctoHub has two authentication layers, both controlled by the `api_key` setting in `octohub.toml`.
+OctoHub has two independent authentication layers. The master `api_key` setting in `octohub.toml` does not enable or disable client authentication.
 
-**If `api_key` is not set** (default): the server starts without authentication. All client endpoints are open, admin endpoints are disabled. A warning is printed at startup.
-
-**If `api_key` is set**: full authentication is enforced on both layers.
+All client endpoints, including the WebSocket handshake and every completion message, require an active client API key from the database even when no master key is configured.
 
 ### Client endpoints (`/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`)
 
@@ -52,12 +50,49 @@ OctoHub exposes two completion APIs. Use whichever fits your client:
 | Endpoint | Style | Best for |
 |---|---|---|
 | `POST /v1/completions` | **OctoHub Responses API** | Octomind and native OctoHub clients. Multi-turn chains, reasoning replay, richer output shape. |
+| `GET /v1/completions` | **WebSocket upgrade (HTTP/1.1)** | Machine clients reusing a connection for sequential, buffered native completions. |
 | `POST /v1/chat/completions` | **Classic OpenAI Chat Completions** | Any OpenAI-compatible SDK or tool (LangChain, LiteLLM, curl with `openai` libs, etc.). Drop-in replacement. |
 | `POST /v1/embeddings` | OpenAI-compatible | Embedding clients. |
 
-Both completion endpoints hit the **same proxy engine** and write to the **same `completions` table** with the same `id`, auth, metrics, and logging. The only difference is the wire format.
+Native completions (HTTP or WebSocket) and classic chat share the **same proxy engine** and **`completions` table**, authorization, metrics, and logging; their wire formats and transports differ.
 
 > **Note:** `POST /v1/chat/completions` supports `"stream": true` as buffered SSE: the upstream call completes before text and indexed tool-call deltas are emitted. This does not provide upstream token streaming or earlier first-token delivery. Set `"stream_options": {"include_usage": true}` to receive a final usage-only chunk with empty `choices` before `[DONE]`; other chunks have `usage: null` when requested.
+
+---
+
+### GET /v1/completions — WebSocket
+
+An authenticated HTTP/1.1 WebSocket upgrade on the native completion route. `POST /v1/completions` is unchanged. Send `Authorization: Bearer <client-api-key>` in the handshake; this is a machine-to-machine endpoint, not a browser endpoint. Any `Origin` header is rejected with HTTP `403`. Invalid or malformed upgrade requests are checked before authentication and rejected with HTTP `400`; a valid handshake without a bearer token returns HTTP `401`.
+
+Send each request as one JSON **text message** using the existing `CreateCompletionRequest` schema below, without an additional request envelope:
+
+```json
+{"model":"my-model","input":"Say hi"}
+```
+
+Each request receives one final text message with this envelope (shown as JSONC):
+
+```jsonc
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json",
+    "x-request-id": "01JAZ6Y6D6YAW9W7G9NRJHY7GK"
+  },
+  "body": { /* existing completion response JSON object */ }
+}
+```
+
+`status` is `200` on success or the existing HTTP error status on failure; `body` is the existing response or error JSON **object**, not an encoded JSON string. Header names are lowercase and their values are strings. Each reply gets a fresh ULID `x-request-id`; a valid client-supplied `X-Request-Id` is used only for the HTTP handshake, not completion messages. Existing errors and discriminators, including `error.type = "modality_not_supported"`, are preserved. A rate-window `429` carries the existing `Retry-After` as `headers["retry-after"]` when supplied by the shared handler.
+
+- **One in-flight request per connection:** wait for the final reply before sending the next request. Pipelining closes the connection with `1008`; there is no application request backlog.
+- **Transport limits:** incoming frames and complete request messages are capped at **16 MiB** (`1009` on overflow). Each single outgoing **serialized envelope**, including status, headers, and body, is capped at **64 MiB**; exceeding it closes with `1009`. Binary messages are rejected with `1003`; malformed protocol frames close with `1002`. Native WebSocket Ping/Pong remains supported while a completion is pending.
+- **Buffered, not token-streaming:** the engine completes before the single reply is sent. WebSocket transport does not provide upstream token streaming or promise faster completion or first-token delivery.
+- **Live authorization and routing:** the client key is authenticated at the handshake and again for every request message. Revocation and model/owner edits apply to subsequent messages. Each request takes a fresh configuration snapshot. Handshake `X-Model-Purpose`, `X-Title`, `HTTP-Referer`, and `X-OpenRouter-Categories` are carried into each request.
+- **Bounds and shutdown:** Acceptance through first headers (including protocol detection), every HTTP/1 request's header reads, handshake authentication, HTTP upgrade completion (`OnUpgrade`), and transport send/flush/close operations each have fixed **10-second** bounds, not new configuration knobs. Listener/header bounds apply to ordinary HTTP routes too, not to bodies or handler duration. These are not completion deadlines. The existing `server.shutdown_timeout_secs` controls draining: idle sockets close with `1001`; busy requests may finish within the drain bound, then close with `1001`. No new requests are accepted during drain; overdue work is aborted.
+- **Disconnect:** closing the socket cancels the local request future and releases its permits. It cannot roll back an already-issued provider call or a running blocking database write.
+
+The upgrade is observed as a separate `GET` handshake. Each completion message uses the shared completion engine, error handling, metrics, and request tracing as `POST /v1/completions`; see [client transport details](doc/05-api-client.md#get-v1completions--websocket) and [observability](doc/07-observability.md#websocket-completions).
 
 ---
 

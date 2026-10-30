@@ -91,7 +91,7 @@ populated by handlers as the request progresses:
 
 | Field | Set at | Type | Notes |
 |---|---|---|---|
-| `req_id` | `src/main.rs:183` | string | `X-Request-Id` passthrough (1–64 chars, `[A-Za-z0-9._-]`) or fresh ULID |
+| `req_id` | `src/main.rs:183` | string | HTTP `X-Request-Id` passthrough (1–64 chars, `[A-Za-z0-9._-]`) or fresh ULID; WebSocket completion messages always get a fresh ULID |
 | `method` | `src/main.rs:215` | string | `GET`, `POST`, … |
 | `route` | `src/main.rs:163` | string | Low-cardinality label: `/v1/completions`, `/v1/embeddings`, `/v1/admin/keys`, `/v1/admin/usage`, `/v1/admin/completions`, `/v1/admin/embeddings`, `/health`, or `other` |
 | `path` | `src/main.rs:216` | string | Full request path (high-cardinality) |
@@ -122,6 +122,37 @@ Behavior:
 
 This is the join key. Take a 500 from a client, grab the `X-Request-Id`
 from the response, grep your logs.
+
+### WebSocket completions
+
+The HTTP/1.1 `GET /v1/completions` upgrade is observed separately as a
+`GET` handshake, including its HTTP status (`101` on success, the existing
+HTTP error status on rejection). Its duration is the handshake duration,
+not the lifetime of the upgraded socket.
+
+Each completion request text message has a separate request span and is
+recorded as **`POST /v1/completions`**, using the existing request counter,
+duration histogram, and in-flight guard. Each message gets a fresh ULID
+`req_id`, also returned as `headers["x-request-id"]` in its final JSON
+envelope; it does not reuse the handshake's ID. A valid client-supplied
+`X-Request-Id` applies only to the HTTP handshake. The envelope's `status`
+is the request's success or error status, not the upgrade's `101`.
+
+`main::route` passes its computed `effective_remote` string to
+`websocket::handle_upgrade`; the session carries it into each message's
+`remote` span field. Messages therefore retain the handshake's effective
+remote address and the existing trusted-forwarding policy, rather than
+recomputing it from message JSON. Their spans also carry
+`transport = "websocket"`.
+
+Messages use the shared completion engine, completion metrics, and error
+helpers, preserving provider/queue/token measurements where available
+and the existing optional `metrics.per_key` labels. Existing errors,
+including `error.type = "modality_not_supported"`, are unchanged, and
+rate-window `429` replies preserve the handler's `Retry-After` as the
+lowercase string header `retry-after` in the envelope. Native Ping/Pong
+and socket lifetime are not completion requests; a buffered WebSocket
+reply does not represent token streaming.
 
 ### `X-Forwarded-For` and `Forwarded` (RFC 7239)
 
@@ -172,8 +203,8 @@ are defined at `src/metrics.rs:17`–`20`.
 | Name | Type | Labels | Description |
 |---|---|---|---|
 | `octohub_build_info`                  | gauge     | `version` | Always 1; identifies the running version |
-| `octohub_requests_total`              | counter   | `route`, `method`, `status` | Every HTTP request |
-| `octohub_request_duration_seconds`    | histogram | `route`, `method` | Total request duration |
+| `octohub_requests_total`              | counter   | `route`, `method`, `status` | HTTP requests and WebSocket completion messages (recorded as `POST`) |
+| `octohub_request_duration_seconds`    | histogram | `route`, `method` | Request duration; WebSocket handshake and completion messages measured separately |
 | `octohub_requests_in_flight`          | gauge     | `route` | In-flight requests right now |
 | `octohub_completions_total`           | counter   | `model`, `provider`, `status`, `api_key_id`\* | Completion requests |
 | `octohub_completion_duration_seconds` | histogram | `model`, `provider` | Upstream call duration |

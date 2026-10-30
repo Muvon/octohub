@@ -3,21 +3,155 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper::{header, Request, Response, StatusCode, Version};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::{TcpListener, TcpSocket};
+use tokio::sync::{watch, Notify};
+use tokio::task::JoinSet;
 
 use crate::BoxBody;
 
 /// The backlog `tokio::net::TcpListener::bind` uses.
 const LISTEN_BACKLOG: u32 = 128;
+// Bounds every HTTP/1 request's headers, not its body or handler duration.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upgraded connections outlive Hyper's connection future, so they need their
+/// own drain signal and task ownership.
+#[derive(Clone)]
+pub(crate) struct UpgradeTasks {
+	tasks: Arc<Mutex<JoinSet<()>>>,
+	draining: watch::Sender<bool>,
+	changed: Arc<Notify>,
+}
+
+impl UpgradeTasks {
+	fn new() -> Self {
+		Self {
+			tasks: Arc::new(Mutex::new(JoinSet::new())),
+			draining: watch::channel(false).0,
+			changed: Arc::new(Notify::new()),
+		}
+	}
+
+	pub fn is_draining(&self) -> bool {
+		*self.draining.borrow()
+	}
+
+	pub fn subscribe(&self) -> watch::Receiver<bool> {
+		self.draining.subscribe()
+	}
+
+	/// Admission and the drain transition share the task lock: an upgrade
+	/// cannot slip into the registry after shutdown has started.
+	pub fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
+		let mut tasks = self.tasks.lock().unwrap();
+		if self.is_draining() {
+			return false;
+		}
+		tasks.spawn(task);
+		self.changed.notify_one();
+		true
+	}
+
+	fn begin_drain(&self) {
+		let _tasks = self.tasks.lock().unwrap();
+		self.draining.send_replace(true);
+	}
+
+	fn len(&self) -> usize {
+		self.tasks.lock().unwrap().len()
+	}
+
+	fn abort_all(&self) {
+		self.tasks.lock().unwrap().abort_all();
+	}
+
+	fn close(&self) {
+		let tasks = {
+			let mut tasks = self.tasks.lock().unwrap();
+			self.draining.send_replace(true);
+			std::mem::take(&mut *tasks)
+		};
+		// Drop outside the lock; JoinSet aborts all tasks and releases handles.
+		drop(tasks);
+	}
+
+	async fn wait(&self) {
+		// Lock only for a poll, never across an await: handlers must be able to
+		// register another upgrade while existing tasks are still running.
+		while let Some(result) = std::future::poll_fn(|cx| self.tasks.lock().unwrap().poll_join_next(cx)).await {
+			if let Err(err) = result {
+				if !err.is_cancelled() {
+					tracing::error!(error = %err, "connection task failed");
+				}
+			}
+		}
+	}
+
+	async fn reap(&self) {
+		loop {
+			self.wait().await;
+			// One reaper per registry: notify_one stores a permit if spawn races
+			// the empty check above, so this wait cannot miss that admission.
+			self.changed.notified().await;
+		}
+	}
+}
+
+/// Task futures can hold registry clones themselves. A serve-owned guard breaks
+/// that ownership cycle even if serve is cancelled before its normal drain.
+struct ServeTasks {
+	http: UpgradeTasks,
+	upgrades: UpgradeTasks,
+}
+
+impl Drop for ServeTasks {
+	fn drop(&mut self) {
+		self.http.close();
+		self.upgrades.close();
+	}
+}
+
+/// Hyper executes HTTP/2 streams separately from the connection future. Keep
+/// those futures owned too, rather than detaching them through TokioExecutor.
+#[derive(Clone)]
+struct HttpExecutor(UpgradeTasks);
+
+impl<F> hyper::rt::Executor<F> for HttpExecutor
+where
+	F: Future + Send + 'static,
+	F::Output: Send + 'static,
+{
+	fn execute(&self, future: F) {
+		self.0.spawn(async move {
+			future.await;
+		});
+	}
+}
+
+/// Protocol detection happens before Hyper's HTTP/1 header timer. Stop this
+/// acceptance deadline at service entry, not when the response finishes.
+async fn with_header_deadline<F: Future>(
+	connection: F,
+	received: &Notify,
+	deadline: tokio::time::Instant,
+) -> Option<F::Output> {
+	let mut connection = std::pin::pin!(connection);
+	tokio::select! {
+		biased;
+		_ = received.notified() => Some(connection.await),
+		_ = tokio::time::sleep_until(deadline) => None,
+		result = &mut connection => Some(result),
+	}
+}
 
 /// Bind the client listener. `SO_REUSEPORT` lets another process bind the
 /// same address while this one serves — a sibling deploy slot, or a load
@@ -82,6 +216,12 @@ where
 	F: Future<Output = Response<BoxBody>> + Send + 'static,
 {
 	let graceful = GracefulShutdown::new();
+	let upgrades = UpgradeTasks::new();
+	let connections = UpgradeTasks::new();
+	let _tasks = ServeTasks {
+		http: connections.clone(),
+		upgrades: upgrades.clone(),
+	};
 	// Every connection task holds a clone, so the strong count less this one
 	// is the number of connections still open.
 	let open = Arc::new(());
@@ -90,6 +230,8 @@ where
 	let drain_timeout = loop {
 		let accepted = tokio::select! {
 			drain_timeout = &mut shutdown => break drain_timeout,
+			_ = connections.reap() => unreachable!("HTTP reaper runs until shutdown"),
+			_ = upgrades.reap() => unreachable!("upgrade reaper runs until shutdown"),
 			accepted = listener.accept() => accepted,
 		};
 		// A failed accept (EMFILE, ECONNABORTED, ...) must not kill the server —
@@ -102,33 +244,55 @@ where
 				continue;
 			}
 		};
+		let header_deadline = tokio::time::Instant::now() + HEADER_READ_TIMEOUT;
 		let io = TokioIo::new(stream);
 		let handler = handler.clone();
 		// Taken here, not in the task: a shutdown signalled before the task
 		// first runs must still reach this connection.
 		let watcher = graceful.watcher();
 		let open = open.clone();
+		let request_upgrades = upgrades.clone();
+		let executor = HttpExecutor(connections.clone());
 
-		tokio::task::spawn(async move {
+		connections.spawn(async move {
 			let _open = open;
-			let service = service_fn(move |req: Request<Incoming>| {
+			let headers_received = Arc::new(Notify::new());
+			let received = headers_received.clone();
+			let service = service_fn(move |mut req: Request<Incoming>| {
+				received.notify_one();
+				req.extensions_mut().insert(request_upgrades.clone());
+				let http1 = req.version() < Version::HTTP_2;
 				let response = handler(req, remote_addr);
-				async move { Ok::<_, hyper::Error>(response.await) }
+				async move {
+					let mut response = response.await;
+					// Disabling Hyper keep-alive also alters 101 upgrade headers.
+					if http1 && response.status() != StatusCode::SWITCHING_PROTOCOLS {
+						response
+							.headers_mut()
+							.insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+					}
+					Ok::<_, hyper::Error>(response)
+				}
 			});
 
 			// auto::Builder negotiates HTTP/1 or HTTP/2 from what the client speaks
 			// (HTTP/2 prior-knowledge for plaintext, ALPN for TLS — TLS terminated
-			// upstream). HTTP/1 keep-alive stays disabled so each request closes
-			// its connection — prevents clients from reusing a stale pooled
-			// connection silently dropped by NAT/firewall during long LLM gaps.
-			let mut builder = auto::Builder::new(TokioExecutor::new());
-			builder.http1().keep_alive(false);
-			match watcher.watch(builder.serve_connection(io, service)).await {
-				Ok(()) => {}
-				Err(err) if is_idle_close(err.as_ref()) => {
+			// upstream). Ordinary HTTP/1 responses explicitly close above so clients
+			// cannot reuse stale connections after long LLM gaps; upgrades stay open.
+			let mut builder = auto::Builder::new(executor);
+			builder
+				.http1()
+				.keep_alive(true)
+				.timer(TokioTimer::new())
+				.header_read_timeout(HEADER_READ_TIMEOUT);
+			let connection = watcher.watch(builder.serve_connection_with_upgrades(io, service));
+			match with_header_deadline(connection, &headers_received, header_deadline).await {
+				Some(Ok(())) => {}
+				Some(Err(err)) if is_idle_close(err.as_ref()) => {
 					tracing::debug!(remote = %remote_addr, "idle connection closed for shutdown");
 				}
-				Err(err) => tracing::error!(remote = %remote_addr, error = %err, "connection error"),
+				Some(Err(err)) => tracing::error!(remote = %remote_addr, error = %err, "connection error"),
+				None => tracing::debug!(remote = %remote_addr, "connection header deadline expired"),
 			}
 		});
 	};
@@ -136,14 +300,24 @@ where
 	// Close the listening socket before draining: the port stops queueing
 	// connections for this process now, not when the last request ends.
 	drop(listener);
+	upgrades.begin_drain();
 	tracing::info!(
 		connections = Arc::strong_count(&open) - 1,
+		upgrades = upgrades.len(),
 		timeout_secs = drain_timeout.as_secs(),
 		"listener closed; draining open connections"
 	);
-	if tokio::time::timeout(drain_timeout, graceful.shutdown()).await.is_err() {
-		let still_open = Arc::strong_count(&open) - 1;
+	let drain = async {
+		tokio::join!(graceful.shutdown(), connections.wait(), upgrades.wait());
+	};
+	if tokio::time::timeout(drain_timeout, drain).await.is_err() {
+		let still_open = Arc::strong_count(&open) - 1 + upgrades.len();
 		tracing::error!(connections = still_open, "drain timed out with connections still open");
+		connections.begin_drain();
+		connections.abort_all();
+		upgrades.abort_all();
+		// Join cancellation too: dropping JoinHandles would detach the work.
+		tokio::join!(connections.wait(), upgrades.wait());
 		anyhow::bail!("{still_open} connection(s) still open after the {drain_timeout:?} drain");
 	}
 	tracing::info!("drained; exiting");
@@ -165,12 +339,338 @@ mod tests {
 	use super::*;
 	use bytes::Bytes;
 	use http_body_util::Full;
+	use hyper_util::rt::TokioExecutor;
 	use std::time::Instant;
 	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 	use tokio::net::TcpStream;
 	use tokio::sync::{oneshot, Notify};
 
 	const REQUEST: &[u8] = b"GET /slow HTTP/1.1\r\nHost: octohub\r\n\r\n";
+
+	#[tokio::test]
+	async fn http_executor_owns_and_aborts_hyper_tasks() {
+		let tasks = UpgradeTasks::new();
+		let dropped = Arc::new(Notify::new());
+		let guard = DropSignal(dropped.clone());
+		let executor = HttpExecutor(tasks.clone());
+		hyper::rt::Executor::execute(&executor, async move {
+			let _guard = guard;
+			std::future::pending::<()>().await;
+		});
+		assert_eq!(tasks.len(), 1);
+		tasks.begin_drain();
+		tasks.abort_all();
+		tasks.wait().await;
+		dropped.notified().await;
+		assert_eq!(tasks.len(), 0);
+	}
+
+	#[tokio::test]
+	async fn admission_between_empty_check_and_notify_wait_is_not_lost() {
+		let tasks = UpgradeTasks::new();
+		tasks.wait().await;
+		assert!(tasks.spawn(async {}));
+		tokio::time::timeout(Duration::from_secs(2), tasks.changed.notified())
+			.await
+			.expect("admission must leave a notification permit even without a waiter");
+		tasks.wait().await;
+		assert_eq!(tasks.len(), 0);
+	}
+
+	#[tokio::test]
+	async fn owner_drop_breaks_task_registry_cycles_and_rejects_new_tasks() {
+		let tasks = UpgradeTasks::new();
+		let dropped = Arc::new(Notify::new());
+		let guard = DropSignal(dropped.clone());
+		let task_registry = tasks.clone();
+		assert!(tasks.spawn(async move {
+			let _guard = guard;
+			let _registry = task_registry;
+			std::future::pending::<()>().await;
+		}));
+		let owner = ServeTasks {
+			http: UpgradeTasks::new(),
+			upgrades: tasks.clone(),
+		};
+		drop(owner);
+		assert!(tasks.is_draining());
+		assert_eq!(tasks.len(), 0, "owner drop must release every retained handle");
+		assert!(!tasks.spawn(async {}));
+		tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+			.await
+			.expect("owner drop must abort a task even when it holds its own registry");
+	}
+
+	#[tokio::test]
+	async fn cancelling_serve_aborts_busy_upgrades() {
+		let started = Arc::new(Notify::new());
+		let dropped = Arc::new(Notify::new());
+		let (addr, _shutdown, server) = start(upgrade_handler(
+			started.clone(),
+			Some(Arc::new(Notify::new())),
+			dropped.clone(),
+		));
+		let mut peer = upgrade_connection(addr).await;
+		started.notified().await;
+		server.abort();
+		assert!(server.await.unwrap_err().is_cancelled());
+		tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+			.await
+			.expect("cancelling serve must not leave an upgraded task detached");
+		assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+	}
+
+	async fn assert_header_deadline_closes(client: &[u8]) {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+		peer.write_all(client).await.unwrap();
+		let (stream, _) = listener.accept().await.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+		let headers_received = Arc::new(Notify::new());
+		let received = headers_received.clone();
+		let service = service_fn(move |_req: Request<Incoming>| {
+			received.notify_one();
+			async { Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::new()))) }
+		});
+		let mut builder = auto::Builder::new(TokioExecutor::new());
+		builder
+			.http1()
+			.keep_alive(false)
+			.timer(TokioTimer::new())
+			.header_read_timeout(HEADER_READ_TIMEOUT);
+		let connection = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
+		let result = tokio::time::timeout(
+			Duration::from_secs(2),
+			with_header_deadline(connection, &headers_received, deadline),
+		)
+		.await
+		.unwrap();
+		assert!(
+			result.is_none(),
+			"incomplete headers must exhaust the acceptance deadline"
+		);
+		assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+	}
+
+	#[tokio::test]
+	async fn idle_protocol_detection_times_out() {
+		assert_header_deadline_closes(b"").await;
+	}
+
+	#[tokio::test]
+	async fn matching_partial_http2_preface_times_out() {
+		assert_header_deadline_closes(b"PRI * HTTP/2.0\r\n\r\nSM\r\n").await;
+	}
+
+	#[tokio::test]
+	async fn incomplete_http1_headers_time_out() {
+		assert_header_deadline_closes(b"GET /slow HTTP/1.1\r\nHost: octohub\r\n").await;
+	}
+
+	#[tokio::test]
+	async fn header_deadline_does_not_limit_the_response() {
+		let received = Notify::new();
+		received.notify_one();
+		let response = with_header_deadline(
+			async { tokio::task::yield_now().await },
+			&received,
+			tokio::time::Instant::now(),
+		)
+		.await;
+		assert_eq!(response, Some(()));
+	}
+
+	struct DropSignal(Arc<Notify>);
+
+	impl Drop for DropSignal {
+		fn drop(&mut self) {
+			self.0.notify_one();
+		}
+	}
+
+	fn upgrade_handler(
+		started: Arc<Notify>,
+		release: Option<Arc<Notify>>,
+		dropped: Arc<Notify>,
+	) -> impl Fn(Request<Incoming>, SocketAddr) -> std::future::Ready<Response<BoxBody>> + Clone {
+		move |mut req, _remote| {
+			let tasks = req
+				.extensions()
+				.get::<UpgradeTasks>()
+				.expect("upgrade registry")
+				.clone();
+			assert!(!tasks.is_draining());
+			let mut draining = tasks.subscribe();
+			let upgrade = hyper::upgrade::on(&mut req);
+			let started = started.clone();
+			let release = release.clone();
+			let dropped = DropSignal(dropped.clone());
+			assert!(tasks.spawn(async move {
+				let _dropped = dropped;
+				let _io = upgrade.await.expect("HTTP upgrade must succeed");
+				started.notify_one();
+				draining.changed().await.unwrap();
+				assert!(*draining.borrow());
+				started.notify_one();
+				if let Some(release) = release {
+					release.notified().await;
+				}
+			}));
+			std::future::ready(
+				Response::builder()
+					.status(101)
+					.header("Connection", "upgrade")
+					.header("Upgrade", "test")
+					.body(Full::new(Bytes::new()))
+					.unwrap(),
+			)
+		}
+	}
+
+	async fn upgrade_connection(addr: SocketAddr) -> TcpStream {
+		let mut peer = TcpStream::connect(addr).await.unwrap();
+		peer.write_all(b"GET /upgrade HTTP/1.1\r\nHost: octohub\r\nConnection: upgrade\r\nUpgrade: test\r\n\r\n")
+			.await
+			.unwrap();
+		let mut response = Vec::new();
+		tokio::time::timeout(Duration::from_secs(2), async {
+			while !response.ends_with(b"\r\n\r\n") {
+				let mut byte = [0];
+				peer.read_exact(&mut byte).await.unwrap();
+				response.push(byte[0]);
+				assert!(response.len() < 8192);
+			}
+		})
+		.await
+		.unwrap();
+		assert!(response.starts_with(b"HTTP/1.1 101 "), "{response:?}");
+		peer
+	}
+
+	#[tokio::test]
+	async fn finished_upgrade_tasks_are_reaped_without_new_requests() {
+		let tasks = UpgradeTasks::new();
+		let reaper_tasks = tasks.clone();
+		let reaper = tokio::spawn(async move { reaper_tasks.reap().await });
+		for _ in 0..64 {
+			assert!(tasks.spawn(async {}));
+		}
+		tokio::time::timeout(Duration::from_secs(2), async {
+			while tasks.len() != 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		reaper.abort();
+		assert!(reaper.await.unwrap_err().is_cancelled());
+	}
+
+	#[tokio::test]
+	async fn draining_rejects_and_drops_new_upgrade_tasks() {
+		let tasks = UpgradeTasks::new();
+		let mut draining = tasks.subscribe();
+		tasks.begin_drain();
+		draining.changed().await.unwrap();
+		assert!(tasks.is_draining());
+		assert!(*tasks.subscribe().borrow(), "late subscribers must see the drain");
+		let dropped = Arc::new(Notify::new());
+		let guard = DropSignal(dropped.clone());
+		assert!(!tasks.spawn(async move {
+			let _guard = guard;
+			panic!("a rejected task must never run");
+		}));
+		dropped.notified().await;
+		assert_eq!(tasks.len(), 0);
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn upgrade_spawn_racing_drain_is_either_owned_or_rejected() {
+		for _ in 0..64 {
+			let tasks = UpgradeTasks::new();
+			let barrier = Arc::new(tokio::sync::Barrier::new(3));
+			let spawning_tasks = tasks.clone();
+			let spawning_barrier = barrier.clone();
+			let spawning = tokio::spawn(async move {
+				spawning_barrier.wait().await;
+				spawning_tasks.spawn(std::future::pending())
+			});
+			let draining_tasks = tasks.clone();
+			let draining_barrier = barrier.clone();
+			let draining = tokio::spawn(async move {
+				draining_barrier.wait().await;
+				draining_tasks.begin_drain();
+			});
+			barrier.wait().await;
+			let accepted = spawning.await.unwrap();
+			draining.await.unwrap();
+			assert!(tasks.is_draining());
+			assert_eq!(tasks.len(), usize::from(accepted));
+			assert!(!tasks.spawn(async {}));
+			tasks.abort_all();
+			tasks.wait().await;
+			assert_eq!(tasks.len(), 0);
+		}
+	}
+
+	#[tokio::test]
+	async fn drain_closes_idle_upgrades() {
+		let started = Arc::new(Notify::new());
+		let dropped = Arc::new(Notify::new());
+		let (addr, shutdown, server) = start(upgrade_handler(started.clone(), None, dropped.clone()));
+		let mut peer = upgrade_connection(addr).await;
+		started.notified().await;
+		shutdown.send(Duration::from_secs(60)).unwrap();
+		tokio::time::timeout(Duration::from_secs(2), server)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		dropped.notified().await;
+		assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+	}
+
+	#[tokio::test]
+	async fn drain_waits_for_busy_upgrades_to_finish() {
+		let started = Arc::new(Notify::new());
+		let release = Arc::new(Notify::new());
+		let dropped = Arc::new(Notify::new());
+		let (addr, shutdown, server) = start(upgrade_handler(started.clone(), Some(release.clone()), dropped));
+		let mut peer = upgrade_connection(addr).await;
+		started.notified().await;
+		shutdown.send(Duration::from_secs(60)).unwrap();
+		started.notified().await;
+		assert!(!server.is_finished(), "busy upgrade must stay owned during the drain");
+		release.notify_one();
+		tokio::time::timeout(Duration::from_secs(2), server)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+	}
+
+	#[tokio::test]
+	async fn drain_bound_aborts_upgrades_and_reports_them() {
+		let started = Arc::new(Notify::new());
+		let dropped = Arc::new(Notify::new());
+		let (addr, shutdown, server) = start(upgrade_handler(
+			started.clone(),
+			Some(Arc::new(Notify::new())),
+			dropped.clone(),
+		));
+		let mut peer = upgrade_connection(addr).await;
+		started.notified().await;
+		shutdown.send(Duration::from_millis(200)).unwrap();
+		let err = tokio::time::timeout(Duration::from_secs(2), server)
+			.await
+			.unwrap()
+			.unwrap()
+			.expect_err("busy upgrade must not outlive the drain bound");
+		assert_eq!(err.to_string(), "1 connection(s) still open after the 200ms drain");
+		dropped.notified().await;
+		assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+	}
 
 	/// A handler that signals `started`, then answers `done` once `release` is
 	/// notified: the test, not a timer, decides when the request ends.
@@ -313,6 +813,13 @@ mod tests {
 			.unwrap()
 			.expect_err("drain past the bound must fail");
 		assert_eq!(err.to_string(), "1 connection(s) still open after the 200ms drain");
+		let closed = tokio::time::timeout(Duration::from_secs(2), stuck.read(&mut [0]))
+			.await
+			.expect("HTTP task must be cancelled before serve returns");
+		match closed {
+			Ok(n) => assert_eq!(n, 0),
+			Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset),
+		}
 	}
 
 	/// Serve one accepted connection the way `serve` does. `client` is what the
@@ -327,9 +834,13 @@ mod tests {
 			Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::new())))
 		});
 		let mut builder = auto::Builder::new(TokioExecutor::new());
-		builder.http1().keep_alive(false);
+		builder
+			.http1()
+			.keep_alive(false)
+			.timer(TokioTimer::new())
+			.header_read_timeout(HEADER_READ_TIMEOUT);
 		let graceful = GracefulShutdown::new();
-		let connection = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
+		let connection = graceful.watch(builder.serve_connection_with_upgrades(TokioIo::new(stream), service));
 		let result = if shutdown {
 			tokio::join!(connection, graceful.shutdown()).0
 		} else {

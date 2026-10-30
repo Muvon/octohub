@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -37,7 +38,7 @@ pub const MODALITY_ERROR_TYPE: &str = "modality_not_supported";
 /// The default OpenAI-compatible error discriminator.
 const DEFAULT_ERROR_TYPE: &str = "invalid_request_error";
 
-fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
+pub(super) fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
 	error_response_typed(status, message, DEFAULT_ERROR_TYPE)
 }
 
@@ -58,7 +59,7 @@ fn error_response_typed(status: StatusCode, message: &str, error_type: &str) -> 
 /// INSERT, and MySQL's default `max_allowed_packet` is 64 MiB: a bigger body
 /// would pay for the upstream call and then fail to store. Rejected up front
 /// with 413 instead.
-const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 async fn read_body<B>(req: Request<B>) -> Result<Bytes, Box<Response<BoxBody>>>
 where
@@ -113,7 +114,7 @@ fn engine_error_response(error: &anyhow::Error, status: StatusCode, message: &st
 }
 
 /// Extract Authorization header value from request
-fn auth_header<B>(req: &Request<B>) -> Option<String> {
+pub(super) fn auth_header<B>(req: &Request<B>) -> Option<String> {
 	req.headers()
 		.get("Authorization")
 		.and_then(|v| v.to_str().ok())
@@ -122,7 +123,7 @@ fn auth_header<B>(req: &Request<B>) -> Option<String> {
 
 /// The client's routing purpose for the virtual `auto` model. Read BEFORE the
 /// body is consumed; absent/blank → `None` (the `[auto]` default applies).
-fn model_purpose(req: &Request<hyper::body::Incoming>) -> Option<String> {
+pub(super) fn model_purpose<B>(req: &Request<B>) -> Option<String> {
 	req.headers()
 		.get("X-Model-Purpose")
 		.and_then(|v| v.to_str().ok())
@@ -135,8 +136,8 @@ fn model_purpose(req: &Request<hyper::body::Incoming>) -> Option<String> {
 /// X-OpenRouter-Categories), forwarded upstream so the originating app — not
 /// this proxy — gets credited.
 /// Read BEFORE the body is consumed.
-fn attribution_headers(req: &Request<hyper::body::Incoming>) -> Option<std::collections::HashMap<String, String>> {
-	let mut map = std::collections::HashMap::new();
+pub(super) fn attribution_headers<B>(req: &Request<B>) -> Option<HashMap<String, String>> {
+	let mut map = HashMap::new();
 	for name in ["X-Title", "HTTP-Referer", "X-OpenRouter-Categories"] {
 		if let Some(v) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
 			map.insert(name.to_string(), v.to_string());
@@ -145,29 +146,42 @@ fn attribution_headers(req: &Request<hyper::body::Incoming>) -> Option<std::coll
 	(!map.is_empty()).then_some(map)
 }
 
-/// Handle POST /v1/completions
-pub async fn handle_create_completion(
-	req: Request<hyper::body::Incoming>,
-	engine: Arc<ProxyEngine>,
+/// Authenticate each HTTP request or WebSocket message against current key state.
+pub(super) async fn completion_auth(
+	header: Option<String>,
 	storage: Arc<dyn Storage>,
-) -> Response<BoxBody> {
-	let header = auth_header(&req);
-	let storage_clone = storage.clone();
-	let auth_result = tokio::task::spawn_blocking(move || authenticate_client(header.as_deref(), &storage_clone))
+) -> Result<crate::storage::ApiKey, Box<Response<BoxBody>>> {
+	let auth_result = tokio::task::spawn_blocking(move || authenticate_client(header.as_deref(), &storage))
 		.await
 		.unwrap_or(ClientAuth::Invalid);
 	let api_key = match auth_result {
 		ClientAuth::Ok(key) => key,
 		ClientAuth::Missing => {
 			tracing::warn!(kind = "client", reason = "missing_token", "auth failed");
-			return error_response(StatusCode::UNAUTHORIZED, "Missing API key");
+			return Err(Box::new(error_response(StatusCode::UNAUTHORIZED, "Missing API key")));
 		}
 		ClientAuth::Invalid => {
 			tracing::warn!(kind = "client", reason = "invalid_token", "auth failed");
-			return error_response(StatusCode::UNAUTHORIZED, "Invalid or revoked API key");
+			return Err(Box::new(error_response(
+				StatusCode::UNAUTHORIZED,
+				"Invalid or revoked API key",
+			)));
 		}
 	};
 	tracing::Span::current().record("api_key_id", api_key.id);
+	Ok(api_key)
+}
+
+/// Handle POST /v1/completions
+pub async fn handle_create_completion(
+	req: Request<hyper::body::Incoming>,
+	engine: Arc<ProxyEngine>,
+	storage: Arc<dyn Storage>,
+) -> Response<BoxBody> {
+	let api_key = match completion_auth(auth_header(&req), storage).await {
+		Ok(key) => key,
+		Err(response) => return *response,
+	};
 	let purpose = model_purpose(&req);
 	let attribution = attribution_headers(&req);
 
@@ -176,8 +190,19 @@ pub async fn handle_create_completion(
 		Err(response) => return *response,
 	};
 
+	completion_from_bytes(&body_bytes, &api_key, purpose, attribution, engine).await
+}
+
+/// Process an authenticated completion identically for HTTP and WebSocket callers.
+pub(super) async fn completion_from_bytes(
+	body: &[u8],
+	api_key: &crate::storage::ApiKey,
+	purpose: Option<String>,
+	attribution: Option<HashMap<String, String>>,
+	engine: Arc<ProxyEngine>,
+) -> Response<BoxBody> {
 	// Parse request
-	let create_req: CreateCompletionRequest = match serde_json::from_slice(&body_bytes) {
+	let create_req: CreateCompletionRequest = match serde_json::from_slice(body) {
 		Ok(r) => r,
 		Err(e) => {
 			return error_response(StatusCode::BAD_REQUEST, &format!("Invalid request JSON: {}", e));
@@ -190,7 +215,7 @@ pub async fn handle_create_completion(
 
 	// Process
 	let model_label = create_req.model.clone();
-	match engine.process(create_req, &api_key, purpose, attribution).await {
+	match engine.process(create_req, api_key, purpose, attribution).await {
 		Ok((response, upstream_duration)) => {
 			tracing::Span::current().record("tok_in", response.usage.input_tokens);
 			tracing::Span::current().record("tok_out", response.usage.output_tokens);
@@ -1227,6 +1252,80 @@ mod tests {
 
 	async fn response_json(response: Response<BoxBody>) -> serde_json::Value {
 		serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+	}
+
+	#[test]
+	fn completion_headers_accept_any_request_body() {
+		let request = Request::builder()
+			.header("Authorization", "Bearer client-key")
+			.header("X-Model-Purpose", "  supervisor-gate  ")
+			.header("X-Title", "client-app")
+			.header("HTTP-Referer", "https://example.com")
+			.header("X-OpenRouter-Categories", "productivity")
+			.body(())
+			.unwrap();
+		assert_eq!(auth_header(&request).as_deref(), Some("Bearer client-key"));
+		assert_eq!(model_purpose(&request).as_deref(), Some("supervisor-gate"));
+		assert_eq!(
+			attribution_headers(&request).unwrap(),
+			HashMap::from([
+				("X-Title".to_string(), "client-app".to_string()),
+				("HTTP-Referer".to_string(), "https://example.com".to_string()),
+				("X-OpenRouter-Categories".to_string(), "productivity".to_string()),
+			])
+		);
+
+		let blank = Request::builder().header("X-Model-Purpose", "  ").body(()).unwrap();
+		assert_eq!(model_purpose(&blank), None);
+		assert_eq!(attribution_headers(&blank), None);
+	}
+
+	#[tokio::test]
+	async fn completion_auth_preserves_errors_and_rechecks_revoked_keys() {
+		let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		for (header, message) in [
+			(None, "Missing API key"),
+			(Some("Basic token".to_string()), "Missing API key"),
+			(Some("Bearer wrong".to_string()), "Invalid or revoked API key"),
+		] {
+			let response = completion_auth(header, storage.clone()).await.unwrap_err();
+			assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+			assert_eq!(
+				response_json(*response).await,
+				serde_json::json!({"error": {"message": message, "type": "invalid_request_error"}})
+			);
+		}
+
+		let key = storage.create_api_key("client", None, None, None).unwrap();
+		let header = Some(format!("Bearer {}", key.key));
+		assert_eq!(
+			completion_auth(header.clone(), storage.clone()).await.unwrap().id,
+			key.id
+		);
+		storage.revoke_api_key(key.id).unwrap();
+		let response = completion_auth(header, storage).await.unwrap_err();
+		assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+		assert_eq!(
+			response_json(*response).await,
+			serde_json::json!({"error": {"message": "Invalid or revoked API key", "type": "invalid_request_error"}})
+		);
+	}
+
+	#[tokio::test]
+	async fn completion_from_bytes_preserves_invalid_json_response() {
+		let (engine, _) = models_engine();
+		let key = engine.storage.create_api_key("client", None, None, None).unwrap();
+		let body = b"{";
+		let error = serde_json::from_slice::<CreateCompletionRequest>(body).unwrap_err();
+		let response = completion_from_bytes(body, &key, None, None, engine).await;
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		assert_eq!(
+			response_json(response).await,
+			serde_json::json!({"error": {
+				"message": format!("Invalid request JSON: {}", error),
+				"type": "invalid_request_error"
+			}})
+		);
 	}
 
 	#[tokio::test]

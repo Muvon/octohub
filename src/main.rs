@@ -339,6 +339,9 @@ async fn route(
 		// Client endpoints (api_keys table auth)
 		match (method, path.as_str()) {
 			(Method::POST, "/v1/completions") => api::handler::handle_create_completion(req, engine, storage).await,
+			(Method::GET, "/v1/completions") => {
+				api::websocket::handle_upgrade(req, engine, storage, effective_remote.clone()).await
+			}
 			(Method::POST, "/v1/chat/completions") => api::handler::handle_chat_completion(req, engine, storage).await,
 			(Method::POST, "/v1/embeddings") => api::handler::handle_create_embedding(req, engine, storage).await,
 			(Method::POST, "/v1/evaluations") => api::handler::handle_create_evaluation(req, engine, storage).await,

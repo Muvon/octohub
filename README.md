@@ -92,6 +92,11 @@ cargo build --release
 
 - **One endpoint, many providers** — OpenAI-style `POST /v1/completions`,
   `/v1/chat/completions`, `/v1/embeddings`, and `/v1/evaluations` routed to 20+ upstream providers
+- **Sequential WebSocket completions** — authenticated HTTP/1.1
+  `GET /v1/completions` upgrade, using the existing native request schema and
+  one final buffered JSON envelope per request; wait for each reply before
+  sending the next request. `POST` is unchanged; this is not token streaming
+  ([protocol and limits](doc/05-api-client.md#get-v1completions--websocket))
 - **Buffered chat SSE** — text and tool-call deltas with `stream: true`, plus
   opt-in usage via `stream_options.include_usage`; upstream completes before SSE
   delivery ([docs](doc/05-api-client.md))

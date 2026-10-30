@@ -77,6 +77,37 @@ Defined in `src/config.rs:83`. All keys optional except as noted.
 The legacy alias `db_path` is also accepted and treated as `db_url`
 (`src/config.rs:98`).
 
+### WebSocket completion lifecycle
+
+The authenticated HTTP/1.1 `GET /v1/completions` WebSocket transport uses
+the same completion configuration as `POST`; there are no new WebSocket
+configuration fields. Each request message reads a fresh configuration
+snapshot, so a long-lived connection does not pin routing to its handshake
+configuration. The key is reauthenticated for every message, applying
+revocation and model/owner edits to subsequent requests. Purpose and
+attribution headers remain those supplied at the handshake.
+
+The listener bounds acceptance through the first request headers, including
+HTTP protocol detection, to **10 seconds**. Every HTTP/1 request also has a
+**10-second** header-read limit; these limits apply to HTTP routes as well
+as WebSocket handshakes, not to bodies or handler duration. Handshake
+authentication, HTTP upgrade completion (`OnUpgrade`), and transport
+send/flush/close operations each have fixed **10-second** bounds. They do not
+replace the existing owner queue, provider queue, or upstream timeouts. Incoming frames and complete
+request messages are capped at **16 MiB**. Each single outgoing serialized
+envelope, including status, headers, and body, is capped at **64 MiB**;
+exceeding either cap closes with `1009`. The
+[client protocol](05-api-client.md#get-v1completions--websocket) describes
+close codes and sequencing.
+
+`server.shutdown_timeout_secs` also bounds WebSocket drain on
+SIGTERM/SIGINT: idle sockets close with `1001`, busy requests may finish
+and send their final reply before closing with `1001`, and overdue work
+is aborted at the drain deadline. No new requests are accepted during
+drain. Closing a caller's socket cancels its local future and releases
+permits, but cannot undo an issued provider call or a running blocking
+database write.
+
 ## `[logging]`
 
 Defined in `src/config.rs:20`.

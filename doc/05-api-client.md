@@ -13,6 +13,7 @@ Sources: [`src/api/handler.rs`](../../src/api/handler.rs),
 | Method | Path | Style | Handler | Auth |
 |---|---|---|---|---|
 | `POST` | `/v1/completions` | OctoHub Responses API | `handle_create_completion` at `src/api/handler.rs:44` | client key |
+| `GET` | `/v1/completions` | HTTP/1.1 WebSocket upgrade; sequential buffered completions | `handle_upgrade` in `src/api/websocket.rs` | client key |
 | `POST` | `/v1/chat/completions` | Classic OpenAI Chat Completions | `handle_chat_completion` at `src/api/handler.rs:284` | client key |
 | `POST` | `/v1/embeddings` | OpenAI-compatible | `handle_create_embedding` at `src/api/handler.rs:146` | client key |
 | `GET`  | `/health` | — | `handle_health` at `src/api/handler.rs:141` | none |
@@ -23,6 +24,9 @@ Sources: [`src/api/handler.rs`](../../src/api/handler.rs),
 Supports multi-turn chains via `previous_completion_id`, reasoning-block
 replay for thinking models, and a richer output structure (`output[]` array
 with typed items). Choose this when building against OctoHub directly.
+`POST` remains unchanged. Machine clients can also use an authenticated
+HTTP/1.1 `GET` WebSocket upgrade on the same path for sequential requests;
+see [WebSocket transport](#get-v1completions--websocket).
 
 **`/v1/chat/completions`** — Classic OpenAI Chat Completions. A drop-in
 replacement for `api.openai.com/v1/chat/completions`. Use this when pointing
@@ -196,6 +200,115 @@ Use your SDK's retry policy.
 If you want OctoHub to load-balance across providers, that's the
 `[models]` config — see [03 — Configuration](./03-configuration.md).
 The list is sampled **once per request**, randomly.
+
+## `GET /v1/completions` — WebSocket
+
+### Handshake and authentication
+
+Upgrade `/v1/completions` over **HTTP/1.1**, using `ws://` or `wss://` as
+appropriate for the deployment. Include `Authorization: Bearer <client-key>`
+in the upgrade request. A successful handshake returns HTTP `101 Switching
+Protocols`; the existing `POST /v1/completions` request/response contract is
+unchanged. HTTP/2 WebSocket upgrade is not supported.
+
+This is a machine-to-machine bearer endpoint. **Any `Origin` header is
+rejected with HTTP `403`**, even for an otherwise valid upgrade; it is not a
+browser WebSocket API. Invalid or malformed upgrades are checked before
+authentication and return HTTP `400`. A valid handshake without a bearer
+token returns HTTP `401`; invalid or revoked client keys also use the
+existing `401` authentication errors. The implementation is
+[`src/api/websocket.rs`](../src/api/websocket.rs).
+
+The client key is authenticated both at the handshake and **for every
+request message**, so revocation, allowed-model edits, and owner edits take
+effect on subsequent requests without reconnecting. Each request reads a
+fresh configuration snapshot instead of pinning the connection to its
+handshake configuration. The handshake's `X-Model-Purpose` and attribution
+headers (`X-Title`, `HTTP-Referer`, `X-OpenRouter-Categories`) are carried
+into each completion request; they are not additional JSON request fields.
+
+### Messages and final replies
+
+Send a **text message** containing the existing `CreateCompletionRequest`
+JSON object, exactly as for `POST`, with no outer request envelope:
+
+```json
+{"model":"minimax-m2.7","input":"Say hi"}
+```
+
+The shared completion engine supplies the same routing, chain replay,
+limits, storage, response body, and error mapping as `POST`. A completion
+is buffered: there are no token deltas, partial responses, or upstream
+streaming, and no promise of faster completion or earlier first-token
+delivery. Each request receives **one final text message** (shape shown as
+JSONC):
+
+```jsonc
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json",
+    "x-request-id": "01JAZ6Y6D6YAW9W7G9NRJHY7GK"
+  },
+  "body": { /* existing CreateCompletionResponse JSON object */ }
+}
+```
+
+- `status` is the corresponding HTTP status: `200` on success, the existing
+  error status otherwise.
+- `body` is the existing completion response or error JSON **object**, not a
+  JSON-encoded string. Existing error discriminators are unchanged,
+  including `error.type = "modality_not_supported"`.
+- Header names are **lowercase**, with **string** values. `content-type`
+  is `application/json`; `x-request-id` is a **fresh ULID for each reply**,
+  not the handshake's request ID. A valid client-supplied `X-Request-Id`
+  is used only for the HTTP handshake. A rate-window `429` preserves the
+  existing `Retry-After` header as `headers["retry-after"]` when supplied
+  by the shared handler; its seconds value is a string.
+
+### Sequencing and transport limits
+
+There is **one in-flight request per connection**. The client must wait
+for the final reply before sending its next request. Pipelining closes the
+socket with `1008` (policy violation); requests are not accumulated in an
+application backlog. Use native WebSocket **Ping/Pong** for transport
+liveness; control frames remain supported while a completion is pending.
+
+| Condition | Result |
+|---|---|
+| Incoming frame or complete request message exceeds **16 MiB** | Close `1009` (message too big) |
+| Single outgoing serialized envelope (status, headers, and body together) exceeds **64 MiB** | Close `1009` (message too big) |
+| Binary message | Close `1003` (unsupported data) |
+| Malformed WebSocket protocol frame (for example, unmasked client text) | Close `1002` (protocol error) |
+| Another request before the previous reply | Close `1008` (policy violation), no backlog |
+| Malformed HTTP upgrade | HTTP `400`, before upgrade |
+| Any `Origin` header | HTTP `403`, before upgrade |
+
+Acceptance through the first headers, including HTTP protocol detection,
+is bounded to **10 seconds**. Every HTTP/1 request has a 10-second
+header-read limit, including non-WebSocket routes. Handshake authentication,
+HTTP upgrade completion (`OnUpgrade`), and transport send/flush/close
+operations each have fixed **10-second** bounds. These are transport bounds, not a
+10-second completion deadline; existing owner/provider queue and upstream
+timeouts still govern completion work. There are no new WebSocket timeout
+configuration fields.
+
+### Disconnect and shutdown
+
+When the caller closes the socket, the local request future is cancelled
+and its permits are released. Cancellation **cannot roll back** an
+already-issued provider call or a running blocking database write.
+
+The existing `server.shutdown_timeout_secs` bounds graceful drain.
+Idle sockets close with `1001` (going away). A busy socket lets its current
+request finish within that bound, sends its reply, then closes with `1001`.
+No new requests are accepted during drain, and overdue work is aborted
+when the drain bound expires.
+
+The HTTP `GET` handshake has its own request metrics and tracing. Each
+completion message is observed as `POST /v1/completions` through the
+shared engine and existing error/metric helpers; see
+[07 — Observability](07-observability.md#websocket-completions).
 
 ## `POST /v1/chat/completions`
 
