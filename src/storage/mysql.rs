@@ -1,8 +1,9 @@
 use super::credentials::{apply_change, decode_error, Credential, CredentialChange};
 use super::{
-	decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models, encode_auto_map,
-	encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-	StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow, TERMINAL_MEDIA_STATUSES_SQL,
+	decode_allowed_models, decode_auto_map, decode_chain_json, decode_json_column, encode_allowed_models,
+	encode_auto_map, encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ChainLink, ListFilter,
+	Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow,
+	TERMINAL_MEDIA_STATUSES_SQL,
 };
 use anyhow::{Context, Result};
 use mysql::prelude::*;
@@ -243,6 +244,28 @@ fn read_completion(row: mysql::Row) -> Result<StoredCompletion> {
 		exchange: serde_json::from_str(&row.get::<String, _>("exchange").unwrap_or_default()).unwrap_or_default(),
 		usage: serde_json::from_str(&row.get::<String, _>("usage").unwrap_or_default()).unwrap_or_default(),
 		created_at: row.get("created_at").unwrap_or_default(),
+	})
+}
+
+/// Columns in the order of the final SELECT in `walk_chain`.
+fn read_chain_link(row: mysql::Row) -> Result<ChainLink> {
+	let (id, previous_completion_id, session_id, provider, input, output, instructions): (
+		String,
+		Option<String>,
+		String,
+		String,
+		String,
+		String,
+		Option<String>,
+	) = mysql::from_row_opt(row)?;
+	Ok(ChainLink {
+		input: decode_chain_json(&id, "input", &input)?,
+		output: decode_chain_json(&id, "output", &output)?,
+		id,
+		previous_completion_id,
+		session_id,
+		provider,
+		instructions,
 	})
 }
 
@@ -581,7 +604,7 @@ impl Storage for MysqlStorage {
 		row.map(read_completion).transpose()
 	}
 
-	fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
+	fn walk_chain(&self, id: &str) -> Result<Vec<ChainLink>> {
 		let mut conn = self.pool.get_conn()?;
 		// Single recursive CTE — one round-trip regardless of chain depth. MySQL
 		// stops a recursive CTE after cte_max_recursion_depth (1000) rows, and a
@@ -590,19 +613,28 @@ impl Storage for MysqlStorage {
 		// restarts the chain, so its real depth stays bounded by the context window.
 		// Ordered by walk depth, not created_at: two links stored in the same second
 		// would otherwise replay in either order.
-		let rows: Vec<mysql::Row> = conn.exec(
-			format!(
-				"WITH RECURSIVE chain AS (\
-               SELECT *, 0 AS depth FROM completions WHERE id = ? \
-               UNION ALL \
-               SELECT c.*, chain.depth + 1 FROM completions c \
-               JOIN chain ON c.id = chain.previous_completion_id \
-             ) \
-             SELECT /*+ SET_VAR(cte_max_recursion_depth = {CHAIN_MAX_DEPTH}) */ * FROM chain ORDER BY depth DESC"
-			),
-			(id,),
-		)?;
-		super::complete_chain(rows.into_iter().map(read_completion).collect::<Result<_>>()?)
+		// The recursion carries ids only and the replay columns are joined once at
+		// the end, so the server never materializes `exchange` (see `ChainLink`).
+		// Rows are parsed as they stream in: the raw result set is never held next
+		// to the parsed chain.
+		let links = conn
+			.exec_iter(
+				format!(
+					"WITH RECURSIVE chain (id, previous_completion_id, depth) AS (\
+					   SELECT id, previous_completion_id, 0 FROM completions WHERE id = ? \
+					   UNION ALL \
+					   SELECT c.id, c.previous_completion_id, chain.depth + 1 FROM completions c \
+					   JOIN chain ON c.id = chain.previous_completion_id \
+					 ) \
+					 SELECT /*+ SET_VAR(cte_max_recursion_depth = {CHAIN_MAX_DEPTH}) */ \
+					   c.id, c.previous_completion_id, c.session_id, c.provider, c.input, c.output, c.instructions \
+					 FROM chain JOIN completions c ON c.id = chain.id ORDER BY chain.depth DESC"
+				),
+				(id,),
+			)?
+			.map(|row| read_chain_link(row?))
+			.collect::<Result<Vec<_>>>()?;
+		super::complete_chain(links)
 	}
 
 	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {

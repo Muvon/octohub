@@ -28,6 +28,11 @@ use storage::Storage;
 
 type BoxBody = Full<Bytes>;
 
+// See the jemalloc note in Cargo.toml.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// A config value (or something derived from it) that SIGHUP reload can swap
 /// atomically. Reads clone the inner `Arc` under a brief read lock; reload takes
 /// the write lock to replace it.

@@ -3,7 +3,7 @@ pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// recursive walk stops at the first previous_completion_id with no row, so a
 /// missing link leaves a SHORTER chain that looks valid; replaying it would
 /// answer with the conversation silently cut. Every backend checks the same way.
-pub(crate) fn complete_chain(chain: Vec<StoredCompletion>) -> Result<Vec<StoredCompletion>> {
+pub(crate) fn complete_chain(chain: Vec<ChainLink>) -> Result<Vec<ChainLink>> {
 	let ids: std::collections::HashSet<&str> = chain.iter().map(|c| c.id.as_str()).collect();
 	if let Some((id, prev)) = chain.iter().find_map(|c| {
 		c.previous_completion_id
@@ -25,6 +25,13 @@ pub(crate) fn complete_chain(chain: Vec<StoredCompletion>) -> Result<Vec<StoredC
 		anyhow::bail!("Chain broken: completion {id} references missing predecessor {prev}");
 	}
 	Ok(chain)
+}
+
+/// Parse a JSON column of a chain link. Unlike the fail-open column decoders
+/// below, an unreadable value fails the walk: replaying it as `null` would drop
+/// that turn from the history without a word.
+pub(crate) fn decode_chain_json(id: &str, column: &str, raw: &str) -> Result<serde_json::Value> {
+	serde_json::from_str(raw).with_context(|| format!("completion {id}: invalid JSON in `{column}`"))
 }
 
 /// Stored API key record
@@ -84,6 +91,22 @@ pub struct StoredCompletion {
 	pub exchange: serde_json::Value,
 	pub usage: serde_json::Value,
 	pub created_at: u64,
+}
+
+/// One link of a completion chain: exactly the columns history replay reads.
+/// `exchange` is left out on purpose. It holds the whole upstream request of
+/// that turn, so every link repeats the conversation so far, and loading it per
+/// link makes one walk quadratic in the conversation length (prod 2026-10-31: a
+/// 782-link chain read 600 MB per request and the process aborted on OOM).
+#[derive(Debug, Clone)]
+pub struct ChainLink {
+	pub id: String,
+	pub previous_completion_id: Option<String>,
+	pub session_id: String,
+	pub provider: String,
+	pub input: serde_json::Value,
+	pub output: serde_json::Value,
+	pub instructions: Option<String>,
 }
 
 /// Stored embedding record from the database
@@ -250,11 +273,10 @@ pub trait Storage: Send + Sync {
 	fn store_completion(&self, completion: &StoredCompletion) -> Result<()>;
 	#[cfg_attr(not(test), expect(dead_code, reason = "exercised only by the sqlite backend tests"))]
 	fn get_completion(&self, id: &str) -> Result<Option<StoredCompletion>>;
-	/// Walk the chain of previous_completion_id links, returning completions oldest-first.
-	/// Only populates the fields needed for chain replay: id, session_id,
-	/// previous_completion_id, input, output, instructions. A chain with a missing
-	/// link is an error ([`complete_chain`]), never a shorter history.
-	fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>>;
+	/// Walk the chain of previous_completion_id links, returning links oldest-first.
+	/// A chain with a missing link or an unreadable column is an error
+	/// ([`complete_chain`]), never a shorter history.
+	fn walk_chain(&self, id: &str) -> Result<Vec<ChainLink>>;
 	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>>;
 
 	// Embeddings

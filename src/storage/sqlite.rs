@@ -1,8 +1,9 @@
 use super::credentials::{apply_change, decode_error, Credential, CredentialChange};
 use super::{
-	decode_allowed_models, decode_auto_map, decode_json_column, encode_allowed_models, encode_auto_map,
-	encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ListFilter, Storage, StoredCompletion,
-	StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow, TERMINAL_MEDIA_STATUSES_SQL,
+	decode_allowed_models, decode_auto_map, decode_chain_json, decode_json_column, encode_allowed_models,
+	encode_auto_map, encode_json_column, generate_api_key, make_key_hint, now_unix, ApiKey, ChainLink, ListFilter,
+	Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia, TimeBucket, UsageRow,
+	TERMINAL_MEDIA_STATUSES_SQL,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
@@ -198,6 +199,20 @@ fn read_completion(row: &rusqlite::Row) -> rusqlite::Result<StoredCompletion> {
 		exchange: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
 		usage: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
 		created_at: row.get(12)?,
+	})
+}
+
+/// Columns in the order of the final SELECT in `walk_chain`.
+fn read_chain_link(row: &rusqlite::Row) -> Result<ChainLink> {
+	let id: String = row.get(0)?;
+	Ok(ChainLink {
+		input: decode_chain_json(&id, "input", &row.get::<_, String>(4)?)?,
+		output: decode_chain_json(&id, "output", &row.get::<_, String>(5)?)?,
+		previous_completion_id: row.get(1)?,
+		session_id: row.get(2)?,
+		provider: row.get(3)?,
+		instructions: row.get(6)?,
+		id,
 	})
 }
 
@@ -495,33 +510,27 @@ impl Storage for SqliteStorage {
 			.map_err(Into::into)
 	}
 
-	fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
+	fn walk_chain(&self, id: &str) -> Result<Vec<ChainLink>> {
 		let conn = lock_conn(&self.conn)?;
-		// Single recursive CTE — one round-trip regardless of chain depth.
-		// Anchor is the requested (tail) completion; each recursive step follows
-		// previous_completion_id toward the root. A `depth` counter lets us
-		// sort oldest-first by reversing the walk order.
-		// Both CTE branches qualify columns with `c.` to avoid ambiguity in the JOIN.
-		let cols_prefixed = COMPLETION_COLUMNS
-			.split(',')
-			.map(|c| format!("c.{}", c.trim()))
-			.collect::<Vec<_>>()
-			.join(", ");
-		let sql = format!(
-			"WITH RECURSIVE chain({cols}, depth) AS (\
-               SELECT {cols}, 0 FROM completions AS c WHERE id = ?1 \
-               UNION ALL \
-               SELECT {prefixed}, chain.depth + 1 FROM completions c \
-               JOIN chain ON c.id = chain.previous_completion_id \
-             ) \
-             SELECT {cols} FROM chain ORDER BY depth DESC",
-			cols = COMPLETION_COLUMNS,
-			prefixed = cols_prefixed,
-		);
-		let mut stmt = conn.prepare(&sql)?;
-		let rows = stmt.query_map(rusqlite::params![id], read_completion)?;
-		let chain = rows.collect::<Result<Vec<_>, _>>()?;
-		super::complete_chain(chain)
+		// Single recursive CTE — one round-trip regardless of chain depth. The
+		// recursion follows previous_completion_id from the tail toward the root
+		// carrying ids only; the replay columns are joined once at the end, so
+		// `exchange` is never read (see `ChainLink`). `depth` sorts oldest-first.
+		let mut stmt = conn.prepare(
+			"WITH RECURSIVE chain (id, previous_completion_id, depth) AS (\
+			   SELECT id, previous_completion_id, 0 FROM completions WHERE id = ?1 \
+			   UNION ALL \
+			   SELECT c.id, c.previous_completion_id, chain.depth + 1 FROM completions c \
+			   JOIN chain ON c.id = chain.previous_completion_id \
+			 ) \
+			 SELECT c.id, c.previous_completion_id, c.session_id, c.provider, c.input, c.output, c.instructions \
+			 FROM chain JOIN completions c ON c.id = chain.id ORDER BY chain.depth DESC",
+		)?;
+		let links = stmt
+			.query(rusqlite::params![id])?
+			.and_then(read_chain_link)
+			.collect::<Result<Vec<_>>>()?;
+		super::complete_chain(links)
 	}
 
 	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {
@@ -1231,6 +1240,72 @@ mod tests {
 
 		let result = storage.walk_chain("cmpl_002");
 		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_walk_chain_carries_replay_fields() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		let mut first = make_stored_completion("cmpl_001", key.id, None, "What is Rust?", "A language");
+		first.instructions = Some("Be brief".to_string());
+		storage.store_completion(&first).unwrap();
+		storage
+			.store_completion(&make_stored_completion(
+				"cmpl_002",
+				key.id,
+				Some("cmpl_001"),
+				"More",
+				"Tokio",
+			))
+			.unwrap();
+
+		let chain = storage.walk_chain("cmpl_002").unwrap();
+		assert_eq!(chain[0].instructions.as_deref(), Some("Be brief"));
+		assert_eq!(chain[0].input, serde_json::json!({"content": "What is Rust?"}));
+		assert_eq!(chain[0].output, serde_json::json!({"content": "A language"}));
+		assert_eq!(chain[1].previous_completion_id.as_deref(), Some("cmpl_001"));
+		assert_eq!(chain[1].session_id, "sess_test_cmpl_002");
+		assert_eq!(chain[1].provider, "openai");
+	}
+
+	#[test]
+	fn test_walk_chain_never_reads_exchange() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		storage
+			.store_completion(&make_stored_completion("cmpl_001", key.id, None, "a", "b"))
+			.unwrap();
+		// An unparseable exchange would fail any reader that selected the column.
+		lock_conn(&storage.conn)
+			.unwrap()
+			.execute("UPDATE completions SET exchange = 'not json' WHERE id = 'cmpl_001'", [])
+			.unwrap();
+
+		assert_eq!(storage.walk_chain("cmpl_001").unwrap().len(), 1);
+	}
+
+	#[test]
+	fn test_walk_chain_fails_on_unreadable_link() {
+		let storage = create_test_storage();
+		let key = create_test_key(&storage);
+		storage
+			.store_completion(&make_stored_completion("cmpl_001", key.id, None, "a", "b"))
+			.unwrap();
+		storage
+			.store_completion(&make_stored_completion("cmpl_002", key.id, Some("cmpl_001"), "c", "d"))
+			.unwrap();
+		lock_conn(&storage.conn)
+			.unwrap()
+			.execute("UPDATE completions SET output = 'not json' WHERE id = 'cmpl_001'", [])
+			.unwrap();
+
+		let error = storage.walk_chain("cmpl_002").unwrap_err();
+		assert!(
+			error
+				.to_string()
+				.contains("completion cmpl_001: invalid JSON in `output`"),
+			"got: {error:#}"
+		);
 	}
 
 	#[test]

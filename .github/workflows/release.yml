@@ -78,7 +78,7 @@ jobs:
             -w /workspace \
             rust:1.99.1-alpine3.23 \
             sh -c "
-              apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig gcc g++ && \
+              apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig gcc g++ make && \
               rustup target add ${{ matrix.target }} && \
               cargo build --release --target ${{ matrix.target }}
             "

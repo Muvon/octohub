@@ -1,7 +1,7 @@
 use super::credentials::{apply_change, decode_error, Credential, CredentialChange};
 use super::{
 	decode_auto_map, encode_allowed_models, encode_auto_map, encode_json_column, generate_api_key, make_key_hint,
-	now_unix, ApiKey, ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia,
+	now_unix, ApiKey, ChainLink, ListFilter, Storage, StoredCompletion, StoredEmbedding, StoredEvaluation, StoredMedia,
 	TimeBucket, UsageRow, TERMINAL_MEDIA_STATUSES_SQL,
 };
 use anyhow::{Context, Result};
@@ -233,6 +233,18 @@ fn read_completion(row: &postgres::Row) -> StoredCompletion {
 		usage: row.get("usage"),
 		created_at: row.get::<_, i64>("created_at") as u64,
 	}
+}
+
+fn read_chain_link(row: &postgres::Row) -> Result<ChainLink> {
+	Ok(ChainLink {
+		id: row.try_get("id")?,
+		previous_completion_id: row.try_get("previous_completion_id")?,
+		session_id: row.try_get("session_id")?,
+		provider: row.try_get("provider")?,
+		input: row.try_get("input")?,
+		output: row.try_get("output")?,
+		instructions: row.try_get("instructions")?,
+	})
 }
 
 fn read_embedding(row: &postgres::Row) -> StoredEmbedding {
@@ -525,22 +537,25 @@ impl Storage for PostgresStorage {
 		Ok(rows.first().map(read_completion))
 	}
 
-	fn walk_chain(&self, id: &str) -> Result<Vec<StoredCompletion>> {
+	fn walk_chain(&self, id: &str) -> Result<Vec<ChainLink>> {
 		let mut client = self.pool.get().context("PostgreSQL connection failed")?;
 		// Single recursive CTE — one round-trip regardless of chain depth. Ordered by
 		// walk depth, not created_at: two links stored in the same second would
-		// otherwise replay in either order.
+		// otherwise replay in either order. The recursion carries ids only and the
+		// replay columns are joined once at the end, so `exchange` is never read
+		// (see `ChainLink`).
 		let rows = client.query(
-			"WITH RECURSIVE chain AS (\
-               SELECT *, 0 AS depth FROM completions WHERE id = $1 \
-               UNION ALL \
-               SELECT c.*, chain.depth + 1 FROM completions c \
-               JOIN chain ON c.id = chain.previous_completion_id \
-             ) \
-             SELECT * FROM chain ORDER BY depth DESC",
+			"WITH RECURSIVE chain (id, previous_completion_id, depth) AS (\
+			   SELECT id, previous_completion_id, 0 FROM completions WHERE id = $1 \
+			   UNION ALL \
+			   SELECT c.id, c.previous_completion_id, chain.depth + 1 FROM completions c \
+			   JOIN chain ON c.id = chain.previous_completion_id \
+			 ) \
+			 SELECT c.id, c.previous_completion_id, c.session_id, c.provider, c.input, c.output, c.instructions \
+			 FROM chain JOIN completions c ON c.id = chain.id ORDER BY chain.depth DESC",
 			&[&id],
 		)?;
-		super::complete_chain(rows.iter().map(read_completion).collect())
+		super::complete_chain(rows.iter().map(read_chain_link).collect::<Result<_>>()?)
 	}
 
 	fn list_completions(&self, filter: &ListFilter) -> Result<Vec<StoredCompletion>> {
