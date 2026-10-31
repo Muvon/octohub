@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.16.3] - 2026-10-31
+
+### 📋 Release Summary
+
+Cache prewarming requests are now supported by the proxy.
+
+### ✨ New Features & Enhancements
+
+- **proxy**: support cache prewarming requests `239081e8`
+
 ## [0.16.2] - 2026-10-31
 
 ### 📋 Release Summary
