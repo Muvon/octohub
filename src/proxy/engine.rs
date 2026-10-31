@@ -1490,6 +1490,12 @@ fn content_to_message(role: &str, content: &ContentValue) -> Message {
 		msg.cache_ttl = content.cache_ttl();
 	}
 
+	attach_media(&mut msg, content);
+	msg
+}
+
+/// Attach the `input_image` / `input_video` parts of `content` to `msg`.
+fn attach_media(msg: &mut Message, content: &ContentValue) {
 	let images: Vec<ImageAttachment> = content
 		.image_urls()
 		.into_iter()
@@ -1507,8 +1513,6 @@ fn content_to_message(role: &str, content: &ContentValue) -> Message {
 	if !videos.is_empty() {
 		msg.videos = Some(videos);
 	}
-
-	msg
 }
 
 /// Parse a Responses-API image URL into an `ImageAttachment`. Supports
@@ -1606,7 +1610,10 @@ fn push_items(items: &[InputItem], messages: &mut Vec<Message>) {
 				output,
 				cache_control,
 			} => {
-				let mut msg = Message::tool(output, call_id, "function");
+				let mut msg = Message::tool(&output.text(), call_id, "function");
+				// A tool result can carry images (browser screenshot); octolib places
+				// them per provider, so they must ride on the tool message.
+				attach_media(&mut msg, output);
 				// Forward the client's cache marker so the upstream provider caches
 				// the prefix ending at this tool result — the common agent-loop tail
 				// breakpoint. Mirrors `content_to_message` for Message items.
@@ -2505,6 +2512,49 @@ mod tests {
 
 		assert_eq!(messages.len(), 1);
 		assert!(!messages[0].cached, "replayed history markers are stripped");
+	}
+
+	#[test]
+	fn function_call_output_with_image_parts_carries_text_and_image() {
+		// Prod 2026-10-31: a browser screenshot came back as an array of parts and
+		// the whole request was rejected. The image must reach the tool Message.
+		let shot = item(
+			r#"{"type":"function_call_output","call_id":"c1","output":[
+				{"type":"input_text","text":"screenshot taken"},
+				{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}
+			]}"#,
+		);
+		let mut messages = Vec::new();
+		push_items(&[shot], &mut messages);
+
+		assert_eq!(messages.len(), 1);
+		assert_eq!(messages[0].role, "tool");
+		assert_eq!(messages[0].content, "screenshot taken");
+		let images = messages[0].images.as_ref().expect("tool image must be forwarded");
+		assert_eq!(images.len(), 1);
+		assert_eq!(images[0].media_type, "image/png");
+	}
+
+	#[test]
+	fn stored_items_replay_tool_image_parts() {
+		let stored = vec![serde_json::json!({
+			"type": "function_call_output",
+			"call_id": "c1",
+			"output": [
+				{"type": "input_text", "text": "screenshot taken"},
+				{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+			]
+		})];
+		let mut messages = Vec::new();
+		push_stored_items(&stored, &mut messages);
+
+		assert_eq!(
+			messages.len(),
+			1,
+			"array-shaped output must not be skipped as unparseable"
+		);
+		assert_eq!(messages[0].content, "screenshot taken");
+		assert_eq!(messages[0].images.as_ref().map(Vec::len), Some(1));
 	}
 
 	#[test]

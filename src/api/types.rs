@@ -106,7 +106,9 @@ pub enum InputItem {
 	#[serde(rename = "function_call_output")]
 	FunctionCallOutput {
 		call_id: String,
-		output: String,
+		/// String, or an array of typed parts when the tool result carries images
+		/// (e.g. a browser screenshot) — octolib sends the array shape.
+		output: ContentValue,
 		/// Optional ephemeral cache marker, mirroring `ContentPartInput.cache_control`
 		/// and `ToolDefinition.cache_control`. In an agent loop the tool result is
 		/// usually the conversation tail, where the client anchors its rolling cache
@@ -704,7 +706,7 @@ fn chat_message_to_input_items(msg: ChatMessage) -> Vec<InputItem> {
 	match msg.role.as_str() {
 		"tool" => {
 			let call_id = msg.tool_call_id.unwrap_or_default();
-			let output = content_as_text(msg.content.as_ref()).unwrap_or_default();
+			let output = content_value_from_chat_owned(msg.content);
 			vec![InputItem::FunctionCallOutput {
 				call_id,
 				output,
@@ -998,11 +1000,46 @@ mod tests {
 		if let Input::Items(items) = &req.input {
 			assert_eq!(items.len(), 1);
 			assert!(
-				matches!(&items[0], InputItem::FunctionCallOutput { call_id, output, .. } if call_id == "call_abc123" && output == "72°F sunny")
+				matches!(&items[0], InputItem::FunctionCallOutput { call_id, output, .. } if call_id == "call_abc123" && output.text() == "72°F sunny")
 			);
 		} else {
 			panic!("Expected Items input");
 		}
+	}
+
+	#[test]
+	fn test_function_call_output_with_image_parts_round_trips() {
+		// octolib sends a tool result carrying an image as an array of parts.
+		// Stored items are replayed, so both shapes must serialize unchanged.
+		let array_json = serde_json::json!({
+			"type": "function_call_output",
+			"call_id": "call_shot",
+			"output": [
+				{"type": "input_text", "text": "screenshot taken"},
+				{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+			]
+		});
+		let text_json = serde_json::json!({"type": "function_call_output", "call_id": "c", "output": "ok"});
+
+		for json in [array_json, text_json] {
+			let item: InputItem = serde_json::from_value(json.clone()).unwrap();
+			assert_eq!(serde_json::to_value(&item).unwrap(), json);
+		}
+
+		let item: InputItem = serde_json::from_value(serde_json::json!({
+			"type": "function_call_output",
+			"call_id": "call_shot",
+			"output": [
+				{"type": "input_text", "text": "screenshot taken"},
+				{"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+			]
+		}))
+		.unwrap();
+		let InputItem::FunctionCallOutput { output, .. } = item else {
+			panic!("expected FunctionCallOutput");
+		};
+		assert_eq!(output.text(), "screenshot taken");
+		assert_eq!(output.image_urls().len(), 1);
 	}
 
 	#[test]
