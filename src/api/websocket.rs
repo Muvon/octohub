@@ -6,10 +6,14 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use bytes::Bytes;
-use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use futures_util::{
+	stream::{SplitSink, SplitStream},
+	SinkExt, StreamExt,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, upgrade::Upgraded, Request, Response, StatusCode, Version};
 use hyper_util::rt::TokioIo;
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tokio_tungstenite::{
 	tungstenite::{
@@ -32,6 +36,16 @@ const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 type Socket = WebSocketStream<TokioIo<Upgraded>>;
 type Writer = SplitSink<Socket, Message>;
+type Reader = SplitStream<Socket>;
+
+/// What the session does after handling an incoming frame.
+#[derive(PartialEq)]
+enum Flow {
+	Continue,
+	Stop,
+	/// Stop, but the rejected frame's payload is still arriving: drain it first.
+	Drain,
+}
 
 pub async fn handle_upgrade(
 	mut req: Request<Incoming>,
@@ -127,12 +141,23 @@ struct Session {
 }
 
 impl Session {
-	async fn serve(self, socket: Socket, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+	async fn serve(self, socket: Socket, shutdown: tokio::sync::watch::Receiver<bool>) {
 		let (mut writer, mut reader) = socket.split();
+		if self.exchange(&mut writer, &mut reader, shutdown).await == Flow::Drain {
+			drain(writer, reader).await;
+		}
+	}
+
+	async fn exchange(
+		&self,
+		writer: &mut Writer,
+		reader: &mut Reader,
+		mut shutdown: tokio::sync::watch::Receiver<bool>,
+	) -> Flow {
 		loop {
 			if *shutdown.borrow() {
-				close(&mut writer, CloseCode::Away, "Server is draining").await;
-				return;
+				close(writer, CloseCode::Away, "Server is draining").await;
+				return Flow::Stop;
 			}
 			let incoming = tokio::select! {
 				biased;
@@ -141,16 +166,14 @@ impl Session {
 			};
 			let text = match incoming {
 				Some(Ok(Message::Text(text))) => text,
-				other => {
-					if control(other, &mut writer).await {
-						continue;
-					}
-					return;
-				}
+				other => match control(other, writer).await {
+					Flow::Continue => continue,
+					flow => return flow,
+				},
 			};
 			if *shutdown.borrow() {
-				close(&mut writer, CloseCode::Away, "Server is draining").await;
-				return;
+				close(writer, CloseCode::Away, "Server is draining").await;
+				return Flow::Stop;
 			}
 			// The request future is owned here: closing the socket drops it and its permits.
 			let request = self.complete(text.as_bytes());
@@ -161,10 +184,13 @@ impl Session {
 					_ = shutdown.changed(), if !draining => { draining = true; }
 					incoming = reader.next() => {
 						if matches!(incoming, Some(Ok(Message::Text(_)))) {
-							close(&mut writer, CloseCode::Policy, "Wait for the completion reply before sending another request").await;
-							return;
+							close(writer, CloseCode::Policy, "Wait for the completion reply before sending another request").await;
+							return Flow::Stop;
 						}
-						if !control(incoming, &mut writer).await { return; }
+						match control(incoming, writer).await {
+							Flow::Continue => {}
+							flow => return flow,
+						}
 					}
 					response = &mut request => break response,
 				}
@@ -173,16 +199,17 @@ impl Session {
 				Ok(message) => message,
 				Err(error) => {
 					tracing::error!(%error, "WebSocket reply encoding failed");
-					close(&mut writer, CloseCode::Error, "Reply encoding failed").await;
-					return;
+					close(writer, CloseCode::Error, "Reply encoding failed").await;
+					return Flow::Stop;
 				}
 			};
 			if message.len() > MAX_REPLY_BYTES {
-				close(&mut writer, CloseCode::Size, "Completion reply exceeds 64 MiB").await;
-				return;
+				close(writer, CloseCode::Size, "Completion reply exceeds 64 MiB").await;
+				return Flow::Stop;
 			}
-			if !deliver(message, &mut writer, &mut reader).await {
-				return;
+			match deliver(message, writer, reader).await {
+				Flow::Continue => {}
+				flow => return flow,
 			}
 		}
 	}
@@ -226,11 +253,7 @@ impl Session {
 }
 
 // Keep enforcing sequencing and servicing control frames until the reply is flushed.
-async fn deliver(
-	message: Message,
-	writer: &mut Writer,
-	reader: &mut futures_util::stream::SplitStream<Socket>,
-) -> bool {
+async fn deliver(message: Message, writer: &mut Writer, reader: &mut Reader) -> Flow {
 	enum Delivery {
 		Finished(bool),
 		Incoming(Option<Result<Message, Error>>),
@@ -254,7 +277,8 @@ async fn deliver(
 		}
 	};
 	match result {
-		Delivery::Finished(sent) => sent,
+		Delivery::Finished(true) => Flow::Continue,
+		Delivery::Finished(false) => Flow::Stop,
 		Delivery::Incoming(Some(Ok(Message::Text(_)))) => {
 			close(
 				writer,
@@ -262,12 +286,12 @@ async fn deliver(
 				"Wait for the completion reply before sending another request",
 			)
 			.await;
-			false
+			Flow::Stop
 		}
-		Delivery::Incoming(other) => {
-			control(other, writer).await;
-			false
-		}
+		Delivery::Incoming(other) => match control(other, writer).await {
+			Flow::Drain => Flow::Drain,
+			_ => Flow::Stop,
+		},
 	}
 }
 
@@ -300,28 +324,46 @@ async fn close(writer: &mut Writer, code: CloseCode, reason: &'static str) {
 }
 
 /// Tungstenite queues native Pong/Close replies while reading; flush without a work queue.
-async fn control(incoming: Option<Result<Message, Error>>, writer: &mut Writer) -> bool {
+async fn control(incoming: Option<Result<Message, Error>>, writer: &mut Writer) -> Flow {
 	match incoming {
-		Some(Ok(Message::Ping(_))) => matches!(timeout(TRANSPORT_TIMEOUT, writer.flush()).await, Ok(Ok(()))),
-		Some(Ok(Message::Pong(_))) => true,
+		Some(Ok(Message::Ping(_))) => match timeout(TRANSPORT_TIMEOUT, writer.flush()).await {
+			Ok(Ok(())) => Flow::Continue,
+			_ => Flow::Stop,
+		},
+		Some(Ok(Message::Pong(_))) => Flow::Continue,
 		Some(Ok(Message::Close(_))) => {
 			let _ = timeout(TRANSPORT_TIMEOUT, writer.flush()).await;
-			false
+			Flow::Stop
 		}
 		Some(Ok(Message::Binary(_))) => {
 			close(writer, CloseCode::Unsupported, "Only JSON text requests are supported").await;
-			false
+			Flow::Stop
 		}
+		// Both reject a frame by its header, before its payload has been read.
 		Some(Err(Error::Capacity(_))) => {
 			close(writer, CloseCode::Size, "Request exceeds 16 MiB").await;
-			false
+			Flow::Drain
 		}
 		Some(Err(Error::Protocol(_))) => {
 			close(writer, CloseCode::Protocol, "Malformed WebSocket frame").await;
-			false
+			Flow::Drain
 		}
-		_ => false,
+		_ => Flow::Stop,
 	}
+}
+
+/// Dropping a socket with unread input makes the OS answer with a TCP reset, and a
+/// peer that receives a reset (always on Windows) discards the Close frame we just
+/// sent before its application reads it. Half-close and consume the rejected
+/// payload until the peer hangs up, so the Close code reaches the client.
+async fn drain(writer: Writer, reader: Reader) {
+	let mut socket = reader.reunite(writer).expect("halves split from one socket");
+	let io = socket.get_mut();
+	let _ = timeout(TRANSPORT_TIMEOUT, async {
+		io.shutdown().await?;
+		tokio::io::copy(io, &mut tokio::io::sink()).await
+	})
+	.await;
 }
 
 #[cfg(test)]
