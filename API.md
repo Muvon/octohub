@@ -1244,6 +1244,6 @@ All errors follow this format:
 | `401` | Missing or invalid API key |
 | `403` | The API key is not permitted to use the requested model (see `allowed_models`) |
 | `404` | Unknown endpoint |
-| `413` | Request body over 16 MiB — rejected before any upstream call, since the stored completion could not hold it |
+| `413` | Request body over 16 MiB — rejected before any upstream call, since the stored completion could not hold it. Media create routes allow one source at `media.max_source_bytes` after base64 (+1 MiB): 28 MiB at the default |
 | `429` | The key's shared `owner` concurrency budget stayed saturated for the 30s queue window — reduce parallelism and retry |
 | `500` | Internal error (provider failure, storage error) |

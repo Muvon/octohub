@@ -27,6 +27,11 @@ pub const MODEL_FORBIDDEN_MARKER: &str = "model_not_allowed_for_key";
 pub const OWNER_LIMIT_MARKER: &str = "owner_concurrency_exhausted";
 const CREDENTIAL_ERROR_MAX_CHARS: usize = 300;
 
+/// Stored-only output item carrying a provider's raw output items (e.g.
+/// Anthropic thinking blocks with their signatures). History rebuilt from the
+/// chain hands it back to octolib for exact replay; clients never see it.
+const PROVIDER_ITEMS_TYPE: &str = "provider_items";
+
 #[derive(Debug)]
 pub enum ProxyTimeoutError {
 	ProviderQueue {
@@ -987,6 +992,14 @@ impl ProxyEngine {
 		// session_id comes from the chain tail — no extra DB query needed.
 		let session_id = inherited_session_id.unwrap_or_else(|| format!("sess_{}", Uuid::new_v4().simple()));
 
+		let mut stored_output = serde_json::to_value(&output).unwrap_or(serde_json::Value::Null);
+		if let Some(provider_items) = stored_provider_items(&provider_response.exchange.response) {
+			stored_output
+				.as_array_mut()
+				.expect("output serializes as an array")
+				.push(provider_items);
+		}
+
 		let mut stored = StoredCompletion {
 			id: completion_id,
 			api_key_id: api_key.id,
@@ -996,7 +1009,7 @@ impl ProxyEngine {
 			resolved_model,
 			provider: provider.name().to_string(),
 			input: serde_json::to_value(&req.input).unwrap_or(serde_json::Value::Null),
-			output: serde_json::to_value(&output).unwrap_or(serde_json::Value::Null),
+			output: stored_output,
 			instructions: req.instructions.as_ref().map(|i| i.text()),
 			exchange: serde_json::json!({
 				"request": provider_response.exchange.request,
@@ -1412,8 +1425,13 @@ impl ProxyEngine {
 			let mut text_parts: Vec<String> = Vec::new();
 			let mut tool_calls: Vec<serde_json::Value> = Vec::new();
 			let mut reasoning_text: Option<String> = None;
+			let mut provider_items: Option<serde_json::Value> = None;
 
 			for item in items {
+				if item["type"] == PROVIDER_ITEMS_TYPE {
+					provider_items = Some(serde_json::json!({"provider": item["provider"], "items": item["items"]}));
+					continue;
+				}
 				if let Ok(output_item) = serde_json::from_value::<OutputItem>(item.clone()) {
 					match output_item {
 						OutputItem::Message { content, .. } => {
@@ -1471,10 +1489,24 @@ impl ProxyEngine {
 				if let Some(rt) = reasoning_text {
 					msg.thinking = Some(ThinkingBlock::new(&rt));
 				}
+				msg.provider_items = provider_items;
 				messages.push(msg);
 			}
 		}
 	}
+}
+
+/// The stored-only output item for a provider's captured output items, if the
+/// provider captured any. BYOK redaction has already run on `exchange_response`.
+fn stored_provider_items(exchange_response: &serde_json::Value) -> Option<serde_json::Value> {
+	let captured = exchange_response
+		.get("output_items")
+		.filter(|captured| !captured.is_null())?;
+	Some(serde_json::json!({
+		"type": PROVIDER_ITEMS_TYPE,
+		"provider": captured["provider"],
+		"items": captured["items"],
+	}))
 }
 
 /// Build an octolib `Message` from an input message, extracting plain text
@@ -3234,5 +3266,61 @@ mod byok_tests {
 		assert!(engine.process(request("face", None), &key, None, None).await.is_err());
 		assert_eq!(paths(), vec!["/primary"]);
 		server.abort();
+	}
+
+	#[test]
+	fn captured_output_items_become_a_stored_only_item() {
+		let captured =
+			serde_json::json!({"provider": "anthropic", "items": [{"type": "thinking", "signature": "sig"}]});
+		let exchange_response = serde_json::json!({"output_items": captured});
+		assert_eq!(
+			stored_provider_items(&exchange_response),
+			Some(serde_json::json!({
+				"type": "provider_items",
+				"provider": "anthropic",
+				"items": [{"type": "thinking", "signature": "sig"}],
+			}))
+		);
+		assert_eq!(stored_provider_items(&serde_json::json!({})), None);
+		assert_eq!(stored_provider_items(&serde_json::json!({"output_items": null})), None);
+	}
+
+	#[tokio::test]
+	async fn chain_rebuild_hands_stored_provider_items_back_on_the_assistant_message() {
+		// Building the harness is enough: reconstruct_output never calls the provider.
+		let h = ChainHarness::new("together", "TOGETHER_API_URL", "TOGETHER_API_KEY").await;
+		let items = serde_json::json!([{"type": "thinking", "thinking": "hmm", "signature": "sig"}, {"type": "text", "text": "hello"}]);
+		let stored_output = serde_json::json!([
+			{"type": "reasoning", "id": "rsn_1", "content": [{"type": "output_text", "text": "hmm"}]},
+			{"type": "message", "id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+			{"type": "provider_items", "provider": "anthropic", "items": items},
+		]);
+		let mut messages = Vec::new();
+		h.engine.reconstruct_output(&stored_output, &mut messages);
+		assert_eq!(messages.len(), 1);
+		assert_eq!(messages[0].content, "hello");
+		assert!(messages[0].thinking.is_some());
+		assert_eq!(
+			messages[0].provider_items,
+			Some(serde_json::json!({"provider": "anthropic", "items": items}))
+		);
+	}
+
+	#[tokio::test]
+	async fn completion_without_captured_output_items_stores_no_provider_items() {
+		let h = ChainHarness::new("nvidia", "NVIDIA_API_URL", "NVIDIA_API_KEY").await;
+		let (response, _) = h
+			.engine
+			.process(request("chain", None), &h.key, None, None)
+			.await
+			.unwrap();
+		let stored = h.storage.get_completion(&response.id).unwrap().unwrap();
+		assert_eq!(stored.output, serde_json::to_value(&response.output).unwrap());
+		assert!(stored
+			.output
+			.as_array()
+			.unwrap()
+			.iter()
+			.all(|item| item["type"] != PROVIDER_ITEMS_TYPE));
 	}
 }

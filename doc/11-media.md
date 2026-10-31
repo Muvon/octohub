@@ -164,7 +164,9 @@ Anything else is a 400.
 path would read the *server's* filesystem. Decoded base64 is checked against
 `media.max_source_bytes` before anything reaches a provider, and inline payloads
 are never written to the database — the stored request keeps the shape and the
-byte count, not the bytes.
+byte count, not the bytes. Because media rows store no payload, a media create
+body may exceed the 16 MiB completion cap: it is sized to hold one source at
+`media.max_source_bytes` after base64, plus 1 MiB (28 MiB at the default).
 
 ### Provider-native parameters
 
