@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.16.1] - 2026-10-31
+
+### 📋 Release Summary
+
+Media request bodies can now fit within the source cap.
+
+### 🐛 Bug Fixes & Stability
+
+- **api**: allow media bodies to fit the source cap `953b90d4`
+
 ## [0.16.0] - 2026-10-31
 
 ### 📋 Release Summary
