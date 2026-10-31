@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.16.0] - 2026-10-31
+
+### 📋 Release Summary
+
+Chain traversal has been reworked to use lightweight records.
+
+### 🚨 Breaking Changes
+
+- **storage**: rework chain traversal with lightweight records `5ada85a0`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib to 0.48.2 `9ffad1b6`
+
 ## [0.15.1] - 2026-10-31
 
 ### 📋 Release Summary
