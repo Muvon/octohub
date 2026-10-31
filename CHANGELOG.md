@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.15.1] - 2026-10-31
+
+### 📋 Release Summary
+
+Configured timeouts now apply correctly to silent streams.
+
+### 🔧 Improvements & Optimizations
+
+- **release**: pin release workflow actions `da88940d`
+
+### 🐛 Bug Fixes & Stability
+
+- **proxy**: apply configured timeout to silent streams `b8786af4`
+
 ## [0.15.0] - 2026-10-31
 
 ### 📋 Release Summary
