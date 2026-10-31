@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.16.2] - 2026-10-31
+
+### 📋 Release Summary
+
+Provider output items are now preserved when requests are chained. Rejected WebSocket frames are now drained.
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib to 0.48.4 `2b095f7b`
+
+### 🐛 Bug Fixes & Stability
+
+- **proxy**: preserve provider output items in chains `1253f131`
+- **websocket**: drain rejected websocket frames `0b0c9422`
+
 ## [0.16.1] - 2026-10-31
 
 ### 📋 Release Summary
