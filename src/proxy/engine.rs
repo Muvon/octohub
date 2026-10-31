@@ -31,6 +31,8 @@ const CREDENTIAL_ERROR_MAX_CHARS: usize = 300;
 /// Anthropic thinking blocks with their signatures). History rebuilt from the
 /// chain hands it back to octolib for exact replay; clients never see it.
 const PROVIDER_ITEMS_TYPE: &str = "provider_items";
+/// `cache_control.ttl` of Anthropic-style long-lived cache markers.
+const LONG_CACHE_TTL: &str = "1h";
 
 #[derive(Debug)]
 pub enum ProxyTimeoutError {
@@ -232,6 +234,59 @@ impl std::fmt::Display for SchemaNotEnforcedError {
 }
 
 impl std::error::Error for SchemaNotEnforcedError {}
+
+/// A cache pre-warm for a lane whose provider has no keepalive policy for its
+/// model: the request is answered without an upstream call (see
+/// `prewarm_unsupported_response`). Not a provider fault.
+#[derive(Debug)]
+pub struct CachePrewarmUnsupported {
+	pub provider: String,
+	pub model: String,
+}
+
+impl std::fmt::Display for CachePrewarmUnsupported {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"provider '{}' cannot pre-warm the cache of '{}'",
+			self.provider, self.model
+		)
+	}
+}
+
+impl std::error::Error for CachePrewarmUnsupported {}
+
+/// The reply to a pre-warm the serving lane cannot honour: nothing was read or
+/// written, it costs exactly zero, and nothing is stored. The client reads the
+/// zero cache read as a miss and stops its keepalive.
+fn prewarm_unsupported_response(unsupported: &CachePrewarmUnsupported) -> CreateCompletionResponse {
+	CreateCompletionResponse {
+		id: format!("cmpl_{}", Uuid::new_v4().simple()),
+		object: "completion",
+		model: unsupported.model.clone(),
+		provider: unsupported.provider.clone(),
+		output: Vec::new(),
+		usage: Usage {
+			byok: None,
+			input_tokens: 0,
+			output_tokens: 0,
+			cache_read_tokens: None,
+			cache_write_tokens: None,
+			reasoning_tokens: None,
+			total_tokens: 0,
+			// A known zero, not an absent cost: a client that sums ping costs into
+			// the session would otherwise mark the whole session's cost unknown.
+			cost: Some(0.0),
+			request_time_ms: None,
+		},
+		structured_output: None,
+		finish_reason: None,
+		created_at: SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or_default()
+			.as_secs(),
+	}
+}
 
 /// Extract the upstream HTTP status embedded in an octolib provider error.
 /// octolib formats provider failures as "... API error <code> <message>", e.g.
@@ -607,6 +662,31 @@ impl ProxyEngine {
 				}));
 			}
 		}
+		// A pre-warm refreshes the cache this chain already holds, and that cache
+		// lives on the provider that served it: only that lane, with no rotation and
+		// no failover to a lane where the ping would write a fresh cache instead.
+		if req.cache_prewarm {
+			if let Some(sticky) = sticky_provider.as_deref() {
+				candidates.retain(|(p, _)| p.eq_ignore_ascii_case(sticky));
+			}
+			candidates.truncate(1);
+			if candidates.is_empty() {
+				return Ok((
+					prewarm_unsupported_response(&CachePrewarmUnsupported {
+						provider: sticky_provider.unwrap_or_default(),
+						model: routed_model,
+					}),
+					std::time::Duration::ZERO,
+				));
+			}
+		}
+		// The interval a pre-warm keeps follows the TTL of the newest cache marker,
+		// the same marker the client derived its ping interval from.
+		let long_cache_ttl = messages
+			.iter()
+			.rev()
+			.find(|m| m.cached)
+			.is_some_and(|m| m.cache_ttl.as_deref() == Some(LONG_CACHE_TTL));
 
 		let cooldown = std::time::Duration::from_secs(config.server.provider_error_cooldown_secs);
 		let (provider_name, resolved_model, provider, mut provider_response, upstream_duration) = loop {
@@ -658,6 +738,13 @@ impl ProxyEngine {
 					}));
 				}
 
+				if req.cache_prewarm && provider.keepalive_policy(&resolved_model, long_cache_ttl).is_none() {
+					return Err(anyhow!(CachePrewarmUnsupported {
+						provider: provider_name.clone(),
+						model: resolved_model.clone(),
+					}));
+				}
+
 				// 6. Build ChatCompletionParams
 				let tools = req.tools.as_ref().map(|tools| {
 					tools
@@ -692,6 +779,7 @@ impl ProxyEngine {
 				if let Some(tools) = tools {
 					params.tools = Some(tools);
 				}
+				params.cache_prewarm = req.cache_prewarm;
 
 				// Forwarded client attribution; octolib applies these last with
 				// override semantics, beating its own env-based defaults.
@@ -797,6 +885,9 @@ impl ProxyEngine {
 					break (provider_name, resolved_model, provider, response, duration);
 				}
 				Err(err) => {
+					if let Some(unsupported) = err.downcast_ref::<CachePrewarmUnsupported>() {
+						return Ok((prewarm_unsupported_response(unsupported), std::time::Duration::ZERO));
+					}
 					// Modality mismatch is a candidate filter, not a provider fault.
 					if let Some(modality_err) = err.downcast_ref::<ModalityNotSupportedError>() {
 						retain_same_model_failover_candidates(&mut candidates, modality_err);
@@ -2747,6 +2838,8 @@ mod byok_tests {
 	#[derive(Default)]
 	struct Upstream {
 		statuses: std::collections::HashMap<String, u16>,
+		// 200 bodies by path, for lanes that do not speak the chat-completions shape.
+		replies: std::collections::HashMap<String, serde_json::Value>,
 		requests: Vec<(String, String)>,
 		bodies: Vec<serde_json::Value>,
 	}
@@ -2778,15 +2871,15 @@ mod byok_tests {
                             let auth = req.headers().get("Authorization").map(|h| h.to_str().unwrap().to_owned()).unwrap_or_default();
                             let body = req.collect().await.unwrap().to_bytes();
                             assert!(!String::from_utf8_lossy(&body).contains("owner-private"));
-                            let status = {
+                            let (status, reply) = {
                                 let mut state = state.lock().unwrap();
                                 state.requests.push((path.clone(), auth.clone()));
 								state.bodies.push(serde_json::from_slice(&body).unwrap());
-                                state.statuses.get(&path).copied().unwrap_or(200)
+                                (state.statuses.get(&path).copied().unwrap_or(200), state.replies.get(&path).cloned())
                             };
                             let body = if status == 200 {
-                                serde_json::json!({"id":"mock", "object":"chat.completion", "created":1_700_000_000, "model":"glm-5", "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
-                                    "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":0.01}})
+                                reply.unwrap_or_else(|| serde_json::json!({"id":"mock", "object":"chat.completion", "created":1_700_000_000, "model":"glm-5", "choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],
+                                    "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cost":0.01}}))
                             } else {
                                 serde_json::json!({"error":{"message": format!("Rejected {auth} {}", "x".repeat(350))}})
                             };
@@ -3322,5 +3415,67 @@ mod byok_tests {
 			.unwrap()
 			.iter()
 			.all(|item| item["type"] != PROVIDER_ITEMS_TYPE));
+	}
+
+	fn prewarm(model: &str, previous: Option<&str>) -> CreateCompletionRequest {
+		let mut req = request(model, previous);
+		req.cache_prewarm = true;
+		req
+	}
+
+	// One test, so the provider env overrides it sets cannot race another test's.
+	#[tokio::test]
+	async fn cache_prewarm_reaches_only_the_chain_lane_and_only_when_it_can_be_prewarmed() {
+		let (address, upstream, server) = mock_upstream().await;
+		let _env = EnvGuard::set(&[
+			("FEATHERLESS_API_URL", format!("http://{address}/featherless")),
+			("FEATHERLESS_API_KEY", "mock-key".into()),
+			("ANTHROPIC_API_URL", format!("http://{address}/anthropic")),
+			("ANTHROPIC_API_KEY", "mock-key".into()),
+		]);
+		upstream.lock().unwrap().replies.insert(
+			"/anthropic".into(),
+			serde_json::json!({"id": "warm", "content": [], "stop_reason": "end_turn",
+				"usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 900}}),
+		);
+		let config: Config = toml::from_str(
+			"[models]\nface = [\"featherless:m\", \"anthropic:m\"]\n[routing.models]\nface = \"ordered\"",
+		)
+		.unwrap();
+		let storage = Arc::new(SqliteStorage::new(":memory:").unwrap());
+		let key = storage.create_api_key("key", None, None, None).unwrap();
+		let credentials = Arc::new(Credentials::new(storage.clone(), None).unwrap());
+		let limiter = Arc::new(RwLock::new(Arc::new(ProviderLimiter::from_config(&config))));
+		let config = Arc::new(RwLock::new(Arc::new(config)));
+		let engine = ProxyEngine::new(storage.clone(), config, limiter, 1, credentials);
+
+		// The chain lives on featherless, whose provider has no keepalive policy:
+		// the ping gets an empty, zero-usage reply and never reaches anthropic.
+		let (prior, _) = engine.process(request("face", None), &key, None, None).await.unwrap();
+		assert_eq!(prior.provider, "featherless");
+		upstream.lock().unwrap().requests.clear();
+		let (ping, _) = engine
+			.process(prewarm("face", Some(&prior.id)), &key, None, None)
+			.await
+			.unwrap();
+		assert!(upstream.lock().unwrap().requests.is_empty(), "no lane is called");
+		assert!(ping.output.is_empty());
+		assert_eq!(ping.usage.cache_read_tokens, None);
+		assert_eq!(ping.usage.cost, Some(0.0));
+		assert!(storage.get_completion(&ping.id).unwrap().is_none(), "nothing is stored");
+
+		// Anthropic has a policy: a cache-only request, stored so it bills.
+		let (ping, _) = engine
+			.process(prewarm("anthropic:m", None), &key, None, None)
+			.await
+			.unwrap();
+		let upstream = upstream.lock().unwrap();
+		assert_eq!(upstream.requests.len(), 1);
+		assert_eq!(upstream.requests[0].0, "/anthropic");
+		assert_eq!(upstream.bodies.last().unwrap()["max_tokens"], 0);
+		assert_ne!(upstream.bodies.last().unwrap()["stream"], true);
+		assert_eq!(ping.usage.cache_read_tokens, Some(900));
+		assert!(storage.get_completion(&ping.id).unwrap().is_some());
+		server.abort();
 	}
 }

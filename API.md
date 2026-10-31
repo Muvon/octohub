@@ -122,6 +122,7 @@ OctoHub's native Responses API. Supports multi-turn conversation chains, reasoni
 | `previous_completion_id` | string | — | `null` | Chain to a previous completion for multi-turn conversations. OctoHub reconstructs the full history automatically. |
 | `temperature` | float | — | `1.0` | Sampling temperature (0.0–2.0). |
 | `max_output_tokens` | integer | — | `0` | Maximum tokens in the response. `0` = provider default. |
+| `cache_prewarm` | bool | — | `false` | Refresh the prompt cache of the lane serving this chain without generating output. Goes only to the provider that served `previous_completion_id` (no rotation, no failover). That provider makes a cache-only call when it has a keepalive policy for the model (Anthropic); the completion is stored and billed like any other. Any other lane gets an empty reply with zero usage and `cost: 0`, no upstream call, nothing stored. |
 | `tools` | array | — | `null` | Function definitions for tool/function calling. |
 
 #### The virtual `auto` model

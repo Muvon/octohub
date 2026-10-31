@@ -76,6 +76,7 @@ OpenAI Responses API-compatible. Request body deserialized into
   "temperature": 1.0,          // optional, default 1.0
   "top_p": 1.0,                // optional, default 1.0 — proxied through
   "max_output_tokens": 0,      // optional, 0 = provider default
+  "cache_prewarm": false,      // optional — cache-only ping of the chain's lane (see below)
   "reasoning_effort": "high",  // optional — "low"|"medium"|"high"|"xhigh"|"max"
   "text": {                    // optional — structured output
     "format": { "type": "json_object" }
@@ -134,6 +135,22 @@ Practical effects:
 - **A chain that cannot be loaded fails the request** before any upstream
   provider call, so the model never answers with stored history silently cut.
 - **The chain is loaded once per request.**
+
+### Cache pre-warm (`cache_prewarm`)
+
+`"cache_prewarm": true` keeps a conversation's prompt cache alive while the
+client waits, the way Anthropic's `max_tokens: 0` request does. Send the same
+request the cached turn sent (same `previous_completion_id`, input, tools and
+cache markers) with the flag set:
+
+- It goes only to the provider that served the chain, never a rotation or a
+  failover lane: the cache lives on that provider.
+- When that provider has a keepalive policy for the model (Anthropic today),
+  the hub makes a cache-only call; the completion is stored and billed like any
+  other and reports the `cache_read_tokens` it refreshed.
+- Any other lane gets an empty reply with zero usage and `cost: 0`, no upstream
+  call and nothing stored. A client treats the zero cache read as a miss and
+  stops pinging.
 
 ### `text.format` — structured output
 

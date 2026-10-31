@@ -32,6 +32,12 @@ pub struct CreateCompletionRequest {
 	#[serde(default)]
 	pub max_output_tokens: u32,
 
+	/// Cache pre-warm: refresh the prompt cache of the lane serving this chain
+	/// without generating output. Sent only to that lane, with no failover; a lane
+	/// whose provider cannot be pre-warmed gets an empty, zero-usage reply.
+	#[serde(default)]
+	pub cache_prewarm: bool,
+
 	/// Reasoning effort hint for thinking-capable models. Accepted values:
 	/// "low" | "medium" | "high" | "xhigh" | "max". Unknown values are
 	/// ignored (provider default applies). Proxied through unchanged.
@@ -668,6 +674,7 @@ impl From<ChatCompletionRequest> for CreateCompletionRequest {
 			temperature: chat.temperature,
 			top_p: chat.top_p,
 			max_output_tokens: chat.max_tokens.unwrap_or(0),
+			cache_prewarm: false,
 			reasoning_effort: None,
 			text: None,
 			tools,
