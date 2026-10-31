@@ -70,6 +70,7 @@ Defined in `src/config.rs:83`. All keys optional except as noted.
 | `provider_queue_timeout_secs` | `60` | Maximum wait for a provider concurrency permit. Exceeding it returns `503`. |
 | `owner_queue_timeout_secs` | `30` | Maximum wait for a slot in the key owner's shared budget (`owner_concurrency`). Exceeding it returns `429`. `0` = never queue. |
 | `upstream_timeout_secs` | `360` | Maximum duration of the complete provider operation, including octolib retries. Exceeding it returns `504`. |
+| `upstream_stream_timeout_secs` | `0` | Maximum silence on a streaming provider call (time to headers, then between chunks); any chunk resets it. Fails a hung lane over fast while `upstream_timeout_secs` stays the total bound. `0` = off. Non-streaming providers ignore it. |
 | `failover_on_error` | `false` | Re-route provider-side failures (timeout, connect, 401/403 key or billing rejection, 404, 429, 5xx) to the next candidate provider of the model alias. A 400 never fails over. |
 | `provider_error_cooldown_secs` | `0` | After 3 consecutive provider-side failures, deprioritize the provider for this many seconds (used only when no healthy candidate admits). `0` = off. |
 | `shutdown_timeout_secs` | `900` | Drain bound on SIGTERM/SIGINT: in-flight requests get this long to finish, then the process exits non-zero. Must be > 0 and ≥ the longest admitted request (`owner_queue + attempts × (provider_queue + upstream)`); the container stop timeout must exceed it. See [08 — Deployment](08-deployment.md#shutdown-and-restarts). |
@@ -272,6 +273,7 @@ loaded (`src/config.rs:190`).
 | `OCTOHUB_PROVIDER_QUEUE_TIMEOUT_SECS` | `[server].provider_queue_timeout_secs` | Overrides the provider queue deadline. |
 | `OCTOHUB_OWNER_QUEUE_TIMEOUT_SECS` | `[server].owner_queue_timeout_secs` | Overrides the owner queue deadline. |
 | `OCTOHUB_UPSTREAM_TIMEOUT_SECS` | `[server].upstream_timeout_secs` | Overrides the complete upstream operation deadline. |
+| `OCTOHUB_UPSTREAM_STREAM_TIMEOUT_SECS` | `[server].upstream_stream_timeout_secs` | Overrides the streaming silence limit. |
 | `OCTOHUB_FAILOVER_ON_ERROR` | `[server].failover_on_error` | `true`/`1` enables provider failover. |
 | `OCTOHUB_PROVIDER_ERROR_COOLDOWN_SECS` | `[server].provider_error_cooldown_secs` | Overrides the provider cooldown duration. |
 | `OCTOHUB_SHUTDOWN_TIMEOUT_SECS` | `[server].shutdown_timeout_secs` | Overrides the drain bound. Not whole seconds, or `0`, is a startup error. |

@@ -214,6 +214,12 @@ pub struct ServerConfig {
 	/// octolib retries and response parsing.
 	#[serde(default = "default_upstream_timeout_secs")]
 	pub upstream_timeout_secs: u64,
+	/// Maximum silence on a streaming upstream call: the time to response
+	/// headers and between received chunks. A hung lane sends nothing, so this
+	/// fails it over long before `upstream_timeout_secs`, which stays the total
+	/// bound; any chunk resets it. 0 = off. Only streaming providers honour it.
+	#[serde(default)]
+	pub upstream_stream_timeout_secs: u64,
 	/// Retry the request on the next candidate provider when an upstream
 	/// call fails with a provider-side error (timeout, connect, 401/403/404,
 	/// 429, 5xx). Only kicks in when the model alias has another candidate
@@ -378,6 +384,7 @@ impl Default for ServerConfig {
 			provider_queue_timeout_secs: default_provider_queue_timeout_secs(),
 			owner_queue_timeout_secs: default_owner_queue_timeout_secs(),
 			upstream_timeout_secs: default_upstream_timeout_secs(),
+			upstream_stream_timeout_secs: 0,
 			failover_on_error: false,
 			provider_error_cooldown_secs: 0,
 			shutdown_timeout_secs: default_shutdown_timeout_secs(),
@@ -524,6 +531,11 @@ impl Config {
 				config.server.upstream_timeout_secs = seconds;
 			}
 		}
+		if let Ok(val) = env::var("OCTOHUB_UPSTREAM_STREAM_TIMEOUT_SECS") {
+			if let Ok(seconds) = val.parse() {
+				config.server.upstream_stream_timeout_secs = seconds;
+			}
+		}
 		if let Ok(val) = env::var("OCTOHUB_FAILOVER_ON_ERROR") {
 			config.server.failover_on_error = val == "true" || val == "1";
 		}
@@ -546,6 +558,7 @@ impl Config {
 				provider_queue_timeout_secs: default_provider_queue_timeout_secs(),
 				owner_queue_timeout_secs: default_owner_queue_timeout_secs(),
 				upstream_timeout_secs: default_upstream_timeout_secs(),
+				upstream_stream_timeout_secs: 0,
 				failover_on_error: false,
 				provider_error_cooldown_secs: 0,
 				shutdown_timeout_secs: default_shutdown_timeout_secs(),
@@ -784,6 +797,7 @@ mod tests {
 		assert_eq!(config.provider_queue_timeout_secs, 60);
 		assert_eq!(config.owner_queue_timeout_secs, 30);
 		assert_eq!(config.upstream_timeout_secs, 360);
+		assert_eq!(config.upstream_stream_timeout_secs, 0, "stream silence limit is opt-in");
 		assert!(!config.failover_on_error, "failover is opt-in");
 		assert_eq!(config.provider_error_cooldown_secs, 0, "cooldown is opt-in");
 	}
@@ -1264,6 +1278,7 @@ mod tests {
             provider_queue_timeout_secs = 45
             owner_queue_timeout_secs = 5
             upstream_timeout_secs = 420
+            upstream_stream_timeout_secs = 45
             "#,
 		)
 		.unwrap();
@@ -1271,6 +1286,7 @@ mod tests {
 		assert_eq!(config.server.provider_queue_timeout_secs, 45);
 		assert_eq!(config.server.owner_queue_timeout_secs, 5);
 		assert_eq!(config.server.upstream_timeout_secs, 420);
+		assert_eq!(config.server.upstream_stream_timeout_secs, 45);
 	}
 
 	fn file_server() -> ServerConfig {

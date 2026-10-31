@@ -692,6 +692,14 @@ impl ProxyEngine {
 				// override semantics, beating its own env-based defaults.
 				params.extra_headers = extra_headers.clone();
 
+				// Silence limit for streaming lanes: a hung lane fails over on its
+				// own clock instead of burning the whole upstream deadline.
+				if config.server.upstream_stream_timeout_secs > 0 {
+					params = params.with_stream_timeout(Some(std::time::Duration::from_secs(
+						config.server.upstream_stream_timeout_secs,
+					)));
+				}
+
 				// Reasoning effort: parse client string into octolib enum and pass
 				// through. Unknown values silently fall back to provider default —
 				// we never want a malformed effort hint to fail the whole request.
@@ -2423,6 +2431,12 @@ mod tests {
 		assert!(
 			is_provider_fault(&connect_error),
 			"transport errors without a status are provider-side"
+		);
+
+		let stream_silence = anyhow::anyhow!("Stream timed out after 30s without response data");
+		assert!(
+			is_provider_fault(&stream_silence),
+			"octolib's StreamTimeout carries no status: a silent lane is provider-side"
 		);
 	}
 
