@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.15.0] - 2026-10-31
+
+### 📋 Release Summary
+
+Sequential WebSocket completions are now supported. Tool outputs preserve media.
+
+### 🚨 Breaking Changes
+
+- **tool-output**: preserve media in tool outputs `28a915d9`
+
+### ✨ New Features & Enhancements
+
+- **api**: add sequential WebSocket completions `8e566ba6`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update locked dependencies `876f8bbf`
+- **dependencies**: upgrade octolib to 0.48.0 `4a242777`
+
 ## [0.14.7] - 2026-10-28
 
 ### 📋 Release Summary
