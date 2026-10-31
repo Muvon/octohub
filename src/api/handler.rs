@@ -61,16 +61,31 @@ fn error_response_typed(status: StatusCode, message: &str, error_type: &str) -> 
 /// with 413 instead.
 pub(super) const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-async fn read_body<B>(req: Request<B>) -> Result<Bytes, Box<Response<BoxBody>>>
+const MIB: usize = 1024 * 1024;
+
+/// Room for everything in a media request besides its one inline source:
+/// model, prompt, options, the base64 envelope's JSON keys.
+const MEDIA_ENVELOPE_BYTES: usize = MIB;
+
+/// The body cap for a media create route. A media request is stored with its
+/// inline payloads redacted, so the completion packet bound above does not
+/// apply — but the body MUST fit one source at `max_source_bytes` after base64
+/// (4/3) or that cap could never be reached: with the 16 MiB completion bound,
+/// a 13 MiB image passed `max_source_bytes` and still came back 413.
+fn media_body_limit(max_source_bytes: usize) -> usize {
+	(max_source_bytes.div_ceil(3) * 4 + MEDIA_ENVELOPE_BYTES).next_multiple_of(MIB)
+}
+
+async fn read_body<B>(req: Request<B>, limit: usize) -> Result<Bytes, Box<Response<BoxBody>>>
 where
 	B: hyper::body::Body,
 	B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-	match Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES).collect().await {
+	match Limited::new(req.into_body(), limit).collect().await {
 		Ok(collected) => Ok(collected.to_bytes()),
 		Err(e) if e.is::<LengthLimitError>() => Err(Box::new(error_response(
 			StatusCode::PAYLOAD_TOO_LARGE,
-			&format!("Request body exceeds {} MiB", MAX_REQUEST_BODY_BYTES / (1024 * 1024)),
+			&format!("Request body exceeds {} MiB", limit / MIB),
 		))),
 		Err(e) => Err(Box::new(error_response(
 			StatusCode::BAD_REQUEST,
@@ -185,7 +200,7 @@ pub async fn handle_create_completion(
 	let purpose = model_purpose(&req);
 	let attribution = attribution_headers(&req);
 
-	let body_bytes = match read_body(req).await {
+	let body_bytes = match read_body(req, MAX_REQUEST_BODY_BYTES).await {
 		Ok(bytes) => bytes,
 		Err(response) => return *response,
 	};
@@ -292,7 +307,7 @@ pub async fn handle_create_embedding(
 	};
 	tracing::Span::current().record("api_key_id", api_key.id);
 
-	let body_bytes = match read_body(req).await {
+	let body_bytes = match read_body(req, MAX_REQUEST_BODY_BYTES).await {
 		Ok(bytes) => bytes,
 		Err(response) => return *response,
 	};
@@ -373,7 +388,7 @@ pub async fn handle_create_evaluation(
 	};
 	tracing::Span::current().record("api_key_id", api_key.id);
 
-	let body_bytes = match read_body(req).await {
+	let body_bytes = match read_body(req, MAX_REQUEST_BODY_BYTES).await {
 		Ok(bytes) => bytes,
 		Err(response) => return *response,
 	};
@@ -560,7 +575,7 @@ pub async fn handle_chat_completion(
 	let purpose = model_purpose(&req);
 	let attribution = attribution_headers(&req);
 
-	let body_bytes = match read_body(req).await {
+	let body_bytes = match read_body(req, MAX_REQUEST_BODY_BYTES).await {
 		Ok(bytes) => bytes,
 		Err(response) => return *response,
 	};
@@ -940,7 +955,7 @@ async fn handle_media_create(
 		Err(response) => return *response,
 	};
 
-	let body_bytes = match read_body(req).await {
+	let body_bytes = match read_body(req, media_body_limit(engine.config().media.max_source_bytes)).await {
 		Ok(bytes) => bytes,
 		Err(response) => return *response,
 	};
@@ -1332,15 +1347,40 @@ mod tests {
 	async fn request_body_over_the_cap_is_413_before_any_work() {
 		let body = |len: usize| Request::new(Full::new(Bytes::from(vec![b' '; len])));
 		assert_eq!(
-			read_body(body(MAX_REQUEST_BODY_BYTES)).await.unwrap().len(),
+			read_body(body(MAX_REQUEST_BODY_BYTES), MAX_REQUEST_BODY_BYTES)
+				.await
+				.unwrap()
+				.len(),
 			MAX_REQUEST_BODY_BYTES
 		);
-		let response = read_body(body(MAX_REQUEST_BODY_BYTES + 1)).await.unwrap_err();
+		let response = read_body(body(MAX_REQUEST_BODY_BYTES + 1), MAX_REQUEST_BODY_BYTES)
+			.await
+			.unwrap_err();
 		assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 		assert_eq!(
 			response_json(*response).await,
 			serde_json::json!({"error": {"message": "Request body exceeds 16 MiB", "type": "invalid_request_error"}})
 		);
+	}
+
+	#[tokio::test]
+	async fn a_media_body_fits_one_source_at_the_cap_after_base64() {
+		let max_source = crate::config::MediaConfig::default().max_source_bytes;
+		let limit = media_body_limit(max_source);
+		let encoded = max_source.div_ceil(3) * 4;
+		assert!(
+			limit >= encoded + MEDIA_ENVELOPE_BYTES,
+			"a source at the cap must fit with its envelope"
+		);
+		assert_eq!(limit % MIB, 0, "the 413 message names a whole MiB");
+		assert!(
+			limit > MAX_REQUEST_BODY_BYTES,
+			"the default media cap outgrows the completion bound"
+		);
+		let body = |len: usize| Request::new(Full::new(Bytes::from(vec![b' '; len])));
+		assert_eq!(read_body(body(encoded), limit).await.unwrap().len(), encoded);
+		let response = read_body(body(limit + 1), limit).await.unwrap_err();
+		assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 	}
 
 	#[tokio::test]

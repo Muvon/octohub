@@ -376,7 +376,7 @@ Transport knobs for media requests. All optional.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_source_bytes` | `20971520` (20 MiB) | Cap on a decoded inline upload, checked before anything reaches a provider |
+| `max_source_bytes` | `20971520` (20 MiB) | Cap on a decoded inline upload, checked before anything reaches a provider. Media create routes accept a request body large enough for one source at this cap after base64 (+1 MiB), rounded up to a whole MiB |
 | `max_response_bytes` | `104857600` (100 MiB) | Cap on a provider response body |
 | `polling_interval_secs` | `2` | Delay between job polls |
 | `submit_timeout_secs` | `120` | Deadline for the submit call itself |
