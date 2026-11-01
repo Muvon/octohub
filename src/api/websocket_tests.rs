@@ -1227,7 +1227,8 @@ async fn pending_delivery() -> DeliveryWire {
 		.await;
 		let (mut writer, mut reader) = socket.split();
 		let start = tokio::time::Instant::now();
-		let delivered = super::deliver(Message::Text("d".repeat(4096).into()), &mut writer, &mut reader).await;
+		let delivered = super::deliver(Message::Text("d".repeat(4096).into()), &mut writer, &mut reader).await
+			== super::Flow::Continue;
 		(delivered, start.elapsed())
 	});
 	let request = b"GET /v1/completions HTTP/1.1\r\nHost: loopback\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
