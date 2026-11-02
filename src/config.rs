@@ -1252,7 +1252,7 @@ mod tests {
 		let mut unknown = base();
 		unknown
 			.evaluation_models
-			.insert("jev".to_string(), vec!["openai:jev-latest".to_string()]);
+			.insert("jev".to_string(), vec!["nosuchprovider:jev-latest".to_string()]);
 		assert!(unknown.validate_evaluation().is_err());
 
 		let mut empty = base();
