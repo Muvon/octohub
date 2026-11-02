@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.16.4] - 2026-11-02
+
+### 📋 Release Summary
+
+WebSocket delivery result assertions are now handled correctly.
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib and locked dependencies `5f41e7b2`
+
+### 🐛 Bug Fixes & Stability
+
+- **websocket**: fix delivery result assertion `85200105`
+
 ## [0.16.3] - 2026-10-31
 
 ### 📋 Release Summary
