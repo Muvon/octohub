@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.5] - 2026-11-03
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib to 0.50.0 `f80321a4`
+- **config**: test unknown evaluation provider validation `2d789c70`
+
 ## [0.16.4] - 2026-11-02
 
 ### 📋 Release Summary
