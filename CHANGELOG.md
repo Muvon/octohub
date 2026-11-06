@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.16.6] - 2026-11-06
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.16.5] - 2026-11-03
 
 ### 🔧 Improvements & Optimizations
