@@ -1813,9 +1813,9 @@ dependencies = [
 
 [[package]]
 name = "octolib"
-version = "0.51.0"
+version = "0.51.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9bd838ffe57cbfae8b2c7f221944975d6dc2336e69603e0b8028eb159ac48aa"
+checksum = "933de79425cdc5f7751936664358118126a7514adb3c16ced187784a4f8a86f8"
 dependencies = [
  "anyhow",
  "arc-swap",
