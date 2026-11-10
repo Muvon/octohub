@@ -204,7 +204,7 @@ pub struct SpeechRequest {
 	#[serde(default)]
 	pub instructions: Option<String>,
 	#[serde(default)]
-	pub speed: Option<f32>,
+	pub speed: Option<f64>,
 	#[serde(default)]
 	pub output: Option<AudioOutput>,
 }

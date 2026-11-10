@@ -21,12 +21,12 @@ pub struct CreateCompletionRequest {
 
 	/// Sampling temperature (0.0 to 2.0)
 	#[serde(default = "default_temperature")]
-	pub temperature: f32,
+	pub temperature: f64,
 
 	/// Top-p nucleus sampling (0.0 to 1.0). Proxied straight to the upstream
 	/// provider so client-controlled sampling actually takes effect.
 	#[serde(default = "default_top_p")]
-	pub top_p: f32,
+	pub top_p: f64,
 
 	/// Maximum output tokens (0 = provider default)
 	#[serde(default)]
@@ -54,11 +54,11 @@ pub struct CreateCompletionRequest {
 	pub tools: Option<Vec<ToolDefinition>>,
 }
 
-fn default_temperature() -> f32 {
+fn default_temperature() -> f64 {
 	1.0
 }
 
-fn default_top_p() -> f32 {
+fn default_top_p() -> f64 {
 	1.0
 }
 
@@ -442,9 +442,9 @@ pub struct ChatCompletionRequest {
 	pub model: String,
 	pub messages: Vec<ChatMessage>,
 	#[serde(default = "default_temperature")]
-	pub temperature: f32,
+	pub temperature: f64,
 	#[serde(default = "default_top_p")]
-	pub top_p: f32,
+	pub top_p: f64,
 	#[serde(default)]
 	pub max_tokens: Option<u32>,
 	/// Buffered upstream responses are re-framed as SSE deltas.
