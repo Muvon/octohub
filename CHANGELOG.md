@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.16.9] - 2026-11-10
+
+### 📋 Release Summary
+
+Numeric request fields now preserve their precision.
+
+### 🚨 Breaking Changes
+
+- **api**: preserve precision in numeric request fields `7e3afcea`
+
+### 🔄 Other Changes
+
+2 maintenance, dependency, and tooling updates not listed individually.
+
 ## [0.16.8] - 2026-11-07
 
 ### 🔄 Other Changes
