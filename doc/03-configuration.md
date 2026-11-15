@@ -73,10 +73,34 @@ Defined in `src/config.rs:83`. All keys optional except as noted.
 | `upstream_stream_timeout_secs` | `0` | Maximum silence on a streaming provider call (time to headers, then between chunks); any chunk resets it. Fails a hung lane over fast while `upstream_timeout_secs` stays the total bound. `0` = off. Non-streaming providers ignore it. |
 | `failover_on_error` | `false` | Re-route provider-side failures (timeout, connect, 401/403 key or billing rejection, 404, 429, 5xx) to the next candidate provider of the model alias. A 400 never fails over. |
 | `provider_error_cooldown_secs` | `0` | After 3 consecutive provider-side failures, deprioritize the provider for this many seconds (used only when no healthy candidate admits). `0` = off. |
+| `expose_upstream_errors` | `true` | Send the upstream provider's own error text to the client. `false`: an error that names the provider or quotes its answer is told in octohub's own sentence, for every endpoint. See [Hiding upstream errors](#hiding-upstream-errors). |
 | `shutdown_timeout_secs` | `900` | Drain bound on SIGTERM/SIGINT: in-flight requests get this long to finish, then the process exits non-zero. Must be > 0 and ≥ the longest admitted request (`owner_queue + attempts × (provider_queue + upstream)`); the container stop timeout must exceed it. See [08 — Deployment](08-deployment.md#shutdown-and-restarts). |
 
 The legacy alias `db_path` is also accepted and treated as `db_url`
 (`src/config.rs:98`).
+
+### Hiding upstream errors
+
+By default a failed call returns the provider's own words, for example
+`Provider 'anthropic' chat_completion failed: Anthropic API error 503: {...}`.
+That is what an operator needs to debug, and it also tells every client which
+provider serves a model and shows them the provider's request and account ids.
+
+With `expose_upstream_errors = false`:
+
+- `error.message` is octohub's own sentence, such as `the model call failed —
+  retry shortly` or `the request exceeds the model's context length`.
+- The HTTP status, `error.type` and `Retry-After` are unchanged, so client retry
+  logic behaves the same.
+- The full error is still written to the log, on the line that carries the
+  `req_id` returned in the response's `X-Request-Id` header.
+- Messages octohub writes about the request itself are unchanged: an unknown
+  model, a model the key may not use, an exhausted rate window or owner budget.
+- A failure of the caller's own provider key (BYOK) keeps the provider's text.
+- A failed media job's `error` is reduced to its `category` and one sentence;
+  the stored record and the admin API keep the original.
+
+The `provider` field of a successful response is not affected.
 
 ### WebSocket completion lifecycle
 
@@ -276,6 +300,7 @@ loaded (`src/config.rs:190`).
 | `OCTOHUB_UPSTREAM_STREAM_TIMEOUT_SECS` | `[server].upstream_stream_timeout_secs` | Overrides the streaming silence limit. |
 | `OCTOHUB_FAILOVER_ON_ERROR` | `[server].failover_on_error` | `true`/`1` enables provider failover. |
 | `OCTOHUB_PROVIDER_ERROR_COOLDOWN_SECS` | `[server].provider_error_cooldown_secs` | Overrides the provider cooldown duration. |
+| `OCTOHUB_EXPOSE_UPSTREAM_ERRORS` | `[server].expose_upstream_errors` | `true`/`1` shows upstream error text; any other value hides it. |
 | `OCTOHUB_SHUTDOWN_TIMEOUT_SECS` | `[server].shutdown_timeout_secs` | Overrides the drain bound. Not whole seconds, or `0`, is a startup error. |
 | `OCTOHUB_HOST` | `[server].host` | Overrides the file too. Set but blank is a startup error. |
 | `OCTOHUB_PORT` | `[server].port` | Overrides the file too. Not a port number (0-65535) is a startup error. |

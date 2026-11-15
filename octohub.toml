@@ -17,6 +17,8 @@ db_url = "sqlite://octohub.db"  # SQLite (default), MySQL, or PostgreSQL DSN
 #                                   # errors (timeout, connect, any status but 400); 400 never fails over
 # provider_error_cooldown_secs = 0  # After 3 consecutive provider-side failures, deprioritize
 #                                   # the provider for this many seconds (0 = off)
+# expose_upstream_errors = true     # false: an error that names a provider or quotes its answer is
+#                                   # told in octohub's own sentence; the full error is logged only
 # shutdown_timeout_secs = 900      # SIGTERM drain bound; must cover the longest request (owner queue +
 #                                   # attempts × (provider queue + upstream)); stop timeout must exceed it
 

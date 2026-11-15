@@ -107,8 +107,22 @@ fn engine_error_type(error: &anyhow::Error) -> &'static str {
 /// `error_response` plus a `Retry-After` header when the failure is a
 /// provider rate-window rejection, so well-behaved clients back off for
 /// exactly as long as the window needs, and a specific `error.type` for
-/// conditions a caller has to branch on rather than merely display.
-fn engine_error_response(error: &anyhow::Error, status: StatusCode, message: &str) -> Response<BoxBody> {
+/// conditions a caller has to branch on rather than merely display. With
+/// `expose_upstream` off (`server.expose_upstream_errors`) the client reads
+/// [`hidden_engine_message`] in place of `message`.
+fn engine_error_response(
+	error: &anyhow::Error,
+	status: StatusCode,
+	message: &str,
+	expose_upstream: bool,
+) -> Response<BoxBody> {
+	let hidden;
+	let message = if expose_upstream {
+		message
+	} else {
+		hidden = hidden_engine_message(error, status, message);
+		hidden.as_str()
+	};
 	let mut response = error_response_typed(status, message, engine_error_type(error));
 	let retry_after_secs = match error.downcast_ref::<RateLimitedError>() {
 		Some(rate) => Some(rate.retry_after.as_secs().max(1)),
@@ -273,7 +287,7 @@ pub(super) async fn completion_from_bytes(
 				per_key,
 			);
 
-			engine_error_response(&e, status, &msg)
+			engine_error_response(&e, status, &msg, engine.config().server.expose_upstream_errors)
 		}
 	}
 }
@@ -359,7 +373,7 @@ pub async fn handle_create_embedding(
 				per_key,
 			);
 
-			engine_error_response(&e, status, &msg)
+			engine_error_response(&e, status, &msg, engine.config().server.expose_upstream_errors)
 		}
 	}
 }
@@ -442,7 +456,7 @@ pub async fn handle_create_evaluation(
 				per_key,
 			);
 
-			engine_error_response(&e, status, &msg)
+			engine_error_response(&e, status, &msg, engine.config().server.expose_upstream_errors)
 		}
 	}
 }
@@ -516,13 +530,8 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
 		return (StatusCode::TOO_MANY_REQUESTS, cleaned);
 	}
 
-	let is_client_error = top.contains("not found in config")
-		|| top.contains("Failed to resolve model")
-		|| top.contains("Failed to resolve embedding model")
-		|| top.contains("Failed to resolve evaluation model")
-		|| top.contains("Failed to resolve media model")
-		|| top.contains("not available")
-		|| top.contains("Invalid request");
+	let is_client_error =
+		REQUEST_ERROR_MARKERS.iter().any(|marker| top.contains(marker)) || top.contains("not available");
 
 	if is_client_error {
 		return (StatusCode::BAD_REQUEST, top);
@@ -547,6 +556,88 @@ fn classify_engine_error(error: &anyhow::Error) -> (StatusCode, String) {
 	// the outer wrap. Without this the client gets a useless top message and has
 	// to read server logs to diagnose anything.
 	(StatusCode::INTERNAL_SERVER_ERROR, full)
+}
+
+/// Top-level messages octohub writes about the request as sent: an unknown
+/// model, an alias nothing resolves, a malformed body. They name what the
+/// client asked for, never the provider behind it.
+const REQUEST_ERROR_MARKERS: [&str; 6] = [
+	"not found in config",
+	"Failed to resolve model",
+	"Failed to resolve embedding model",
+	"Failed to resolve evaluation model",
+	"Failed to resolve media model",
+	"Invalid request",
+];
+
+/// Wordings by which providers say the conversation no longer fits the model.
+const CONTEXT_LENGTH_MARKERS: [&str; 6] = [
+	"context length",
+	"context_length",
+	"maximum context",
+	"context window",
+	"prompt is too long",
+	"too many tokens",
+];
+
+/// Wordings by which providers say they refused the content itself.
+const CONTENT_POLICY_MARKERS: [&str; 4] = ["content filter", "content_filter", "content policy", "content_policy"];
+
+/// What a client reads when `server.expose_upstream_errors` is off.
+///
+/// A refusal octohub wrote about the request itself (the model, the key, the
+/// owner's budget) names no provider and is returned as it is; so is a failure
+/// of the caller's own provider key, whose text is theirs to read. Everything
+/// else is replaced: anything this function does not recognise is hidden, so a
+/// new error path cannot leak a provider by being forgotten here.
+fn hidden_engine_message(error: &anyhow::Error, status: StatusCode, detail: &str) -> String {
+	let top = error.to_string();
+	let own_refusal = error.downcast_ref::<crate::proxy::engine::ByokFailure>().is_some()
+		|| error.downcast_ref::<RateLimitedError>().is_some()
+		|| error.downcast_ref::<SchemaNotEnforcedError>().is_some()
+		|| top.contains(MODEL_FORBIDDEN_MARKER)
+		|| top.contains(OWNER_LIMIT_MARKER)
+		|| REQUEST_ERROR_MARKERS.iter().any(|marker| top.contains(marker));
+	if own_refusal {
+		return detail.to_string();
+	}
+	if let Some(modality) = error.downcast_ref::<ModalityNotSupportedError>() {
+		return format!("this model does not support {} attachments", modality.modality);
+	}
+	if let Some(timeout) = error.downcast_ref::<ProxyTimeoutError>() {
+		return match timeout {
+			ProxyTimeoutError::ProviderQueue { timeout, .. } => {
+				format!("timed out after {}s waiting for model capacity", timeout.as_secs())
+			}
+			ProxyTimeoutError::Upstream { timeout, .. } => {
+				format!("the model exceeded the {}s operation deadline", timeout.as_secs())
+			}
+		};
+	}
+	hidden_upstream_message(status, detail).to_string()
+}
+
+/// octohub's own sentence for a failure whose detail is the provider's. Two
+/// refusals call for a different next step than "try again" — the conversation
+/// no longer fits, the provider refused the content — so those are recognised
+/// from the provider's text; every other failure is told apart by its status.
+fn hidden_upstream_message(status: StatusCode, detail: &str) -> &'static str {
+	if status.is_client_error() {
+		let detail = detail.to_ascii_lowercase();
+		if CONTEXT_LENGTH_MARKERS.iter().any(|marker| detail.contains(marker)) {
+			return "the request exceeds the model's context length";
+		}
+		if CONTENT_POLICY_MARKERS.iter().any(|marker| detail.contains(marker)) {
+			return "the model refused this request under its content policy";
+		}
+	}
+	match status.as_u16() {
+		429 => "the model is rate limited — retry shortly",
+		// The provider turned our own account away, or no longer hosts the model.
+		401 | 403 | 404 => "the model is unavailable right now",
+		400..=499 => "the model rejected this request",
+		_ => "the model call failed — retry shortly",
+	}
 }
 
 /// Handle POST /v1/chat/completions (classic OpenAI-compatible)
@@ -656,7 +747,7 @@ pub async fn handle_chat_completion(
 				per_key,
 			);
 
-			engine_error_response(&e, status, &msg)
+			engine_error_response(&e, status, &msg, engine.config().server.expose_upstream_errors)
 		}
 	}
 }
@@ -861,13 +952,61 @@ fn classify_media_error(error: &anyhow::Error) -> (StatusCode, String, &'static 
 	}
 }
 
-fn media_error_response(error: &anyhow::Error) -> Response<BoxBody> {
+/// What a client reads for a media failure when `server.expose_upstream_errors`
+/// is off. octolib's adapters word even their own request checks around the
+/// provider ("Runway requires an output ratio"), so only the parameter name of
+/// an unsupported parameter and a source-size refusal survive as written.
+fn hidden_media_message(error: &anyhow::Error, status: StatusCode, detail: &str) -> String {
+	use octolib::media::MediaError;
+
+	const UNSUPPORTED_TASK: &str = "this media model does not support the requested task";
+
+	if error
+		.downcast_ref::<crate::proxy::media::MediaTaskUnsupported>()
+		.is_some()
+	{
+		return UNSUPPORTED_TASK.to_string();
+	}
+	let Some(media) = error.downcast_ref::<MediaError>() else {
+		return hidden_engine_message(error, status, detail);
+	};
+	match media {
+		MediaError::SourceTooLarge { .. } => detail.to_string(),
+		MediaError::UnsupportedParameter { parameter, .. } => format!("unsupported parameter '{parameter}'"),
+		MediaError::InvalidRequest(_) => "the media request is invalid for this model".to_string(),
+		MediaError::UnsupportedProvider(_) | MediaError::UnsupportedTask { .. } => UNSUPPORTED_TASK.to_string(),
+		MediaError::RateLimit { .. } => "the media model is rate limited — retry shortly".to_string(),
+		MediaError::RemoteFailure(failure) => hidden_generation_failure(&failure.category).to_string(),
+		_ if status.is_client_error() => "the media model rejected this request".to_string(),
+		_ => "the media call failed — retry shortly".to_string(),
+	}
+}
+
+/// octohub's own sentence for a media job the provider failed, by category.
+fn hidden_generation_failure(category: &octolib::media::FailureCategory) -> &'static str {
+	use octolib::media::FailureCategory;
+	match category {
+		FailureCategory::ContentPolicy => "the media model refused this request under its content policy",
+		FailureCategory::InvalidInput => "the media model rejected this input",
+		FailureCategory::RateLimit => "the media model is rate limited — retry shortly",
+		FailureCategory::Cancelled => "the media job was cancelled",
+		FailureCategory::Expired => "the media job expired before it finished",
+		_ => "media generation failed",
+	}
+}
+
+fn media_error_response(error: &anyhow::Error, expose_upstream: bool) -> Response<BoxBody> {
 	let (status, message, error_type) = classify_media_error(error);
 	if status.is_server_error() {
 		tracing::error!(error = ?error, "media request failed");
 	} else {
 		tracing::warn!(reason = %message, "media request rejected");
 	}
+	let message = if expose_upstream {
+		message
+	} else {
+		hidden_media_message(error, status, &message)
+	};
 	let mut response = error_response_typed(status, &message, error_type);
 	if let Some(octolib::media::MediaError::RateLimit {
 		retry_after_secs: Some(secs),
@@ -932,15 +1071,36 @@ fn refused_for_content(category: &octolib::media::FailureCategory) -> bool {
 	matches!(category, FailureCategory::ContentPolicy | FailureCategory::InvalidInput)
 }
 
+/// A media record as the client reads it. A failed job carries the provider's
+/// failure (its message, code, request id, metadata); with `expose_upstream`
+/// off that is reduced to the category and octohub's own sentence for it. The
+/// stored record keeps the original.
+fn media_outcome_body(response: &crate::api::media_types::MediaResponse, expose_upstream: bool) -> serde_json::Value {
+	let mut body = serde_json::to_value(response).unwrap_or_default();
+	if expose_upstream {
+		return body;
+	}
+	if let Some(failure) = response
+		.error
+		.clone()
+		.and_then(|error| serde_json::from_value::<octolib::media::GenerationFailure>(error).ok())
+	{
+		body["error"] = serde_json::json!({
+			"category": failure.category,
+			"message": hidden_generation_failure(&failure.category),
+		});
+	}
+	body
+}
+
 /// Render a media outcome: 200 when terminal, 202 while the job is still live.
-fn media_outcome_response(outcome: crate::proxy::media::MediaOutcome) -> Response<BoxBody> {
+fn media_outcome_response(outcome: crate::proxy::media::MediaOutcome, expose_upstream: bool) -> Response<BoxBody> {
 	let status = if outcome.accepted {
 		StatusCode::ACCEPTED
 	} else {
 		StatusCode::OK
 	};
-	let body = serde_json::to_value(&outcome.response).unwrap_or_default();
-	json_response(status, body)
+	json_response(status, media_outcome_body(&outcome.response, expose_upstream))
 }
 
 /// Shared body for the four create endpoints: parse, dispatch, record metrics.
@@ -983,7 +1143,7 @@ async fn handle_media_create(
 				api_key_id: Some(api_key.id),
 				per_key,
 			});
-			media_outcome_response(outcome)
+			media_outcome_response(outcome, engine.config().server.expose_upstream_errors)
 		}
 		Err(e) => {
 			crate::metrics::record_media(crate::metrics::MediaCall {
@@ -998,7 +1158,7 @@ async fn handle_media_create(
 				api_key_id: Some(api_key.id),
 				per_key,
 			});
-			media_error_response(&e)
+			media_error_response(&e, engine.config().server.expose_upstream_errors)
 		}
 	}
 }
@@ -1092,9 +1252,9 @@ pub async fn handle_media_get(
 					per_key: engine.config().metrics.per_key,
 				});
 			}
-			media_outcome_response(outcome)
+			media_outcome_response(outcome, engine.config().server.expose_upstream_errors)
 		}
-		Err(e) => media_error_response(&e),
+		Err(e) => media_error_response(&e, engine.config().server.expose_upstream_errors),
 	}
 }
 
@@ -1113,9 +1273,9 @@ pub async fn handle_media_cancel(
 		Ok(None) => error_response_typed(StatusCode::NOT_FOUND, "Media record not found", "not_found"),
 		Ok(Some(outcome)) => json_response(
 			StatusCode::OK,
-			serde_json::to_value(&outcome.response).unwrap_or_default(),
+			media_outcome_body(&outcome.response, engine.config().server.expose_upstream_errors),
 		),
-		Err(e) => media_error_response(&e),
+		Err(e) => media_error_response(&e, engine.config().server.expose_upstream_errors),
 	}
 }
 
@@ -1550,7 +1710,7 @@ mod tests {
 		assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 		assert!(msg.contains("kimi-k2"));
 
-		let response = engine_error_response(&error, status, &msg);
+		let response = engine_error_response(&error, status, &msg, true);
 		assert_eq!(response.headers().get(hyper::header::RETRY_AFTER).unwrap(), "37");
 	}
 
@@ -1611,7 +1771,7 @@ mod tests {
 			retry_after: std::time::Duration::from_millis(200),
 		});
 		let (status, msg) = classify_engine_error(&error);
-		let response = engine_error_response(&error, status, &msg);
+		let response = engine_error_response(&error, status, &msg, true);
 		assert_eq!(response.headers().get(hyper::header::RETRY_AFTER).unwrap(), "1");
 	}
 
@@ -1619,7 +1779,7 @@ mod tests {
 	fn non_rate_limit_errors_get_no_retry_after() {
 		let error = anyhow::anyhow!("database connection lost");
 		let (status, msg) = classify_engine_error(&error);
-		let response = engine_error_response(&error, status, &msg);
+		let response = engine_error_response(&error, status, &msg, true);
 		assert!(response.headers().get(hyper::header::RETRY_AFTER).is_none());
 	}
 
@@ -1659,6 +1819,216 @@ mod tests {
 		let error = anyhow::anyhow!("database connection lost");
 		let (status, _) = classify_engine_error(&error);
 		assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+	}
+
+	/// A provider failure as it leaves the engine: octolib's message under the
+	/// engine's "which provider" context.
+	fn upstream_failure(provider_error: &str) -> anyhow::Error {
+		Err::<(), _>(anyhow::anyhow!("{provider_error}"))
+			.context("Provider 'anthropic' chat_completion failed")
+			.unwrap_err()
+	}
+
+	#[test]
+	fn hidden_upstream_failure_names_no_provider() {
+		let error = upstream_failure(
+			r#"Anthropic API error 503: {"type":"error","error":{"type":"overloaded_error"},"request_id":"req_011C"}"#,
+		);
+		let (status, detail) = classify_engine_error(&error);
+		assert!(detail.contains("req_011C"), "the log line keeps the provider's answer");
+
+		assert_eq!(
+			status,
+			StatusCode::INTERNAL_SERVER_ERROR,
+			"the status still drives the client's retry"
+		);
+		assert_eq!(
+			hidden_engine_message(&error, status, &detail),
+			"the model call failed — retry shortly"
+		);
+	}
+
+	#[test]
+	fn hidden_upstream_failure_still_says_what_the_client_can_act_on() {
+		for (provider_error, expected) in [
+			(
+				r#"ollama API error 400 Bad Request: {"error":"The prompt is too long: 380813"}"#,
+				"the request exceeds the model's context length",
+			),
+			(
+				r#"openai API error 400: {"error":{"code":"content_filter","request_id":"req_1"}}"#,
+				"the model refused this request under its content policy",
+			),
+			(
+				"anthropic API error 429 Too Many Requests",
+				"the model is rate limited — retry shortly",
+			),
+			(
+				"ollama API error 403 Forbidden: your subscription payment is past due",
+				"the model is unavailable right now",
+			),
+			(
+				"zai API error 422: unknown field 'foo'",
+				"the model rejected this request",
+			),
+		] {
+			let error = upstream_failure(provider_error);
+			let (status, detail) = classify_engine_error(&error);
+			assert_eq!(
+				hidden_engine_message(&error, status, &detail),
+				expected,
+				"{provider_error}"
+			);
+		}
+	}
+
+	#[test]
+	fn hidden_mode_keeps_what_octohub_says_about_the_request_itself() {
+		let unknown_model = Err::<(), _>(anyhow::anyhow!(
+			"Model 'nope' not found in config. Available: glm, qwen"
+		))
+		.context("Failed to resolve model 'nope'")
+		.unwrap_err();
+		for error in [
+			anyhow::anyhow!(RateLimitedError {
+				model: "kimi-k2".to_string(),
+				retry_after: std::time::Duration::from_secs(37),
+			}),
+			anyhow::anyhow!(SchemaNotEnforcedError {
+				model: "glm-5.3-flash".to_string(),
+			}),
+			anyhow::anyhow!(
+				"{}: model 'opus' is not permitted for this API key",
+				MODEL_FORBIDDEN_MARKER
+			),
+			anyhow::anyhow!(
+				"{}: owner concurrency limit (10) exhausted — retry shortly",
+				OWNER_LIMIT_MARKER
+			),
+			unknown_model,
+		] {
+			let (status, detail) = classify_engine_error(&error);
+			assert_eq!(hidden_engine_message(&error, status, &detail), detail);
+		}
+	}
+
+	#[test]
+	fn hidden_mode_keeps_the_failure_of_the_callers_own_provider_key() {
+		let upstream = anyhow::anyhow!("Z.ai API error 401: invalid api key");
+		let error: anyhow::Error = crate::proxy::engine::ByokFailure::from_upstream(&upstream, "zai", &[])
+			.unwrap()
+			.into();
+		let (status, detail) = classify_engine_error(&error);
+
+		assert!(detail.contains("Z.ai API error 401: invalid api key"));
+		assert_eq!(hidden_engine_message(&error, status, &detail), detail);
+	}
+
+	#[test]
+	fn hidden_modality_and_timeout_messages_name_no_lane() {
+		let modality = anyhow::anyhow!(ModalityNotSupportedError {
+			provider: "cloudflare".to_string(),
+			model: "@cf/zai-org/glm-5.3".to_string(),
+			modality: "image".to_string(),
+		});
+		let queued = anyhow::Error::new(ProxyTimeoutError::ProviderQueue {
+			provider: "ollama".to_string(),
+			timeout: std::time::Duration::from_secs(60),
+		});
+		let slow = Err::<(), _>(anyhow::Error::new(ProxyTimeoutError::Upstream {
+			provider: "anthropic".to_string(),
+			timeout: std::time::Duration::from_secs(360),
+		}))
+		.context("Provider chat_completion failed")
+		.unwrap_err();
+
+		for (error, expected) in [
+			(modality, "this model does not support image attachments"),
+			(queued, "timed out after 60s waiting for model capacity"),
+			(slow, "the model exceeded the 360s operation deadline"),
+		] {
+			let (status, detail) = classify_engine_error(&error);
+			assert_eq!(hidden_engine_message(&error, status, &detail), expected);
+		}
+	}
+
+	#[tokio::test]
+	async fn error_body_follows_expose_upstream_errors() {
+		let error = upstream_failure("openai API error 503 Service Unavailable");
+		let (status, detail) = classify_engine_error(&error);
+
+		let shown = response_json(engine_error_response(&error, status, &detail, true)).await;
+		assert_eq!(shown["error"]["message"], detail);
+
+		let hidden = response_json(engine_error_response(&error, status, &detail, false)).await;
+		assert_eq!(hidden["error"]["message"], "the model call failed — retry shortly");
+		assert_eq!(hidden["error"]["type"], shown["error"]["type"]);
+	}
+
+	fn refused_generation() -> octolib::media::GenerationFailure {
+		octolib::media::GenerationFailure {
+			category: octolib::media::FailureCategory::ContentPolicy,
+			message: "fal: the prompt was flagged".to_string(),
+			provider_code: Some("content_policy_violation".to_string()),
+			http_status: Some(422),
+			request_id: Some("req_9".to_string()),
+			provider_metadata: serde_json::Value::Null,
+		}
+	}
+
+	#[test]
+	fn hidden_media_failure_names_no_provider() {
+		use octolib::media::MediaError;
+
+		let refused = anyhow::anyhow!(MediaError::RemoteFailure(refused_generation()));
+		let (status, detail, _) = classify_media_error(&refused);
+		assert_eq!(status, StatusCode::BAD_REQUEST);
+		assert_eq!(
+			hidden_media_message(&refused, status, &detail),
+			"the media model refused this request under its content policy"
+		);
+
+		// The parameter is the client's own word; the adapter's reason names the provider.
+		let parameter = anyhow::anyhow!(MediaError::UnsupportedParameter {
+			provider: "runway".to_string(),
+			parameter: "mask".to_string(),
+			reason: "Runway image generation has no documented mask input".to_string(),
+		});
+		let (status, detail, _) = classify_media_error(&parameter);
+		assert_eq!(
+			hidden_media_message(&parameter, status, &detail),
+			"unsupported parameter 'mask'"
+		);
+	}
+
+	#[test]
+	fn hidden_failed_media_job_keeps_only_its_category() {
+		let response = crate::api::media_types::MediaResponse {
+			id: "med_1".to_string(),
+			object: "media",
+			task: octolib::media::MediaTask::TextToImage,
+			status: octolib::media::OperationStatus::Failed,
+			model: "flux".to_string(),
+			provider: "fal".to_string(),
+			progress: None,
+			artifacts: Vec::new(),
+			result: None,
+			usage: None,
+			warnings: Vec::new(),
+			safety: octolib::media::SafetyReport::default(),
+			error: Some(serde_json::to_value(refused_generation()).unwrap()),
+			created_at: 1_700_000_000,
+			completed_at: Some(1_700_000_005),
+		};
+
+		assert_eq!(media_outcome_body(&response, true)["error"]["request_id"], "req_9");
+		assert_eq!(
+			media_outcome_body(&response, false)["error"],
+			serde_json::json!({
+				"category": "content_policy",
+				"message": "the media model refused this request under its content policy",
+			})
+		);
 	}
 
 	#[test]

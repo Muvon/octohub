@@ -1998,7 +1998,7 @@ pub(crate) struct ByokFailure {
 }
 
 impl ByokFailure {
-	fn from_upstream(
+	pub(crate) fn from_upstream(
 		error: &anyhow::Error,
 		provider: &str,
 		credentials: &[crate::auth::OwnerCredential],

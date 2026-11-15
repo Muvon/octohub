@@ -231,6 +231,14 @@ pub struct ServerConfig {
 	/// candidate can admit the request. 0 = disabled.
 	#[serde(default)]
 	pub provider_error_cooldown_secs: u64,
+	/// Send the upstream provider's own error text to the client. On by
+	/// default: whoever runs octohub debugs from the response. Off, a failure
+	/// that names the provider or quotes its answer is told in octohub's own
+	/// sentence instead; the HTTP status stays, and the full error is still
+	/// logged under the response's `X-Request-Id`. A failure of the caller's
+	/// own provider key always keeps the provider's text.
+	#[serde(default = "default_expose_upstream_errors")]
+	pub expose_upstream_errors: bool,
 	/// How long SIGTERM/SIGINT waits for in-flight requests before exiting
 	/// non-zero. Must cover the longest request octohub admits: owner queue +
 	/// provider queue + one `upstream_timeout_secs` window per failover
@@ -367,6 +375,10 @@ fn default_upstream_timeout_secs() -> u64 {
 	6 * 60
 }
 
+fn default_expose_upstream_errors() -> bool {
+	true
+}
+
 /// With the default timeouts it covers the owner queue (30 s) plus two full
 /// attempts, each a provider queue and an upstream window (2 × (60 + 360) s).
 fn default_shutdown_timeout_secs() -> u64 {
@@ -387,6 +399,7 @@ impl Default for ServerConfig {
 			upstream_stream_timeout_secs: 0,
 			failover_on_error: false,
 			provider_error_cooldown_secs: 0,
+			expose_upstream_errors: default_expose_upstream_errors(),
 			shutdown_timeout_secs: default_shutdown_timeout_secs(),
 		}
 	}
@@ -544,6 +557,9 @@ impl Config {
 				config.server.provider_error_cooldown_secs = seconds;
 			}
 		}
+		if let Ok(val) = env::var("OCTOHUB_EXPOSE_UPSTREAM_ERRORS") {
+			config.server.expose_upstream_errors = val == "true" || val == "1";
+		}
 	}
 
 	/// Load from environment variables only (fallback)
@@ -561,6 +577,7 @@ impl Config {
 				upstream_stream_timeout_secs: 0,
 				failover_on_error: false,
 				provider_error_cooldown_secs: 0,
+				expose_upstream_errors: default_expose_upstream_errors(),
 				shutdown_timeout_secs: default_shutdown_timeout_secs(),
 			},
 			models: HashMap::new(),
@@ -800,6 +817,10 @@ mod tests {
 		assert_eq!(config.upstream_stream_timeout_secs, 0, "stream silence limit is opt-in");
 		assert!(!config.failover_on_error, "failover is opt-in");
 		assert_eq!(config.provider_error_cooldown_secs, 0, "cooldown is opt-in");
+		assert!(
+			config.expose_upstream_errors,
+			"upstream error text is shown unless turned off"
+		);
 	}
 
 	#[test]
@@ -810,12 +831,14 @@ mod tests {
             api_key = ""
             failover_on_error = true
             provider_error_cooldown_secs = 120
+            expose_upstream_errors = false
             "#,
 		)
 		.unwrap();
 
 		assert!(config.server.failover_on_error);
 		assert_eq!(config.server.provider_error_cooldown_secs, 120);
+		assert!(!config.server.expose_upstream_errors);
 	}
 
 	#[test]
