@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.16.10] - 2026-11-15
+
+### 📋 Release Summary
+
+Upstream error details are now gated by configuration.
+
+### 🐛 Bug Fixes & Stability
+
+- **errors**: gate upstream error details by configuration `ecf52b5e`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.16.9] - 2026-11-10
 
 ### 📋 Release Summary
