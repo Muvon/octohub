@@ -19,15 +19,6 @@ pub struct CreateCompletionRequest {
 	#[serde(default)]
 	pub previous_completion_id: Option<String>,
 
-	/// Sampling temperature (0.0 to 2.0)
-	#[serde(default = "default_temperature")]
-	pub temperature: f64,
-
-	/// Top-p nucleus sampling (0.0 to 1.0). Proxied straight to the upstream
-	/// provider so client-controlled sampling actually takes effect.
-	#[serde(default = "default_top_p")]
-	pub top_p: f64,
-
 	/// Maximum output tokens (0 = provider default)
 	#[serde(default)]
 	pub max_output_tokens: u32,
@@ -52,14 +43,6 @@ pub struct CreateCompletionRequest {
 	/// Tool definitions for function calling
 	#[serde(default)]
 	pub tools: Option<Vec<ToolDefinition>>,
-}
-
-fn default_temperature() -> f64 {
-	1.0
-}
-
-fn default_top_p() -> f64 {
-	1.0
 }
 
 /// Responses-API `text` configuration object — only `format` is meaningful
@@ -441,10 +424,6 @@ pub struct CreateEvaluationResponse {
 pub struct ChatCompletionRequest {
 	pub model: String,
 	pub messages: Vec<ChatMessage>,
-	#[serde(default = "default_temperature")]
-	pub temperature: f64,
-	#[serde(default = "default_top_p")]
-	pub top_p: f64,
 	#[serde(default)]
 	pub max_tokens: Option<u32>,
 	/// Buffered upstream responses are re-framed as SSE deltas.
@@ -671,8 +650,6 @@ impl From<ChatCompletionRequest> for CreateCompletionRequest {
 			input: Input::Items(items),
 			instructions,
 			previous_completion_id: None,
-			temperature: chat.temperature,
-			top_p: chat.top_p,
 			max_output_tokens: chat.max_tokens.unwrap_or(0),
 			cache_prewarm: false,
 			reasoning_effort: None,
@@ -868,7 +845,32 @@ mod tests {
 		assert_eq!(req.model, "openai:gpt-4o");
 		assert!(matches!(req.input, Input::Text(ref s) if s == "Hello, world!"));
 		assert!(req.previous_completion_id.is_none());
-		assert_eq!(req.temperature, 1.0);
+	}
+
+	#[test]
+	fn deprecated_sampling_fields_are_accepted_and_not_forwarded() {
+		let req: CreateCompletionRequest = serde_json::from_str(
+			r#"{
+                "model": "openai:gpt-4o",
+                "input": "Hello",
+                "temperature": 0.2,
+                "top_p": 0.3,
+                "top_k": 40,
+                "max_output_tokens": 64
+            }"#,
+		)
+		.unwrap();
+
+		let params = octolib::llm::ChatCompletionParams::new(
+			&[octolib::llm::Message::user("Hello")],
+			&req.model,
+			req.max_output_tokens,
+		);
+		assert_eq!(params.max_tokens, 64);
+		let params_debug = format!("{params:?}");
+		assert!(!params_debug.contains("temperature"));
+		assert!(!params_debug.contains("top_p"));
+		assert!(!params_debug.contains("top_k"));
 	}
 
 	#[test]
@@ -893,8 +895,7 @@ mod tests {
             "input": [
                 {"type": "message", "role": "user", "content": "What is Rust?"}
             ],
-            "instructions": "You are helpful",
-            "temperature": 0.7
+            "instructions": "You are helpful"
         }"#;
 		let req: CreateCompletionRequest = serde_json::from_str(json).unwrap();
 		assert_eq!(
@@ -902,7 +903,6 @@ mod tests {
 			Some("You are helpful")
 		);
 		assert!(!req.instructions.as_ref().unwrap().is_cached());
-		assert_eq!(req.temperature, 0.7);
 		if let Input::Items(items) = &req.input {
 			assert_eq!(items.len(), 1);
 			match &items[0] {

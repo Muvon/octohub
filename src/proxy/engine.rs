@@ -759,17 +759,7 @@ impl ProxyEngine {
 						})
 						.collect::<Vec<_>>()
 				});
-				// top_k is not part of the Responses-API wire shape (octolib client
-				// never sends it), so we leave it at a neutral default; upstream
-				// providers that don't honor it ignore it harmlessly.
-				let mut params = ChatCompletionParams::new(
-					&messages,
-					&resolved_model,
-					req.temperature,
-					req.top_p,
-					50,
-					req.max_output_tokens,
-				);
+				let mut params = ChatCompletionParams::new(&messages, &resolved_model, req.max_output_tokens);
 
 				if let Some(credential) = credential {
 					params = params.with_api_key(credential.key.clone());
@@ -2788,8 +2778,8 @@ mod byok_tests {
 		let failure = ByokFailure::from_upstream(&anyhow!("connection closed"), "zai", &credentials).unwrap();
 		assert_eq!(failure.status, hyper::StatusCode::BAD_GATEWAY);
 		assert!(failure.retryable());
-		let params = ChatCompletionParams::new(&[Message::user("hello")], "glm-5", 1.0, 1.0, 50, 10)
-			.with_api_key(credentials[0].key.clone());
+		let params =
+			ChatCompletionParams::new(&[Message::user("hello")], "glm-5", 10).with_api_key(credentials[0].key.clone());
 		assert!(!format!("{params:?}").contains("private-zai-key"));
 		let mut exchange = serde_json::json!({"request": {"private-zai-key": "Bearer private-zai-key"}, "response": ["private-zai-key"]});
 		redact_credential_json(&mut exchange, &credentials);

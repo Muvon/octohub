@@ -73,8 +73,6 @@ OpenAI Responses API-compatible. Request body deserialized into
   "input": "Say hi",           // required — string OR array of input items
   "instructions": "Be brief.", // optional — system prompt; string or array of parts
   "previous_completion_id": "...",  // optional — for multi-turn chain replay
-  "temperature": 1.0,          // optional, default 1.0
-  "top_p": 1.0,                // optional, default 1.0 — proxied through
   "max_output_tokens": 0,      // optional, 0 = provider default
   "cache_prewarm": false,      // optional — cache-only ping of the chain's lane (see below)
   "reasoning_effort": "high",  // optional — "low"|"medium"|"high"|"xhigh"|"max"
@@ -93,6 +91,8 @@ OpenAI Responses API-compatible. Request body deserialized into
   ]
 }
 ```
+
+`temperature`, `top_p` — deprecated: accepted and ignored; the model's default sampling applies.
 
 ### `input` shapes
 
@@ -342,8 +342,6 @@ identical to `/v1/completions` — same engine, same DB row, same auth.
     {"role": "system", "content": "Be concise."},
     {"role": "user",   "content": "What is Rust?"}
   ],
-  "temperature": 1.0,      // optional, default 1.0
-  "top_p": 1.0,            // optional, default 1.0
   "max_tokens": 512,       // optional, 0/null = provider default
   "stream": false,         // optional — true emits buffered SSE
   "stream_options": {"include_usage": true}, // optional — usage-only final chunk
@@ -351,6 +349,8 @@ identical to `/v1/completions` — same engine, same DB row, same auth.
   "tool_choice": "auto"    // optional — accepted and ignored
 }
 ```
+
+`temperature`, `top_p` — deprecated: accepted and ignored; the model's default sampling applies.
 
 Message conversion (transparent to the caller):
 

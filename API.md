@@ -108,7 +108,6 @@ OctoHub's native Responses API. Supports multi-turn conversation chains, reasoni
   "input": "string | InputItem[]",
   "instructions": "string | null",
   "previous_completion_id": "string | null",
-  "temperature": 1.0,
   "max_output_tokens": 0,
   "tools": "ToolDefinition[] | null"
 }
@@ -120,7 +119,7 @@ OctoHub's native Responses API. Supports multi-turn conversation chains, reasoni
 | `input` | string \| array | ✅ | — | Input content. A plain string becomes a user message. An array allows typed items (see below). |
 | `instructions` | string | — | `null` | System instructions prepended to the conversation. |
 | `previous_completion_id` | string | — | `null` | Chain to a previous completion for multi-turn conversations. OctoHub reconstructs the full history automatically. |
-| `temperature` | float | — | `1.0` | Sampling temperature (0.0–2.0). |
+| `temperature`, `top_p` | float | — | — | deprecated: accepted and ignored; the model's default sampling applies. |
 | `max_output_tokens` | integer | — | `0` | Maximum tokens in the response. `0` = provider default. |
 | `cache_prewarm` | bool | — | `false` | Refresh the prompt cache of the lane serving this chain without generating output. Goes only to the provider that served `previous_completion_id` (no rotation, no failover). That provider makes a cache-only call when it has a keepalive policy for the model (Anthropic); the completion is stored and billed like any other. Any other lane gets an empty reply with zero usage and `cost: 0`, no upstream call, nothing stored. |
 | `tools` | array | — | `null` | Function definitions for tool/function calling. |
@@ -266,8 +265,7 @@ curl -X POST http://127.0.0.1:8080/v1/completions \
   -d '{
     "model": "openai:gpt-4o",
     "input": "What should I learn first?",
-    "instructions": "You are a programming tutor. Be concise.",
-    "temperature": 0.7
+    "instructions": "You are a programming tutor. Be concise."
   }'
 ```
 
@@ -367,8 +365,6 @@ Classic OpenAI Chat Completions API. Compatible with any OpenAI-compatible clien
 {
   "model": "string",
   "messages": [{"role": "user", "content": "Hello"}],
-  "temperature": 1.0,
-  "top_p": 1.0,
   "max_tokens": null,
   "stream": false,
   "tools": null,
@@ -380,8 +376,7 @@ Classic OpenAI Chat Completions API. Compatible with any OpenAI-compatible clien
 |---|---|---|---|---|
 | `model` | string | ✅ | — | Model identifier — same as `/v1/completions`. |
 | `messages` | array | ✅ | — | Conversation history. Roles: `system`, `user`, `assistant`, `tool`. |
-| `temperature` | float | — | `1.0` | Sampling temperature. |
-| `top_p` | float | — | `1.0` | Nucleus sampling. |
+| `temperature`, `top_p` | float | — | — | deprecated: accepted and ignored; the model's default sampling applies. |
 | `max_tokens` | integer | — | provider default | Maximum output tokens. |
 | `stream` | bool | — | `false` | Emit buffered SSE text/tool-call deltas; upstream completes first. |
 | `stream_options` | object | — | `null` | `include_usage: true` adds a final usage-only chunk before `[DONE]`; only applies with `stream: true`. |
