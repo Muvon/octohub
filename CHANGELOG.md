@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.17.0] - 2026-11-21
+
+### 📋 Release Summary
+
+The API now ignores deprecated sampling parameters.
+
+### 🚨 Breaking Changes
+
+- **api**: ignore deprecated sampling parameters `7a606005`
+
 ## [0.16.11] - 2026-11-17
 
 ### 🔄 Other Changes
