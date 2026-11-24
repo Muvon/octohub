@@ -67,12 +67,12 @@ curl -sX POST http://127.0.0.1:8080/v1/completions \
 ## Installation
 
 **Prebuilt binaries** — every [release](https://github.com/Muvon/octohub/releases)
-ships static binaries for 6 targets:
+ships static binaries for 5 targets:
 
 | OS | Targets |
 |---|---|
 | Linux (musl, static) | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` |
-| macOS | `x86_64-apple-darwin`, `aarch64-apple-darwin` |
+| macOS (Apple Silicon) | `aarch64-apple-darwin` |
 | Windows | `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
 
 ```bash

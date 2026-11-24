@@ -10,7 +10,7 @@ There are no platform-specific dependencies in `Cargo.toml` beyond
 `rusqlite` (bundled) and the network stack. OctoHub runs on:
 
 - Linux x86_64 / aarch64 (glibc and musl)
-- macOS x86_64 / aarch64
+- macOS (Apple Silicon, aarch64)
 - (in principle) Windows, though it's untested
 
 Minimum RAM is in the tens of MB — this is a thin proxy. Disk is
