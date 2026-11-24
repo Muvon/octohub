@@ -756,6 +756,7 @@ impl ProxyEngine {
 							// Pass-through: octohub is a proxy. Whatever cache marker
 							// the client attached to this tool goes upstream unchanged.
 							cache_control: t.cache_control.clone(),
+							freeform: None,
 						})
 						.collect::<Vec<_>>()
 				});
