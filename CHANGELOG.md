@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.17.1] - 2026-11-24
+
+### 📋 Release Summary
+
+Proxied tools now clear freeform data.
+
+### 🔧 Improvements & Optimizations
+
+- **release**: drop x86_64 macOS release target `fb75d544`
+
+### 🐛 Bug Fixes & Stability
+
+- **proxy**: clear freeform data on proxied tools `8507fbf4`
+
+### 🔄 Other Changes
+
+1 maintenance, dependency, and tooling update not listed individually.
+
 ## [0.17.0] - 2026-11-21
 
 ### 📋 Release Summary
